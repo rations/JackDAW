@@ -306,7 +306,7 @@ GtkWidget *jackdaw_wave_view_new(JackDawTrack  *track,
     wv->zoom_adj   = g_object_ref(zoom_adj);
     wv->cursor_adj = g_object_ref(cursor_adj);
 
-    gtk_widget_set_size_request(GTK_WIDGET(wv), -1, TIMELINE_TRACK_HEIGHT);
+    gtk_widget_set_size_request(GTK_WIDGET(wv), -1, TIMELINE_TRACK_MIN_HEIGHT);
     gtk_widget_add_events(GTK_WIDGET(wv),
                           GDK_BUTTON_PRESS_MASK | GDK_SCROLL_MASK |
                           GDK_SMOOTH_SCROLL_MASK);
@@ -334,6 +334,92 @@ void jackdaw_wave_view_set_focused(JackDawWaveView *wv, gboolean focused)
 void jackdaw_wave_view_invalidate(JackDawWaveView *wv)
 {
     gtk_widget_queue_draw(GTK_WIDGET(wv));
+}
+
+/* ========================================================================
+ * Track resize handle
+ * ======================================================================== */
+
+typedef struct {
+    GtkWidget *outer;       /* vertical box containing row + handle */
+    gint       base_h;      /* outer height at drag start */
+    gdouble    drag_y_root; /* pointer y_root at drag start */
+    gboolean   dragging;
+} ResizeData;
+
+static gboolean resize_handle_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    (void)data;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    /* Dark trough with a subtle highlight line */
+    cairo_set_source_rgb(cr, 0.20, 0.20, 0.20);
+    cairo_paint(cr);
+    cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
+    cairo_set_line_width(cr, 1.0);
+    double mid = a.height / 2.0;
+    cairo_move_to(cr, 0,       mid + 0.5);
+    cairo_line_to(cr, a.width, mid + 0.5);
+    cairo_stroke(cr);
+    return FALSE;
+}
+
+static gboolean resize_handle_enter(GtkWidget *w, GdkEventCrossing *ev,
+                                     gpointer data)
+{
+    (void)ev; (void)data;
+    GdkCursor *cur = gdk_cursor_new_for_display(
+        gtk_widget_get_display(w), GDK_SB_V_DOUBLE_ARROW);
+    gdk_window_set_cursor(gtk_widget_get_window(w), cur);
+    g_object_unref(cur);
+    return FALSE;
+}
+
+static gboolean resize_handle_leave(GtkWidget *w, GdkEventCrossing *ev,
+                                     gpointer data)
+{
+    (void)ev; (void)data;
+    gdk_window_set_cursor(gtk_widget_get_window(w), NULL);
+    return FALSE;
+}
+
+static gboolean resize_handle_press(GtkWidget *w, GdkEventButton *ev,
+                                     gpointer data)
+{
+    if (ev->button != 1) return FALSE;
+    ResizeData *rd = data;
+    GtkAllocation a;
+    gtk_widget_get_allocation(rd->outer, &a);
+    rd->base_h      = a.height;
+    rd->drag_y_root = ev->y_root;
+    rd->dragging    = TRUE;
+    gtk_grab_add(w);
+    return TRUE;
+}
+
+static gboolean resize_handle_motion(GtkWidget *w, GdkEventMotion *ev,
+                                      gpointer data)
+{
+    (void)w;
+    ResizeData *rd = data;
+    if (!rd->dragging) return FALSE;
+    gint new_h = rd->base_h + (gint)(ev->y_root - rd->drag_y_root);
+    new_h = CLAMP(new_h,
+                  TIMELINE_TRACK_MIN_HEIGHT + TIMELINE_RESIZE_HANDLE_H,
+                  TIMELINE_TRACK_MAX_HEIGHT + TIMELINE_RESIZE_HANDLE_H);
+    gtk_widget_set_size_request(rd->outer, -1, new_h);
+    return TRUE;
+}
+
+static gboolean resize_handle_release(GtkWidget *w, GdkEventButton *ev,
+                                       gpointer data)
+{
+    (void)ev;
+    ResizeData *rd = data;
+    if (!rd->dragging) return FALSE;
+    rd->dragging = FALSE;
+    gtk_grab_remove(w);
+    return TRUE;
 }
 
 /* ========================================================================
@@ -415,15 +501,36 @@ static gboolean timeline_wave_scroll(GtkWidget *widget,
     return TRUE;
 }
 
-/* 50 ms timer: update ruler cursor from engine play position */
+/* 50 ms timer: update playhead and auto-scroll to follow it */
 static gboolean timeline_update_timer(gpointer data)
 {
     JackDawTimeline *tl = data;
     if (!JACKDAW_IS_TIMELINE(tl)) return G_SOURCE_REMOVE;
 
-    if (jackdaw_engine_is_running()) {
-        off_t pos = jackdaw_engine_get_play_pos();
-        gtk_adjustment_set_value(tl->cursor_adj, (gdouble)pos);
+    if (!jackdaw_engine_is_running()) return G_SOURCE_CONTINUE;
+
+    off_t pos = jackdaw_engine_get_play_pos();
+    gtk_adjustment_set_value(tl->cursor_adj, (gdouble)pos);
+
+    /* Auto-scroll: if playhead moved and is past the right edge, jump so
+     * the playhead lands at ~20% from the left — gives lookahead room. */
+    if (pos != tl->prev_play_pos) {
+        tl->prev_play_pos = pos;
+
+        GtkAllocation alloc;
+        gtk_widget_get_allocation(GTK_WIDGET(tl->ruler), &alloc);
+        gint view_w = alloc.width;
+        if (view_w > 0) {
+            gdouble spp   = gtk_adjustment_get_value(tl->zoom_adj);
+            gdouble start = gtk_adjustment_get_value(tl->time_adj);
+            gdouble end   = start + (gdouble)view_w * spp;
+            gdouble pos_d = (gdouble)pos;
+            if (pos_d > end) {
+                gdouble new_start = pos_d - 0.10 * (gdouble)view_w * spp;
+                if (new_start < 0.0) new_start = 0.0;
+                gtk_adjustment_set_value(tl->time_adj, new_start);
+            }
+        }
     }
     return G_SOURCE_CONTINUE;
 }
@@ -488,6 +595,7 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->focused_track = NULL;
     tl->wave_views    = g_hash_table_new(g_direct_hash, g_direct_equal);
     tl->update_timer  = 0;
+    tl->prev_play_pos = 0;
 
     gtk_orientable_set_orientation(GTK_ORIENTABLE(tl),
                                    GTK_ORIENTATION_VERTICAL);
@@ -555,9 +663,13 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
 
     if (g_hash_table_contains(tl->wave_views, track)) return;
 
+    /* Outer wrapper: vertical box [row][resize handle] */
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(outer, -1,
+        TIMELINE_TRACK_HEIGHT + TIMELINE_RESIZE_HANDLE_H);
+
     /* Track row: [header 180px][waveview →] */
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    gtk_widget_set_size_request(row, -1, TIMELINE_TRACK_HEIGHT);
 
     /* Header — Phase 3 will replace with full TrackStrip widget */
     GtkWidget *header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -574,7 +686,6 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     /* WaveView */
     GtkWidget *wv = jackdaw_wave_view_new(track, tl->time_adj, tl->zoom_adj,
                                           tl->cursor_adj);
-
     g_signal_connect(wv, "button-press-event",
                      G_CALLBACK(timeline_wave_clicked), tl);
     g_signal_connect(wv, "scroll-event",
@@ -583,12 +694,38 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     gtk_box_pack_start(GTK_BOX(row), header, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(row), wv,     TRUE,  TRUE,  0);
 
-    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
-    gtk_box_pack_start(GTK_BOX(tl->tracks_box), row, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(tl->tracks_box), sep, FALSE, FALSE, 0);
+    /* Resize handle: 5px drawing area the user drags to change track height */
+    GtkWidget *handle = gtk_drawing_area_new();
+    gtk_widget_set_size_request(handle, -1, TIMELINE_RESIZE_HANDLE_H);
+    gtk_widget_set_name(handle, "track-resize-handle");
+    gtk_widget_add_events(handle,
+        GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK |
+        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+        GDK_POINTER_MOTION_MASK);
 
-    gtk_widget_show_all(row);
-    gtk_widget_show(sep);
+    ResizeData *rd   = g_new0(ResizeData, 1);
+    rd->outer        = outer;
+    g_object_set_data_full(G_OBJECT(handle), "resize-data", rd, g_free);
+
+    g_signal_connect(handle, "draw",
+                     G_CALLBACK(resize_handle_draw),    NULL);
+    g_signal_connect(handle, "enter-notify-event",
+                     G_CALLBACK(resize_handle_enter),   rd);
+    g_signal_connect(handle, "leave-notify-event",
+                     G_CALLBACK(resize_handle_leave),   rd);
+    g_signal_connect(handle, "button-press-event",
+                     G_CALLBACK(resize_handle_press),   rd);
+    g_signal_connect(handle, "motion-notify-event",
+                     G_CALLBACK(resize_handle_motion),  rd);
+    g_signal_connect(handle, "button-release-event",
+                     G_CALLBACK(resize_handle_release), rd);
+
+    /* Assemble: row fills outer, handle is pinned at bottom */
+    gtk_box_pack_start(GTK_BOX(outer), row,    TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(outer), handle, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(tl->tracks_box), outer, FALSE, FALSE, 0);
+    gtk_widget_show_all(outer);
 
     g_hash_table_insert(tl->wave_views, track, JACKDAW_WAVE_VIEW(wv));
 }
@@ -602,25 +739,14 @@ void jackdaw_timeline_remove_track(JackDawTimeline *tl, JackDawTrack *track)
         GTK_WIDGET(g_hash_table_lookup(tl->wave_views, track));
     if (!wv_widget) return;
 
-    GtkWidget *row = gtk_widget_get_parent(wv_widget);
-
     g_hash_table_remove(tl->wave_views, track);
-
     if (tl->focused_track == track)
         tl->focused_track = NULL;
 
-    if (row) {
-        GtkWidget *tracks_box = gtk_widget_get_parent(row);
-        if (tracks_box) {
-            GList *children = gtk_container_get_children(
-                                  GTK_CONTAINER(tracks_box));
-            GList *node = g_list_find(children, row);
-            if (node && node->next)
-                gtk_widget_destroy(GTK_WIDGET(node->next->data));
-            g_list_free(children);
-        }
-        gtk_widget_destroy(row);
-    }
+    /* hierarchy: wv -> row -> outer; destroy outer tears down everything */
+    GtkWidget *row   = gtk_widget_get_parent(wv_widget);
+    GtkWidget *outer = row ? gtk_widget_get_parent(row) : NULL;
+    gtk_widget_destroy(outer ? outer : (row ? row : wv_widget));
 }
 
 JackDawTrack *jackdaw_timeline_get_focused(JackDawTimeline *tl)
