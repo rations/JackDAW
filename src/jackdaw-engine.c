@@ -3,9 +3,14 @@
 
 #include <string.h>
 #include <math.h>
+#include <pthread.h>
+#include <time.h>
 #include <jack/jack.h>
 #include <jack/midiport.h>
 #include <jack/ringbuffer.h>
+#ifdef HAVE_SAMPLERATE
+#  include <samplerate.h>
+#endif
 
 #include "jackdaw-engine.h"
 #include "settings.h"
@@ -50,6 +55,392 @@ typedef struct {
 } JackDawEngine;
 
 static JackDawEngine engine;
+
+/* -----------------------------------------------------------------------
+ * Phase 2.5: Playback feeder thread
+ *
+ * A dedicated pthread fills play_buf_L/R ringbuffers from AudioClip data
+ * so the RT callback always has audio to drain.  No malloc/free/mutex
+ * in the feeder — only jack_ringbuffer_* (lock-free) and libsndfile reads.
+ * ----------------------------------------------------------------------- */
+
+/* Output frames produced per slot per inner-loop pass (controls granularity).
+ * Small enough to fit in L1 cache; large enough to reduce syscall overhead. */
+#define FEEDER_CHUNK_FRAMES   2048
+/* Raw interleaved frames to allocate for one read (covers up to 6:1 downsample,
+ * e.g. a 192 kHz clip playing into a 32 kHz JACK session). */
+#define FEEDER_RAW_FRAMES     (FEEDER_CHUNK_FRAMES * 6)
+/* Maximum clip channels we deinterleave.  Clips with more channels still open
+ * correctly via sf_readf_float; we only pick ch 0 and 1. */
+#define FEEDER_MAX_CHANNELS   8
+
+/* Per-slot feeder state — only the two atomic fields are shared; everything
+ * else is private to the feeder thread. */
+typedef struct {
+    SNDFILE      *sf;           /* open sequential file handle; NULL = not open */
+#ifdef HAVE_SAMPLERATE
+    SRC_STATE    *src_L;        /* resampler for channel 0; NULL = no SRC */
+    SRC_STATE    *src_R;        /* resampler for channel 1; NULL = mono or no SRC */
+#endif
+    /* Locate protocol: main thread writes locate_frame then sets locate_req=1.
+     * Feeder does CAS(1->0) and applies the seek. */
+    volatile gint locate_req;   /* g_atomic_int */
+    off_t         locate_frame; /* JACK frame target; valid when locate_req==1 */
+    off_t         clip_pos;     /* feeder's current read position in clip frames */
+} FeederSlot;
+
+static FeederSlot   feeder_slots[JACKDAW_MAX_TRACKS];
+static pthread_t    feeder_tid;
+static volatile int feeder_stop_flag;
+static gboolean     feeder_started = FALSE;
+
+/* Scratch buffers owned exclusively by the feeder thread */
+static float *feeder_raw;    /* FEEDER_RAW_FRAMES * FEEDER_MAX_CHANNELS interleaved */
+static float *feeder_mono;   /* FEEDER_RAW_FRAMES — one deinterleaved channel pre-SRC */
+static float *feeder_L;      /* FEEDER_CHUNK_FRAMES — output left channel */
+static float *feeder_R;      /* FEEDER_CHUNK_FRAMES — output right channel */
+
+/* Close a slot's file handle and SRC states (feeder thread or stop path only). */
+static void feeder_slot_close(guint i)
+{
+    if (feeder_slots[i].sf) {
+        sf_close(feeder_slots[i].sf);
+        feeder_slots[i].sf = NULL;
+    }
+#ifdef HAVE_SAMPLERATE
+    if (feeder_slots[i].src_L) {
+        src_delete(feeder_slots[i].src_L);
+        feeder_slots[i].src_L = NULL;
+    }
+    if (feeder_slots[i].src_R) {
+        src_delete(feeder_slots[i].src_R);
+        feeder_slots[i].src_R = NULL;
+    }
+#endif
+    feeder_slots[i].clip_pos = 0;
+    g_atomic_int_set(&feeder_slots[i].locate_req, 0);
+}
+
+static void *feeder_thread_func(void *arg)
+{
+    (void)arg;
+    guint i;
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 }; /* 2 ms sleep */
+
+    while (!feeder_stop_flag) {
+        nanosleep(&ts, NULL);
+
+        if (!(g_atomic_int_get(&engine.transport_flags) & ENGINE_PLAYING))
+            continue;
+        if (!engine.client)
+            continue;
+
+        jack_nframes_t jack_sr = jack_get_sample_rate(engine.client);
+
+        for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+            JackDawTrack *t = engine.slots[i];
+
+            /* No track in this slot — release any open resources */
+            if (!t) {
+                if (feeder_slots[i].sf)
+                    feeder_slot_close(i);
+                continue;
+            }
+
+            AudioClip *clip = t->clip;
+            if (!clip || !t->play_buf_L || !t->play_buf_R)
+                continue;
+
+            int        clip_ch     = clip->info.channels;
+            sf_count_t clip_frames = clip->info.frames;
+            int        clip_sr     = clip->info.samplerate;
+            int        eff_ch      = (clip_ch > FEEDER_MAX_CHANNELS)
+                                     ? FEEDER_MAX_CHANNELS : clip_ch;
+
+            /* --- Handle locate request from main thread --- */
+            if (g_atomic_int_compare_and_exchange(
+                    &feeder_slots[i].locate_req, 1, 0)) {
+                off_t jpos = feeder_slots[i].locate_frame;
+                off_t cpos;
+                if (clip_sr == (int)jack_sr) {
+                    cpos = jpos;
+                } else {
+                    cpos = (off_t)((double)jpos
+                                   * (double)clip_sr / (double)jack_sr);
+                }
+                if (cpos < 0)           cpos = 0;
+                if (cpos > clip_frames) cpos = clip_frames;
+                feeder_slots[i].clip_pos = cpos;
+                if (feeder_slots[i].sf)
+                    sf_seek(feeder_slots[i].sf, cpos, SEEK_SET);
+#ifdef HAVE_SAMPLERATE
+                if (feeder_slots[i].src_L)
+                    src_reset(feeder_slots[i].src_L);
+                if (feeder_slots[i].src_R)
+                    src_reset(feeder_slots[i].src_R);
+#endif
+            }
+
+            /* --- Open file if not already open --- */
+            if (!feeder_slots[i].sf) {
+                SF_INFO sfi = {0};
+                SNDFILE *sf = sf_open(clip->path, SFM_READ, &sfi);
+                if (!sf) continue;
+                sf_seek(sf, feeder_slots[i].clip_pos, SEEK_SET);
+                feeder_slots[i].sf = sf;
+            }
+
+            /* --- Decide whether SRC is needed --- */
+            gboolean needs_src = (clip_sr != (int)jack_sr);
+#ifndef HAVE_SAMPLERATE
+            /* No SRC library compiled in — play at native rate (pitch will shift
+             * if clip SR != JACK SR, but will not crash). */
+            needs_src = FALSE;
+#endif
+
+#ifdef HAVE_SAMPLERATE
+            /* Create SRC states on demand */
+            if (needs_src && !feeder_slots[i].src_L) {
+                int src_err = 0;
+                feeder_slots[i].src_L = src_new(SRC_SINC_FASTEST, 1, &src_err);
+                if (!feeder_slots[i].src_L) {
+                    needs_src = FALSE;
+                } else if (clip_ch > 1) {
+                    feeder_slots[i].src_R =
+                        src_new(SRC_SINC_FASTEST, 1, &src_err);
+                    /* src_R may remain NULL for mono clips — handled below */
+                }
+            }
+            /* Drop SRC states if clip SR now matches JACK SR */
+            if (!needs_src) {
+                if (feeder_slots[i].src_L) {
+                    src_delete(feeder_slots[i].src_L);
+                    feeder_slots[i].src_L = NULL;
+                }
+                if (feeder_slots[i].src_R) {
+                    src_delete(feeder_slots[i].src_R);
+                    feeder_slots[i].src_R = NULL;
+                }
+            }
+#endif /* HAVE_SAMPLERATE */
+
+            /* --- Inner fill loop: top up the ringbuffer each wakeup --- */
+            gboolean keep_filling = TRUE;
+            while (keep_filling) {
+                size_t space_L = jack_ringbuffer_write_space(t->play_buf_L)
+                                 / sizeof(float);
+                size_t space_R = jack_ringbuffer_write_space(t->play_buf_R)
+                                 / sizeof(float);
+                size_t out_want = (space_L < space_R) ? space_L : space_R;
+                if (out_want > FEEDER_CHUNK_FRAMES)
+                    out_want = FEEDER_CHUNK_FRAMES;
+                if (out_want == 0)
+                    break; /* buffer full */
+
+                off_t cpos = feeder_slots[i].clip_pos;
+
+                /* Clip finished — fill with silence so RT stays running */
+                if (cpos >= clip_frames) {
+                    memset(feeder_L, 0, out_want * sizeof(float));
+                    memset(feeder_R, 0, out_want * sizeof(float));
+                    jack_ringbuffer_write(t->play_buf_L,
+                                         (const char *)feeder_L,
+                                         out_want * sizeof(float));
+                    jack_ringbuffer_write(t->play_buf_R,
+                                         (const char *)feeder_R,
+                                         out_want * sizeof(float));
+                    break;
+                }
+
+                /* ---- SRC path (only when HAVE_SAMPLERATE is defined) ---- */
+#ifdef HAVE_SAMPLERATE
+                gboolean did_src = FALSE;
+                if (needs_src && feeder_slots[i].src_L) {
+                    double ratio = (double)jack_sr / (double)clip_sr;
+                    long in_want = (long)ceil((double)out_want / ratio) + 8;
+                    sf_count_t avail = clip_frames - cpos;
+                    if ((sf_count_t)in_want > avail)
+                        in_want = (long)avail;
+                    if (in_want <= 0) {
+                        /* Clip exhausted through SRC lookahead */
+                        memset(feeder_L, 0, out_want * sizeof(float));
+                        memset(feeder_R, 0, out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_L,
+                                             (const char *)feeder_L,
+                                             out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_R,
+                                             (const char *)feeder_R,
+                                             out_want * sizeof(float));
+                        break;
+                    }
+                    if (in_want > FEEDER_RAW_FRAMES)
+                        in_want = FEEDER_RAW_FRAMES;
+
+                    sf_count_t got = sf_readf_float(feeder_slots[i].sf,
+                                                    feeder_raw,
+                                                    (sf_count_t)in_want);
+                    if (got <= 0) {
+                        memset(feeder_L, 0, out_want * sizeof(float));
+                        memset(feeder_R, 0, out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_L,
+                                             (const char *)feeder_L,
+                                             out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_R,
+                                             (const char *)feeder_R,
+                                             out_want * sizeof(float));
+                        feeder_slots[i].clip_pos = clip_frames;
+                        keep_filling = FALSE;
+                        break;
+                    }
+
+                    gboolean near_end =
+                        (feeder_slots[i].clip_pos + got >= clip_frames);
+
+                    /* Deinterleave channel 0 and resample to feeder_L */
+                    sf_count_t f;
+                    for (f = 0; f < got; f++)
+                        feeder_mono[f] = feeder_raw[f * eff_ch];
+
+                    SRC_DATA sd_L = {
+                        .data_in       = feeder_mono,
+                        .data_out      = feeder_L,
+                        .input_frames  = (long)got,
+                        .output_frames = (long)out_want,
+                        .src_ratio     = ratio,
+                        .end_of_input  = near_end ? 1 : 0
+                    };
+                    src_process(feeder_slots[i].src_L, &sd_L);
+                    long out_gen = sd_L.output_frames_gen;
+
+                    /* Deinterleave channel 1 and resample, or copy mono to R */
+                    if (eff_ch > 1 && feeder_slots[i].src_R) {
+                        for (f = 0; f < got; f++)
+                            feeder_mono[f] = feeder_raw[f * eff_ch + 1];
+                        SRC_DATA sd_R = {
+                            .data_in       = feeder_mono,
+                            .data_out      = feeder_R,
+                            .input_frames  = (long)got,
+                            .output_frames = (long)out_want,
+                            .src_ratio     = ratio,
+                            .end_of_input  = near_end ? 1 : 0
+                        };
+                        src_process(feeder_slots[i].src_R, &sd_R);
+                    } else {
+                        if (out_gen > 0)
+                            memcpy(feeder_R, feeder_L,
+                                   (size_t)out_gen * sizeof(float));
+                    }
+
+                    if (out_gen < (long)out_want) {
+                        size_t pad = (size_t)((long)out_want - out_gen);
+                        memset(feeder_L + out_gen, 0, pad * sizeof(float));
+                        memset(feeder_R + out_gen, 0, pad * sizeof(float));
+                        if (near_end) keep_filling = FALSE;
+                    }
+
+                    /* Advance clip_pos by actual input consumed by SRC */
+                    feeder_slots[i].clip_pos += sd_L.input_frames_used;
+
+                    jack_ringbuffer_write(t->play_buf_L,
+                                         (const char *)feeder_L,
+                                         out_want * sizeof(float));
+                    jack_ringbuffer_write(t->play_buf_R,
+                                         (const char *)feeder_R,
+                                         out_want * sizeof(float));
+                    did_src = TRUE;
+                }
+                if (!did_src) {
+#else  /* !HAVE_SAMPLERATE */
+                {
+#endif /* HAVE_SAMPLERATE */
+                    /* ---- Direct copy path (no SRC needed) ---- */
+                    sf_count_t to_read = (sf_count_t)out_want;
+                    sf_count_t avail   = clip_frames - cpos;
+                    if (to_read > avail) to_read = avail;
+
+                    sf_count_t got = sf_readf_float(feeder_slots[i].sf,
+                                                    feeder_raw, to_read);
+                    if (got <= 0) {
+                        memset(feeder_L, 0, out_want * sizeof(float));
+                        memset(feeder_R, 0, out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_L,
+                                             (const char *)feeder_L,
+                                             out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_R,
+                                             (const char *)feeder_R,
+                                             out_want * sizeof(float));
+                        feeder_slots[i].clip_pos = clip_frames;
+                        keep_filling = FALSE;
+                    } else {
+                        sf_count_t f;
+                        if (eff_ch == 1) {
+                            for (f = 0; f < got; f++)
+                                feeder_L[f] = feeder_R[f] = feeder_raw[f];
+                        } else {
+                            for (f = 0; f < got; f++) {
+                                feeder_L[f] = feeder_raw[f * eff_ch];
+                                feeder_R[f] = feeder_raw[f * eff_ch + 1];
+                            }
+                        }
+                        /* Zero-pad if near EOF */
+                        if ((size_t)got < out_want) {
+                            size_t pad = out_want - (size_t)got;
+                            memset(feeder_L + got, 0, pad * sizeof(float));
+                            memset(feeder_R + got, 0, pad * sizeof(float));
+                            keep_filling = FALSE;
+                        }
+                        feeder_slots[i].clip_pos += got;
+                        jack_ringbuffer_write(t->play_buf_L,
+                                             (const char *)feeder_L,
+                                             out_want * sizeof(float));
+                        jack_ringbuffer_write(t->play_buf_R,
+                                             (const char *)feeder_R,
+                                             out_want * sizeof(float));
+                    }
+                }
+            } /* inner fill loop */
+        } /* for each slot */
+    } /* while !feeder_stop_flag */
+
+    /* Clean up all open handles on thread exit */
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++)
+        feeder_slot_close(i);
+
+    return NULL;
+}
+
+static void feeder_start(void)
+{
+    if (feeder_started) return;
+
+    feeder_raw  = g_new(float, FEEDER_RAW_FRAMES * FEEDER_MAX_CHANNELS);
+    feeder_mono = g_new(float, FEEDER_RAW_FRAMES);
+    feeder_L    = g_new(float, FEEDER_CHUNK_FRAMES);
+    feeder_R    = g_new(float, FEEDER_CHUNK_FRAMES);
+
+    feeder_stop_flag = 0;
+    memset(feeder_slots, 0, sizeof(feeder_slots));
+
+    if (pthread_create(&feeder_tid, NULL, feeder_thread_func, NULL) != 0) {
+        g_free(feeder_raw);  g_free(feeder_mono);
+        g_free(feeder_L);    g_free(feeder_R);
+        feeder_raw = feeder_mono = feeder_L = feeder_R = NULL;
+        return;
+    }
+    feeder_started = TRUE;
+}
+
+static void feeder_stop(void)
+{
+    if (!feeder_started) return;
+    feeder_stop_flag = 1;
+    pthread_join(feeder_tid, NULL);
+    feeder_started = FALSE;
+    g_free(feeder_raw);  feeder_raw  = NULL;
+    g_free(feeder_mono); feeder_mono = NULL;
+    g_free(feeder_L);    feeder_L    = NULL;
+    g_free(feeder_R);    feeder_R    = NULL;
+}
 
 /* -----------------------------------------------------------------------
  * JACK process callback — RT thread, no malloc/free/mutex/file I/O
@@ -112,7 +503,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             memset((char *)engine.tmp_R + got_R, 0, want - got_R);
 
         /* Constant-power pan law:
-         *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] → [0, π/2]
+         *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] -> [0, pi/2]
          *   L gain = vol * cos(angle), R gain = vol * sin(angle) */
         gfloat vol   = t->volume;
         gfloat pan   = t->pan;
@@ -197,7 +588,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 }
 
 /* -----------------------------------------------------------------------
- * Buffer size callback — called by JACK when buffer size changes
+ * Buffer size callback — called by JACK when buffer size changes.
  * Must NOT block; reallocates mix buffers and track ringbuffers.
  * ----------------------------------------------------------------------- */
 
@@ -236,6 +627,9 @@ static int engine_buffer_size_cb(jack_nframes_t nframes, void *arg)
         if (t->play_buf_R) jack_ringbuffer_mlock(t->play_buf_R);
         if (t->rec_buf_L)  jack_ringbuffer_mlock(t->rec_buf_L);
         if (t->rec_buf_R)  jack_ringbuffer_mlock(t->rec_buf_R);
+        /* Ringbuffers just emptied — tell feeder to re-seek to play position */
+        feeder_slots[i].locate_frame = (off_t)engine.play_pos;
+        g_atomic_int_set(&feeder_slots[i].locate_req, 1);
     }
 
     return 0;
@@ -245,7 +639,6 @@ static void engine_shutdown_cb(void *arg)
 {
     (void)arg;
     engine.active = FALSE;
-    /* The main thread checks engine.active periodically via mainloop */
 }
 
 /* -----------------------------------------------------------------------
@@ -268,7 +661,8 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     /* Read port counts from project (loaded from inifile in project_init) */
     engine.audio_in_count  = CLAMP(project->audio_in_count,  1, 64);
     engine.audio_out_count = CLAMP(project->audio_out_count, 1, 64);
-    engine.midi_in_count   = project->midi_in_count > 16u ? 16u : project->midi_in_count;
+    engine.midi_in_count   = project->midi_in_count > 16u ? 16u
+                             : project->midi_in_count;
 
     engine.client = jack_client_open("jackdaw", JackNullOption, &status);
     if (!engine.client) {
@@ -327,8 +721,11 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         goto fail;
     }
 
+    /* Start feeder thread — keeps play_buf_L/R filled from AudioClip */
+    feeder_start();
+
     engine.active = TRUE;
-    (void)rb_bytes; /* used by engine_add_track */
+    (void)rb_bytes; /* suppress unused-variable warning */
     return FALSE;   /* success */
 
 fail:
@@ -343,6 +740,9 @@ fail:
 void jackdaw_engine_quit(void)
 {
     if (!engine.active || !engine.client) return;
+
+    /* Stop feeder before deactivating JACK so the thread exits cleanly */
+    feeder_stop();
 
     jack_deactivate(engine.client);
     jack_client_close(engine.client);
@@ -500,6 +900,15 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
 
     track->slot   = i;
     engine.slots[i] = track; /* RT callback can see this now */
+
+    /* If playback is in progress, sync the new track to the current position
+     * so it starts in the right place rather than always from frame 0. */
+    if (engine.active &&
+        (g_atomic_int_get(&engine.transport_flags) & ENGINE_PLAYING)) {
+        feeder_slots[i].locate_frame = (off_t)engine.play_pos;
+        g_atomic_int_set(&feeder_slots[i].locate_req, 1);
+    }
+
     return FALSE;
 }
 
@@ -548,6 +957,9 @@ void jackdaw_engine_locate(off_t sample)
         t->played_frames = sample;
         if (t->play_buf_L) jack_ringbuffer_reset(t->play_buf_L);
         if (t->play_buf_R) jack_ringbuffer_reset(t->play_buf_R);
+        /* Tell feeder to re-seek each slot to the new position */
+        feeder_slots[i].locate_frame = sample;
+        g_atomic_int_set(&feeder_slots[i].locate_req, 1);
     }
 }
 

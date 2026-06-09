@@ -1,0 +1,34 @@
+# Claude Code project instructions (local dev tool, not source)
+CLAUDE.md
+
+# Build artifacts
+*.o
+*.d
+*.a
+*.so
+*.la
+*.lo
+
+# Compiled binary
+src/jackdaw
+
+# Autotools generated files (if ever used)
+autom4te.cache/
+config.status
+config.log
+config.h
+configure
+Makefile.in
+aclocal.m4
+.deps/
+.libs/
+stamp-h1
+
+# Editor and OS noise
+*~
+*.swp
+*.swo
+.#*
+\#*\#
+.DS_Store
+Thumbs.db
