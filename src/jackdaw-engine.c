@@ -446,6 +446,173 @@ static void feeder_stop(void)
 }
 
 /* -----------------------------------------------------------------------
+ * Recorder thread — drains rec_buf_L/R into WAV files on disk.
+ * No malloc/free/file-I/O in the RT callback; all disk work is here.
+ * ----------------------------------------------------------------------- */
+
+#define REC_SCRATCH_FRAMES 4096
+
+typedef struct {
+    SNDFILE *sf;              /* open for writing; NULL = idle */
+    char     path[512];       /* destination file path */
+    off_t    written;         /* frames written so far */
+    gint     finalize_req;    /* g_atomic: stop_recording sets to 1 */
+} RecorderSlot;
+
+static RecorderSlot  recorder_slots[JACKDAW_MAX_TRACKS];
+static pthread_t     recorder_tid;
+static volatile int  recorder_stop_flag;
+static gboolean      recorder_started = FALSE;
+
+static float *rec_scratch_L;
+static float *rec_scratch_R;
+static float *rec_interleaved;  /* 2 * REC_SCRATCH_FRAMES for stereo write */
+
+typedef struct {
+    JackDawTrack *track;    /* strong ref — released by idle */
+    char          path[512];
+} RecordFinalize;
+
+static gboolean recorder_finalize_idle(gpointer data)
+{
+    RecordFinalize *rf = data;
+    GError    *err  = NULL;
+    AudioClip *clip = audio_clip_new(rf->path, &err);
+    if (clip) {
+        jackdaw_track_set_clip(rf->track, clip);
+    } else {
+        g_warning("jackdaw: could not load recording %s: %s",
+                  rf->path, err ? err->message : "unknown");
+        if (err) g_error_free(err);
+    }
+    g_object_unref(rf->track);
+    g_free(rf);
+    return G_SOURCE_REMOVE;
+}
+
+/* Drain remaining data from a slot's rec_buf, close the WAV file, and
+ * schedule a main-thread callback to create the AudioClip. */
+static void recorder_slot_finalize(guint i)
+{
+    RecorderSlot *rs = &recorder_slots[i];
+    if (!rs->sf) return;
+
+    JackDawTrack *t = engine.slots[i];
+    if (t && t->rec_buf_L && t->rec_buf_R) {
+        while (TRUE) {
+            size_t avL = jack_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
+            size_t avR = jack_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
+            size_t av  = avL < avR ? avL : avR;
+            if (av > REC_SCRATCH_FRAMES) av = REC_SCRATCH_FRAMES;
+            if (av == 0) break;
+
+            jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
+            jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
+
+            for (size_t f = 0; f < av; f++) {
+                rec_interleaved[f * 2]     = rec_scratch_L[f];
+                rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+            }
+            rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
+        }
+    }
+
+    sf_close(rs->sf);
+    rs->sf = NULL;
+
+    if (t && rs->written > 0) {
+        RecordFinalize *rf = g_new0(RecordFinalize, 1);
+        rf->track = g_object_ref(t);
+        g_strlcpy(rf->path, rs->path, sizeof(rf->path));
+        g_idle_add(recorder_finalize_idle, rf);
+    }
+    rs->written = 0;
+}
+
+static void *recorder_thread_func(void *arg)
+{
+    (void)arg;
+    guint i;
+    struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 }; /* 2 ms */
+
+    while (!recorder_stop_flag) {
+        nanosleep(&ts, NULL);
+
+        for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+            /* Main thread signals finalize when recording stops */
+            if (g_atomic_int_compare_and_exchange(&recorder_slots[i].finalize_req, 1, 0)) {
+                recorder_slot_finalize(i);
+                continue;
+            }
+
+            RecorderSlot *rs = &recorder_slots[i];
+            if (!rs->sf) continue;
+
+            JackDawTrack *t = engine.slots[i];
+            if (!t || !t->rec_buf_L || !t->rec_buf_R) continue;
+
+            while (TRUE) {
+                size_t avL = jack_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
+                size_t avR = jack_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
+                size_t av  = avL < avR ? avL : avR;
+                if (av > REC_SCRATCH_FRAMES) av = REC_SCRATCH_FRAMES;
+                if (av == 0) break;
+
+                jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
+                jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
+
+                for (size_t f = 0; f < av; f++) {
+                    rec_interleaved[f * 2]     = rec_scratch_L[f];
+                    rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+                }
+                rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
+            }
+        }
+    }
+
+    /* On thread exit: close any still-open files (engine quit path) */
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        if (recorder_slots[i].sf) {
+            sf_close(recorder_slots[i].sf);
+            recorder_slots[i].sf = NULL;
+        }
+    }
+    return NULL;
+}
+
+static void recorder_start(void)
+{
+    if (recorder_started) return;
+
+    rec_scratch_L   = g_new(float, REC_SCRATCH_FRAMES);
+    rec_scratch_R   = g_new(float, REC_SCRATCH_FRAMES);
+    rec_interleaved = g_new(float, REC_SCRATCH_FRAMES * 2);
+
+    recorder_stop_flag = 0;
+    memset(recorder_slots, 0, sizeof(recorder_slots));
+
+    if (pthread_create(&recorder_tid, NULL, recorder_thread_func, NULL) != 0) {
+        g_free(rec_scratch_L);
+        g_free(rec_scratch_R);
+        g_free(rec_interleaved);
+        rec_scratch_L = rec_scratch_R = rec_interleaved = NULL;
+        return;
+    }
+    recorder_started = TRUE;
+}
+
+static void recorder_stop(void)
+{
+    if (!recorder_started) return;
+    recorder_stop_flag = 1;
+    pthread_join(recorder_tid, NULL);
+    recorder_started = FALSE;
+    g_free(rec_scratch_L);   rec_scratch_L   = NULL;
+    g_free(rec_scratch_R);   rec_scratch_R   = NULL;
+    g_free(rec_interleaved); rec_interleaved = NULL;
+}
+
+/* -----------------------------------------------------------------------
  * JACK process callback — RT thread, no malloc/free/mutex/file I/O
  * ----------------------------------------------------------------------- */
 
@@ -516,6 +683,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
         gfloat peak_L = 0.0f, peak_R = 0.0f;
 
+        /* Mix playback audio */
         for (k = 0; k < nframes; k++) {
             float sL = engine.tmp_L[k] * gain_L;
             float sR = engine.tmp_R[k] * gain_R;
@@ -527,23 +695,42 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             if (sR > peak_R) peak_R = sR;
         }
 
+        /* Input monitoring: when armed, the live input is always mixed into the
+         * master so the user hears their instrument before and during recording.
+         * The same buffer is also captured to rec_buf when ENGINE_RECORDING is set. */
+        float *live_in = NULL;
+        if ((tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
+            (guint)t->audio_in_idx < engine.audio_in_count &&
+            engine.audio_in[(guint)t->audio_in_idx]) {
+            live_in = jack_port_get_buffer(
+                engine.audio_in[(guint)t->audio_in_idx], nframes);
+        }
+        if (live_in) {
+            for (k = 0; k < nframes; k++) {
+                float sL = live_in[k] * gain_L;
+                float sR = live_in[k] * gain_R;
+                engine.master_L[k] += sL;
+                engine.master_R[k] += sR;
+                if (sL < 0.0f) sL = -sL;
+                if (sR < 0.0f) sR = -sR;
+                if (sL > peak_L) peak_L = sL;
+                if (sR > peak_R) peak_R = sR;
+            }
+        }
+
         /* Update peaks for VU — racy write is acceptable */
         if (peak_L > t->peak_L) t->peak_L = peak_L;
         if (peak_R > t->peak_R) t->peak_R = peak_R;
 
-        /* Record audio: feed rec ringbuffers from the assigned input port */
-        if ((tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
-            t->audio_in_idx >= 0 &&
-            (guint)t->audio_in_idx < engine.audio_in_count) {
-            float *src = jack_port_get_buffer(
-                engine.audio_in[t->audio_in_idx], nframes);
+        /* Capture live input to rec ringbuffers when recording */
+        if (live_in && (flags & ENGINE_RECORDING)) {
             if (t->rec_buf_L)
                 jack_ringbuffer_write(t->rec_buf_L,
-                                      (const char *)src,
+                                      (const char *)live_in,
                                       nframes * sizeof(float));
             if (t->rec_buf_R)
                 jack_ringbuffer_write(t->rec_buf_R,
-                                      (const char *)src,
+                                      (const char *)live_in,
                                       nframes * sizeof(float));
         }
 
@@ -900,8 +1087,9 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         }
     }
 
-    /* Start feeder thread — keeps play_buf_L/R filled from AudioClip */
+    /* Start background threads */
     feeder_start();
+    recorder_start();
 
     engine.active = TRUE;
     (void)rb_bytes; /* suppress unused-variable warning */
@@ -921,8 +1109,9 @@ void jackdaw_engine_quit(void)
 {
     if (!engine.active || !engine.client) return;
 
-    /* Stop feeder before deactivating JACK so the thread exits cleanly */
+    /* Stop background threads before deactivating JACK */
     feeder_stop();
+    recorder_stop();
 
     jack_deactivate(engine.client);
     jack_client_close(engine.client);
@@ -1174,12 +1363,58 @@ void jackdaw_engine_stop_playback(void)
 
 void jackdaw_engine_start_recording(void)
 {
-    g_atomic_int_or(&engine.transport_flags, ENGINE_RECORDING);
+    /* Create recordings directory under ~/.jackdaw/ (settings_init created the parent) */
+    gchar *rec_dir = g_build_filename(g_get_home_dir(), ".jackdaw", "recordings", NULL);
+    g_mkdir_with_parents(rec_dir, 0700);
+
+    jack_nframes_t sr  = engine.client ? jack_get_sample_rate(engine.client) : 48000;
+    GDateTime     *now = g_date_time_new_now_local();
+
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        JackDawTrack *t = engine.slots[i];
+        if (!t) continue;
+        if (!(g_atomic_int_get(&t->state_flags) & TRACK_ARMED)) continue;
+        if (t->audio_in_idx < 0) continue;
+        if (recorder_slots[i].sf) continue; /* already open */
+
+        gchar *ts    = g_date_time_format(now, "%Y%m%d_%H%M%S");
+        gchar *fname = g_strdup_printf("track_%u_%s.wav", i + 1, ts);
+        gchar *fpath = g_build_filename(rec_dir, fname, NULL);
+        g_strlcpy(recorder_slots[i].path, fpath, sizeof(recorder_slots[i].path));
+        g_free(fpath); g_free(fname); g_free(ts);
+
+        SF_INFO sfi    = { 0 };
+        sfi.samplerate = (int)sr;
+        sfi.channels   = 2;
+        sfi.format     = SF_FORMAT_WAV | SF_FORMAT_PCM_24;
+
+        SNDFILE *sf = sf_open(recorder_slots[i].path, SFM_WRITE, &sfi);
+        if (!sf) {
+            g_warning("jackdaw: could not open recording file %s: %s",
+                      recorder_slots[i].path, sf_strerror(NULL));
+            continue;
+        }
+        recorder_slots[i].sf      = sf;
+        recorder_slots[i].written = 0;
+        g_atomic_int_set(&recorder_slots[i].finalize_req, 0);
+    }
+
+    g_date_time_unref(now);
+    g_free(rec_dir);
+
+    /* Start rolling — RT callback begins filling rec_buf immediately */
+    g_atomic_int_or(&engine.transport_flags, ENGINE_RECORDING | ENGINE_PLAYING);
 }
 
 void jackdaw_engine_stop_recording(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_RECORDING);
+
+    /* Tell the recorder thread to drain, close, and create AudioClips */
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        if (recorder_slots[i].sf)
+            g_atomic_int_set(&recorder_slots[i].finalize_req, 1);
+    }
 }
 
 void jackdaw_engine_locate(off_t sample)

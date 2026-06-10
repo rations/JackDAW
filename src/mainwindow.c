@@ -154,11 +154,15 @@ static void mw_transport_stop_cb(GtkMenuItem *item, gpointer data)
 
 static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
 {
-    (void)data;
-    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget))) {
         jackdaw_engine_start_recording();
-    else
+        /* start_recording sets ENGINE_PLAYING; keep the play button in sync */
+        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(win->play_button)))
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->play_button), TRUE);
+    } else {
         jackdaw_engine_stop_recording();
+    }
 }
 
 static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
@@ -167,6 +171,8 @@ static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     jackdaw_engine_locate(0);
     jackdaw_timeline_set_cursor(win->timeline, 0);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->play_button),   FALSE);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->record_button), FALSE);
 }
 
 /* ---- Edit menu — undo/redo (Phase 4+ when editing is added) ---- */
