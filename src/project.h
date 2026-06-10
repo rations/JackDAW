@@ -15,6 +15,12 @@ G_BEGIN_DECLS
 typedef struct _JackDawProject      JackDawProject;
 typedef struct _JackDawProjectClass JackDawProjectClass;
 
+/* Ruler display mode */
+typedef enum {
+    JACKDAW_RULER_TIME = 0,   /* HH:MM:SS / samples (existing) */
+    JACKDAW_RULER_BARS        /* bars.beats from BPM + time signature */
+} JackDawRulerMode;
+
 struct _JackDawProject {
     GObject parent_instance;
 
@@ -30,6 +36,15 @@ struct _JackDawProject {
     guint        audio_out_count;
     guint        midi_in_count;
     guint        midi_out_count;
+
+    /* Tempo / grid (Phase 3) */
+    gdouble          bpm;            /* beats per minute (default 120) */
+    guint            beats_per_bar;  /* time-sig numerator (default 4) */
+    guint            beat_unit;      /* time-sig denominator (default 4) */
+    gboolean         grid_enabled;   /* draw beat/bar grid on tracks */
+    gboolean         snap_enabled;   /* snap edits/cursor to grid */
+    gboolean         metronome_enabled;
+    JackDawRulerMode ruler_mode;
 };
 
 struct _JackDawProjectClass {
@@ -38,6 +53,7 @@ struct _JackDawProjectClass {
     void (*track_added)  (JackDawProject *project, JackDawTrack *track);
     void (*track_removed)(JackDawProject *project, JackDawTrack *track);
     void (*ports_changed)(JackDawProject *project);
+    void (*timing_changed)(JackDawProject *project);
 };
 
 GType          jackdaw_project_get_type(void);
@@ -59,6 +75,24 @@ const gchar *jackdaw_project_get_file(JackDawProject *p);
 
 /* Signal to refresh port selectors after port count change */
 void jackdaw_project_emit_ports_changed(JackDawProject *p);
+
+/* ---- Tempo / grid (emit "timing-changed" on set) ---- */
+void     jackdaw_project_set_bpm          (JackDawProject *p, gdouble bpm);
+gdouble  jackdaw_project_get_bpm          (JackDawProject *p);
+void     jackdaw_project_set_time_signature(JackDawProject *p,
+                                            guint num, guint den);
+void     jackdaw_project_set_grid_enabled (JackDawProject *p, gboolean on);
+void     jackdaw_project_set_snap_enabled (JackDawProject *p, gboolean on);
+void     jackdaw_project_set_metronome    (JackDawProject *p, gboolean on);
+void     jackdaw_project_set_ruler_mode   (JackDawProject *p, JackDawRulerMode m);
+void     jackdaw_project_emit_timing_changed(JackDawProject *p);
+
+/* Grid geometry helpers (timeline frames at the given sample rate). */
+gdouble  jackdaw_project_frames_per_beat(JackDawProject *p, guint32 sample_rate);
+gdouble  jackdaw_project_frames_per_bar (JackDawProject *p, guint32 sample_rate);
+/* Snap a timeline frame to the nearest beat when snap is enabled. */
+off_t    jackdaw_project_snap_frame(JackDawProject *p, off_t frame,
+                                    guint32 sample_rate);
 
 G_END_DECLS
 

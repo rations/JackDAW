@@ -33,6 +33,7 @@ struct _JackDawTimeRuler {
     GtkAdjustment  *time_adj;    /* value = start sample (gdouble) */
     GtkAdjustment  *zoom_adj;    /* value = samples per pixel (gdouble) */
     GtkAdjustment  *cursor_adj;  /* value = transport playhead in samples */
+    JackDawProject *project;     /* weak ref — for bars/beats ruler mode */
     guint32         sample_rate;
 };
 
@@ -59,6 +60,7 @@ GtkWidget *jackdaw_time_ruler_new(GtkAdjustment *time_adj,
 
 typedef struct _JackDawWaveView      JackDawWaveView;
 typedef struct _JackDawWaveViewClass JackDawWaveViewClass;
+typedef struct _JackDawTimeline      JackDawTimeline;
 
 struct _JackDawWaveView {
     GtkDrawingArea  parent_instance;
@@ -66,6 +68,8 @@ struct _JackDawWaveView {
     GtkAdjustment  *time_adj;    /* strong ref */
     GtkAdjustment  *zoom_adj;    /* strong ref */
     GtkAdjustment  *cursor_adj;  /* strong ref — transport playhead */
+    JackDawProject *project;     /* weak ref — for tempo/grid */
+    JackDawTimeline *timeline;   /* weak ref — for shared selection */
     gboolean        focused;
 };
 
@@ -92,7 +96,6 @@ void       jackdaw_wave_view_invalidate (JackDawWaveView *wv);
 #define JACKDAW_IS_TIMELINE(o) \
     (G_TYPE_CHECK_INSTANCE_TYPE(o, JACKDAW_TYPE_TIMELINE))
 
-typedef struct _JackDawTimeline      JackDawTimeline;
 typedef struct _JackDawTimelineClass JackDawTimelineClass;
 
 struct _JackDawTimeline {
@@ -108,6 +111,23 @@ struct _JackDawTimeline {
     GtkWidget        *tracks_box;    /* GtkBox vertical inside scroll */
 
     JackDawTrack     *focused_track; /* weak ref; NULL when nothing focused */
+
+    /* Shared selection range (timeline frames). sel_active = a region is set. */
+    gboolean          sel_active;
+    gboolean          selecting;   /* button1 drag in progress */
+    off_t             sel_start;
+    off_t             sel_end;
+
+    /* Right-click context: track + timeline frame under the pointer */
+    JackDawTrack     *menu_track;
+    off_t             menu_frame;
+
+    /* Per-track region-edit undo/redo stacks (GHashTable track→GQueue of
+     * GPtrArray* region-list snapshots). */
+    GHashTable       *undo_stacks;
+    GHashTable       *redo_stacks;
+
+    GtkWidget        *hscroll;     /* horizontal scrollbar bound to time_adj */
 
     /* Keeps ruler spacer and all track strips at the same width automatically */
     GtkSizeGroup     *header_size_group;
@@ -136,6 +156,14 @@ JackDawTrack *jackdaw_timeline_get_focused(JackDawTimeline *tl);
 void          jackdaw_timeline_zoom_in    (JackDawTimeline *tl);
 void          jackdaw_timeline_zoom_out   (JackDawTimeline *tl);
 void          jackdaw_timeline_set_cursor (JackDawTimeline *tl, off_t sample);
+
+/* Region editing (operate on the focused track / current selection) */
+void          jackdaw_timeline_split_at_cursor(JackDawTimeline *tl);
+void          jackdaw_timeline_undo           (JackDawTimeline *tl);
+void          jackdaw_timeline_redo           (JackDawTimeline *tl);
+
+/* Redraw every track's wave view (e.g. after a timing or selection change). */
+void          jackdaw_timeline_redraw_all(JackDawTimeline *tl);
 
 G_END_DECLS
 

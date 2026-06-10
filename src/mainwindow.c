@@ -5,6 +5,7 @@
 #include "mainwindow.h"
 #include "jackdaw-engine.h"
 #include "audio_clip.h"
+#include "mixer.h"
 #include "main.h"
 #include "um.h"
 
@@ -123,13 +124,21 @@ static void mw_remove_track_cb(GtkMenuItem *item, gpointer data)
 
 /* ---- Transport ---- */
 
+/* Toggle a CSS style class on a widget based on a boolean. */
+static void mw_set_class(GtkWidget *w, const char *cls, gboolean on)
+{
+    GtkStyleContext *ctx = gtk_widget_get_style_context(w);
+    if (on) gtk_style_context_add_class(ctx, cls);
+    else    gtk_style_context_remove_class(ctx, cls);
+}
+
 static void mw_transport_play_cb(GtkWidget *widget, gpointer data)
 {
     (void)data;
-    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget)))
-        jackdaw_engine_start_playback();
-    else
-        jackdaw_engine_stop_playback();
+    gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
+    if (on) jackdaw_engine_start_playback();
+    else    jackdaw_engine_stop_playback();
+    mw_set_class(widget, "transport-play", on);
 }
 
 static void mw_pause_cb(GtkWidget *widget, gpointer data)
@@ -155,7 +164,8 @@ static void mw_transport_stop_cb(GtkMenuItem *item, gpointer data)
 static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
 {
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
-    if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget))) {
+    gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
+    if (on) {
         jackdaw_engine_start_recording();
         /* start_recording sets ENGINE_PLAYING; keep the play button in sync */
         if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(win->play_button)))
@@ -163,6 +173,69 @@ static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
     } else {
         jackdaw_engine_stop_recording();
     }
+    mw_set_class(widget, "transport-rec", on);
+}
+
+/* ---- Function toolbar callbacks ---- */
+
+static void mw_split_cb(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    jackdaw_timeline_split_at_cursor(mw_timeline(GTK_WIDGET(data)));
+}
+
+static void mw_grid_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_grid_enabled(win->project,
+                                     gtk_toggle_button_get_active(b));
+}
+
+static void mw_snap_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_snap_enabled(win->project,
+                                     gtk_toggle_button_get_active(b));
+}
+
+static void mw_metro_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_metronome(win->project,
+                                  gtk_toggle_button_get_active(b));
+}
+
+static void mw_bars_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_ruler_mode(win->project,
+        gtk_toggle_button_get_active(b) ? JACKDAW_RULER_BARS
+                                        : JACKDAW_RULER_TIME);
+}
+
+static void mw_bpm_changed(GtkSpinButton *sb, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_bpm(win->project, gtk_spin_button_get_value(sb));
+}
+
+static void mw_timesig_changed(GtkSpinButton *sb, gpointer data)
+{
+    (void)sb;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkSpinButton *num = g_object_get_data(G_OBJECT(win), "ts-num");
+    GtkSpinButton *den = g_object_get_data(G_OBJECT(win), "ts-den");
+    if (num && den)
+        jackdaw_project_set_time_signature(win->project,
+            (guint)gtk_spin_button_get_value_as_int(num),
+            (guint)gtk_spin_button_get_value_as_int(den));
+}
+
+static void mw_mixer_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (!win->mixer) return;
+    gtk_widget_set_visible(win->mixer, gtk_toggle_button_get_active(b));
 }
 
 static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
@@ -179,13 +252,14 @@ static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
 
 static void mw_undo_cb(GtkMenuItem *item, gpointer data)
 {
-    (void)item; (void)data;
-    /* Placeholder: edit operations will be added in a later phase */
+    (void)item;
+    jackdaw_timeline_undo(mw_timeline(GTK_WIDGET(data)));
 }
 
 static void mw_redo_cb(GtkMenuItem *item, gpointer data)
 {
-    (void)item; (void)data;
+    (void)item;
+    jackdaw_timeline_redo(mw_timeline(GTK_WIDGET(data)));
 }
 
 /* ---- View menu ---- */
@@ -326,6 +400,8 @@ static void jackdaw_main_window_init(JackDawMainWindow *win)
     win->play_button     = NULL;
     win->record_button   = NULL;
     win->time_label      = NULL;
+    win->mixer           = NULL;
+    win->paned           = NULL;
     win->track_counter   = 0;
     win->transport_timer = 0;
 }
@@ -343,6 +419,22 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
 
     gtk_window_set_title(GTK_WINDOW(win), "JackDAW 0.1.0");
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 700);
+
+    /* Transport button state colours (play = green, record = red). */
+    {
+        GtkCssProvider *css = gtk_css_provider_new();
+        gtk_css_provider_load_from_data(css,
+            "button.transport-play {"
+            "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
+            "button.transport-rec  {"
+            "  background-image:none; background-color:#c0392b; color:#ffffff; }",
+            -1, NULL);
+        gtk_style_context_add_provider_for_screen(
+            gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+        g_object_unref(css);
+    }
+
     g_signal_connect(win, "delete-event", G_CALLBACK(mw_delete_event), NULL);
     g_signal_connect(win, "key-press-event", G_CALLBACK(mw_key_press), NULL);
 
@@ -442,10 +534,69 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_widget_set_size_request(win->time_label, 90, -1);
     gtk_box_pack_start(GTK_BOX(toolbar), win->time_label, FALSE, FALSE, 8);
 
-    /* ---- Timeline ---- */
+    /* ---- Function toolbar (DAW tools) ---- */
+    GtkWidget *ftb = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(ftb), 3);
+    gtk_box_pack_start(GTK_BOX(vbox), ftb, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                       FALSE, FALSE, 0);
+
+    GtkWidget *btn_split = gtk_button_new_with_label("Split");
+    gtk_widget_set_tooltip_text(btn_split, "Split focused track at the cursor");
+    g_signal_connect(btn_split, "clicked", G_CALLBACK(mw_split_cb), win);
+    gtk_box_pack_start(GTK_BOX(ftb), btn_split, FALSE, FALSE, 0);
+
+    GtkWidget *tg_grid = gtk_toggle_button_new_with_label("Grid");
+    g_signal_connect(tg_grid, "toggled", G_CALLBACK(mw_grid_toggled), win);
+    gtk_box_pack_start(GTK_BOX(ftb), tg_grid, FALSE, FALSE, 0);
+
+    GtkWidget *tg_snap = gtk_toggle_button_new_with_label("Snap");
+    g_signal_connect(tg_snap, "toggled", G_CALLBACK(mw_snap_toggled), win);
+    gtk_box_pack_start(GTK_BOX(ftb), tg_snap, FALSE, FALSE, 0);
+
+    GtkWidget *tg_metro = gtk_toggle_button_new_with_label("Metro");
+    g_signal_connect(tg_metro, "toggled", G_CALLBACK(mw_metro_toggled), win);
+    gtk_box_pack_start(GTK_BOX(ftb), tg_metro, FALSE, FALSE, 0);
+
+    GtkWidget *tg_bars = gtk_toggle_button_new_with_label("Bars");
+    gtk_widget_set_tooltip_text(tg_bars, "Ruler: bars/beats vs time");
+    g_signal_connect(tg_bars, "toggled", G_CALLBACK(mw_bars_toggled), win);
+    gtk_box_pack_start(GTK_BOX(ftb), tg_bars, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ftb), gtk_label_new("BPM"), FALSE, FALSE, 4);
+    GtkWidget *bpm = gtk_spin_button_new_with_range(20.0, 999.0, 1.0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(bpm),
+                              jackdaw_project_get_bpm(project));
+    g_signal_connect(bpm, "value-changed", G_CALLBACK(mw_bpm_changed), win);
+    gtk_box_pack_start(GTK_BOX(ftb), bpm, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ftb), gtk_label_new("Sig"), FALSE, FALSE, 4);
+    GtkWidget *ts_num = gtk_spin_button_new_with_range(1.0, 32.0, 1.0);
+    GtkWidget *ts_den = gtk_spin_button_new_with_range(1.0, 32.0, 1.0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ts_num), 4.0);
+    gtk_spin_button_set_value(GTK_SPIN_BUTTON(ts_den), 4.0);
+    g_object_set_data(G_OBJECT(win), "ts-num", ts_num);
+    g_object_set_data(G_OBJECT(win), "ts-den", ts_den);
+    g_signal_connect(ts_num, "value-changed", G_CALLBACK(mw_timesig_changed), win);
+    g_signal_connect(ts_den, "value-changed", G_CALLBACK(mw_timesig_changed), win);
+    gtk_box_pack_start(GTK_BOX(ftb), ts_num, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ftb), gtk_label_new("/"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ftb), ts_den, FALSE, FALSE, 0);
+
+    GtkWidget *tg_mixer = gtk_toggle_button_new_with_label("Mixer");
+    g_signal_connect(tg_mixer, "toggled", G_CALLBACK(mw_mixer_toggled), win);
+    gtk_box_pack_end(GTK_BOX(ftb), tg_mixer, FALSE, FALSE, 0);
+
+    /* ---- Timeline + mixer dock (vertical paned) ---- */
     GtkWidget *tl_widget = jackdaw_timeline_new(project);
     win->timeline = JACKDAW_TIMELINE(tl_widget);
-    gtk_box_pack_start(GTK_BOX(vbox), tl_widget, TRUE, TRUE, 0);
+    win->mixer    = jackdaw_mixer_new(project);
+
+    win->paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_paned_pack1(GTK_PANED(win->paned), tl_widget,  TRUE,  FALSE);
+    gtk_paned_pack2(GTK_PANED(win->paned), win->mixer, FALSE, FALSE);
+    gtk_box_pack_start(GTK_BOX(vbox), win->paned, TRUE, TRUE, 0);
 
     g_signal_connect(tl_widget, "position-changed",
                      G_CALLBACK(mw_on_position_changed), win);
@@ -453,6 +604,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     win->transport_timer = g_timeout_add(100, mw_transport_timer, win);
 
     gtk_widget_show_all(GTK_WIDGET(win));
+    /* Mixer hidden until toggled on */
+    gtk_widget_hide(win->mixer);
 
     return GTK_WIDGET(win);
 }

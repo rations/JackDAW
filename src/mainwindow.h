@@ -28,6 +28,10 @@ struct _JackDawMainWindow {
     GtkWidget *record_button;
     GtkWidget *time_label;
 
+    /* Mixer dock */
+    GtkWidget *mixer;
+    GtkWidget *paned;
+
     guint      track_counter;   /* incremented for "Track N" names */
     guint      transport_timer; /* 100 ms source id for time display */
 };

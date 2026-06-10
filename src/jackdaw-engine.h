@@ -82,6 +82,9 @@ jack_nframes_t jackdaw_engine_get_buffer_size(void);
  * while ENGINE_PLAYING is set. Read by main thread for display only. */
 off_t jackdaw_engine_get_play_pos(void);
 
+/* Post-master-fader peak levels (master VU). Resets the stored peak on read. */
+void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
+
 /* --- Input port enumeration (main thread only) ---
  * Returns NULL-terminated array of available external JACK audio/MIDI output
  * port names (i.e. sources jackdaw can record from), excluding jackdaw's own

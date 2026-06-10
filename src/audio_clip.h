@@ -26,13 +26,20 @@ typedef struct {
 
     gfloat     *block_peaks;  /* owned; length = n_blocks * channels * 2 */
     guint32     n_blocks;
+
+    gint        refcount;     /* shared across clip regions; new = 1 */
 } AudioClip;
 
 /*
  * Load an audio file.  Reads the whole file once to build the peak table.
- * Returns NULL on failure; *err is set if err != NULL.
+ * Returns NULL on failure; *err is set if err != NULL.  Refcount = 1.
  */
 AudioClip  *audio_clip_new (const gchar *path, GError **err);
+
+/* Take an additional reference; returns the same clip (NULL-safe). */
+AudioClip  *audio_clip_ref (AudioClip   *clip);
+
+/* Drop a reference; frees the clip (and its buffers) when it reaches zero. */
 void        audio_clip_free(AudioClip   *clip);
 
 /*

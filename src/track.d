@@ -93,7 +93,7 @@ src/track.o: src/track.c src/config.h src/track.h \
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h src/audio_clip.h \
- src/um.h
+ src/clipregion.h src/jackdaw-engine.h src/project.h src/um.h
 src/config.h:
 src/track.h:
 /usr/include/glib-2.0/glib-object.h:
@@ -207,4 +207,7 @@ src/track.h:
 /usr/include/glib-2.0/gobject/gvaluetypes.h:
 /usr/include/glib-2.0/gobject/gobject-autocleanups.h:
 src/audio_clip.h:
+src/clipregion.h:
+src/jackdaw-engine.h:
+src/project.h:
 src/um.h:

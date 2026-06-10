@@ -65,11 +65,14 @@ SRCS := \
     $(SRCDIR)/settings.c \
     $(SRCDIR)/um.c \
     $(SRCDIR)/audio_clip.c \
+    $(SRCDIR)/clipregion.c \
     $(SRCDIR)/track.c \
     $(SRCDIR)/project.c \
     $(SRCDIR)/jackdaw-engine.c \
+    $(SRCDIR)/knob.c \
     $(SRCDIR)/trackstrip.c \
     $(SRCDIR)/timeline.c \
+    $(SRCDIR)/mixer.c \
     $(SRCDIR)/mainwindow.c
 
 OBJS := $(SRCS:.c=.o)

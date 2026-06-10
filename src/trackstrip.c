@@ -5,140 +5,9 @@
 #include "trackstrip.h"
 #include "timeline.h"       /* TIMELINE_HEADER_WIDTH */
 #include "jackdaw-engine.h"
+#include "knob.h"
 
 G_DEFINE_TYPE(JackDawTrackStrip, jackdaw_track_strip, GTK_TYPE_BOX)
-
-/* ---- Cairo knob --------------------------------------------------------- */
-
-#define KNOB_SIZE       28          /* px: drawing area width and height */
-#define KNOB_START_ANG  (-M_PI * 5.0 / 4.0)   /* min value: ~7:30 position */
-#define KNOB_END_ANG    (M_PI / 4.0)            /* max value: ~4:30 position */
-
-typedef struct {
-    double   value;
-    double   min;
-    double   max;
-    double   drag_start_y;
-    double   drag_start_val;
-    gboolean dragging;
-    void   (*on_change)(double val, gpointer user_data);
-    gpointer user_data;
-} KnobData;
-
-static double knob_angle(KnobData *kd)
-{
-    double t = (kd->max > kd->min)
-               ? (kd->value - kd->min) / (kd->max - kd->min)
-               : 0.0;
-    t = CLAMP(t, 0.0, 1.0);
-    return KNOB_START_ANG + t * (KNOB_END_ANG - KNOB_START_ANG);
-}
-
-static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
-{
-    KnobData *kd = data;
-    GtkAllocation alloc;
-    gtk_widget_get_allocation(widget, &alloc);
-
-    double cx = alloc.width  / 2.0;
-    double cy = alloc.height / 2.0;
-    double r  = MIN(cx, cy) - 2.5;
-    double ang = knob_angle(kd);
-
-    /* Background arc track */
-    cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
-    cairo_set_line_width(cr, 3.0);
-    cairo_arc(cr, cx, cy, r - 1.5, KNOB_START_ANG, KNOB_END_ANG);
-    cairo_stroke(cr);
-
-    /* Value arc */
-    cairo_set_source_rgb(cr, 0.2, 0.55, 0.9);
-    cairo_set_line_width(cr, 3.0);
-    cairo_arc(cr, cx, cy, r - 1.5, KNOB_START_ANG, ang);
-    cairo_stroke(cr);
-
-    /* Pointer dot on the rim */
-    double px = cx + (r - 3.5) * cos(ang);
-    double py = cy + (r - 3.5) * sin(ang);
-    cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
-    cairo_arc(cr, px, py, 2.0, 0.0, 2.0 * M_PI);
-    cairo_fill(cr);
-
-    return FALSE;
-}
-
-static gboolean knob_press(GtkWidget *widget, GdkEventButton *ev, gpointer data)
-{
-    KnobData *kd = data;
-    if (ev->button != 1) return FALSE;
-    kd->dragging       = TRUE;
-    kd->drag_start_y   = ev->y_root;
-    kd->drag_start_val = kd->value;
-    gtk_widget_grab_focus(widget);
-    return TRUE;
-}
-
-static gboolean knob_motion(GtkWidget *widget, GdkEventMotion *ev, gpointer data)
-{
-    KnobData *kd = data;
-    if (!kd->dragging) return FALSE;
-    double range = kd->max - kd->min;
-    double delta = (kd->drag_start_y - ev->y_root) * range / 150.0;
-    kd->value = CLAMP(kd->drag_start_val + delta, kd->min, kd->max);
-    gtk_widget_queue_draw(widget);
-    if (kd->on_change) kd->on_change(kd->value, kd->user_data);
-    return TRUE;
-}
-
-static gboolean knob_release(GtkWidget *widget, GdkEventButton *ev, gpointer data)
-{
-    (void)widget; (void)ev;
-    KnobData *kd = data;
-    kd->dragging = FALSE;
-    return TRUE;
-}
-
-static gboolean knob_scroll(GtkWidget *widget, GdkEventScroll *ev, gpointer data)
-{
-    KnobData *kd = data;
-    double step = (kd->max - kd->min) / 200.0;
-    if (ev->direction == GDK_SCROLL_UP   || ev->direction == GDK_SCROLL_RIGHT)
-        kd->value = CLAMP(kd->value + step, kd->min, kd->max);
-    else if (ev->direction == GDK_SCROLL_DOWN || ev->direction == GDK_SCROLL_LEFT)
-        kd->value = CLAMP(kd->value - step, kd->min, kd->max);
-    else
-        return FALSE;
-    gtk_widget_queue_draw(widget);
-    if (kd->on_change) kd->on_change(kd->value, kd->user_data);
-    return TRUE;
-}
-
-static GtkWidget *knob_new(double min, double max, double value,
-                            void (*on_change)(double, gpointer), gpointer user_data)
-{
-    KnobData *kd     = g_new0(KnobData, 1);
-    kd->min          = min;
-    kd->max          = max;
-    kd->value        = CLAMP(value, min, max);
-    kd->on_change    = on_change;
-    kd->user_data    = user_data;
-
-    GtkWidget *da = gtk_drawing_area_new();
-    gtk_widget_set_size_request(da, KNOB_SIZE, KNOB_SIZE);
-    gtk_widget_add_events(da,
-        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
-        GDK_POINTER_MOTION_MASK | GDK_SCROLL_MASK);
-    gtk_widget_set_can_focus(da, TRUE);
-
-    g_object_set_data_full(G_OBJECT(da), "knob-data", kd, g_free);
-    g_signal_connect(da, "draw",                  G_CALLBACK(knob_draw_cb),  kd);
-    g_signal_connect(da, "button-press-event",    G_CALLBACK(knob_press),    kd);
-    g_signal_connect(da, "motion-notify-event",   G_CALLBACK(knob_motion),   kd);
-    g_signal_connect(da, "button-release-event",  G_CALLBACK(knob_release),  kd);
-    g_signal_connect(da, "scroll-event",          G_CALLBACK(knob_scroll),   kd);
-
-    return da;
-}
 
 /* ---- Strip signal callbacks --------------------------------------------- */
 
@@ -540,10 +409,11 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     double vol_db = (vol_linear > 0.0f)
                     ? CLAMP(20.0 * log10((double)vol_linear), -25.0, 25.0)
                     : -25.0;
-    strip->vol_knob = knob_new(-25.0, 25.0, vol_db, on_vol_changed, strip);
+    strip->vol_knob = knob_new(-25.0, 25.0, vol_db, 0.0, KNOB_DB,
+                               on_vol_changed, strip);
     strip->pan_knob = knob_new( -1.0,  1.0,
-                               (double)jackdaw_track_get_pan(track),
-                               on_pan_changed, strip);
+                               (double)jackdaw_track_get_pan(track), 0.0,
+                               KNOB_PAN, on_pan_changed, strip);
     gtk_widget_set_tooltip_text(strip->vol_knob,
         "Volume: drag up/down or scroll. Centre = 0 dB");
     gtk_widget_set_tooltip_text(strip->pan_knob,

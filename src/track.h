@@ -4,6 +4,7 @@
 #include <glib-object.h>
 #include <jack/ringbuffer.h>
 #include "audio_clip.h"
+#include "clipregion.h"
 
 G_BEGIN_DECLS
 
@@ -32,7 +33,13 @@ struct _JackDawTrack {
 
     gchar     *name;
     guint      slot;          /* index in engine track slot array */
-    AudioClip *clip;          /* audio data; track owns this — may be NULL */
+
+    /* Timeline clip regions (main-thread list, ordered by tl_pos).
+     * The feeder thread never touches this directly — it reads the immutable
+     * rt_snapshot under region_lock. */
+    GPtrArray          *regions;     /* GPtrArray of ClipRegion* */
+    GMutex              region_lock; /* guards rt_snapshot (main ↔ feeder) */
+    ClipRegionSnapshot *rt_snapshot; /* current snapshot for the feeder */
 
     /* Input routing — indices into engine port arrays; -1 = none */
     gint     audio_in_idx;
@@ -61,7 +68,19 @@ struct _JackDawTrack {
 
     /* Recording state — main thread only */
     off_t    rec_start_frame;  /* transport pos when Record was pressed */
+    off_t    rec_latency;      /* JACK capture latency at record start (frames) */
     gboolean mono_record;      /* TRUE = 1-ch WAV (default), FALSE = stereo */
+
+    /* Timeline position of the most recent recording (sample offset from 0).
+     * Kept for the live recording overlay; finalised audio lives in regions. */
+    off_t    clip_start;
+
+    /* Real-time waveform peak buffer.
+     * Allocated (main thread) at rec start, freed after clip finalized.
+     * RT callback writes; main thread (wave view draw) reads. */
+    gfloat        *rec_peak_buf;    /* interleaved [min,max] pairs per JACK period */
+    volatile gint  rec_peak_count;  /* number of valid pairs written so far */
+    guint          rec_peak_block;  /* samples per bucket (= jack_get_buffer_size) */
 
     /* External JACK ports connected to this track's input ports (main-thread only).
      * NULL = no connection established by jackdaw. */
@@ -88,10 +107,31 @@ JackDawTrack *jackdaw_track_new(const gchar *name, AudioClip *clip);
 const gchar *jackdaw_track_get_name (JackDawTrack *t);
 void         jackdaw_track_set_name (JackDawTrack *t, const gchar *name);
 
-/* Returns borrowed pointer — do not free */
+/* Returns the first region's source clip, or NULL — borrowed, do not free.
+ * Back-compat helper; new code iterates jackdaw_track_get_regions(). */
 AudioClip   *jackdaw_track_get_clip (JackDawTrack *t);
-/* Track takes ownership of new_clip; frees old clip */
+/* Replace all regions with a single region holding new_clip placed at tl=0.
+ * Consumes one reference to new_clip (mhwaveedit "take ownership" semantics). */
 void         jackdaw_track_set_clip (JackDawTrack *t, AudioClip *new_clip);
+
+/* ---- Clip regions (main thread only) ----
+ * Place a clip as a new region at timeline position tl_pos, spanning the whole
+ * file.  Consumes one reference to clip.  Rebuilds the feeder snapshot. */
+void         jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl_pos);
+
+/* Borrowed region list — edit in place, then call jackdaw_track_commit_regions(). */
+GPtrArray   *jackdaw_track_get_regions(JackDawTrack *t);
+
+/* Rebuild the immutable feeder snapshot from the current region list and emit
+ * state-changed so wave views redraw.  Call after any region-list edit. */
+void         jackdaw_track_commit_regions(JackDawTrack *t);
+
+/* Last timeline frame covered by any region (0 if empty). */
+off_t        jackdaw_track_total_frames(JackDawTrack *t);
+
+/* Feeder-thread access: take/drop a reference to the current snapshot.
+ * ref locks region_lock briefly; the returned snapshot is stable until unref. */
+ClipRegionSnapshot *jackdaw_track_ref_snapshot(JackDawTrack *t);
 
 /* State flag helpers — use g_atomic_int_or/and for thread safety */
 void  jackdaw_track_set_armed (JackDawTrack *t, gboolean armed);

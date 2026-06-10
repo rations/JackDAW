@@ -23,6 +23,7 @@ AudioClip *audio_clip_new(const gchar *path, GError **err)
     AudioClip *clip = g_new0(AudioClip, 1);
     clip->path = g_strdup(path);
     clip->info = info;
+    clip->refcount = 1;
 
     int ch = info.channels;
     clip->n_blocks = (guint32)((info.frames + AUDIO_CLIP_PEAK_BLOCK - 1)
@@ -58,9 +59,18 @@ AudioClip *audio_clip_new(const gchar *path, GError **err)
     return clip;
 }
 
+AudioClip *audio_clip_ref(AudioClip *clip)
+{
+    if (!clip) return NULL;
+    g_atomic_int_inc(&clip->refcount);
+    return clip;
+}
+
 void audio_clip_free(AudioClip *clip)
 {
     if (!clip) return;
+    if (!g_atomic_int_dec_and_test(&clip->refcount))
+        return;   /* still referenced elsewhere */
     g_free(clip->block_peaks);
     g_free(clip->path);
     g_free(clip);
