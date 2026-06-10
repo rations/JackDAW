@@ -185,6 +185,80 @@ static void on_solo_toggled(GtkToggleButton *btn, gpointer data)
     jackdaw_track_set_soloed(strip->track, gtk_toggle_button_get_active(btn));
 }
 
+static void on_mono_toggled(GtkToggleButton *btn, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update) return;
+    gboolean stereo = gtk_toggle_button_get_active(btn);
+    strip->track->mono_record = !stereo;
+    gtk_button_set_label(GTK_BUTTON(btn), stereo ? "St" : "Mo");
+}
+
+/* ---- VU meter ----------------------------------------------------------- */
+
+static gboolean vu_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(widget, &alloc);
+    gint w = alloc.width;
+    gint h = alloc.height;
+
+    cairo_set_source_rgb(cr, 0.08, 0.08, 0.08);
+    cairo_paint(cr);
+
+    gfloat peaks[2] = { strip->vu_peak_L, strip->vu_peak_R };
+    gint   bar_w    = (w - 3) / 2;  /* 1px border each side + 1px gap between */
+
+    for (int ch = 0; ch < 2; ch++) {
+        gint bx = (ch == 0) ? 1 : (2 + bar_w);
+
+        /* Empty trough */
+        cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
+        cairo_rectangle(cr, bx, 0, bar_w, h);
+        cairo_fill(cr);
+
+        gfloat pk = peaks[ch];
+        if (pk > 0.0001f) {
+            float db      = 20.0f * log10f(pk);
+            float db_clip = CLAMP(db, -60.0f, 6.0f);
+            float frac    = (db_clip + 60.0f) / 66.0f;  /* 0 = -60dBFS, 1 = +6dBFS */
+            gint  fill_h  = (gint)(frac * (float)h);
+            if (fill_h > h) fill_h = h;
+
+            if (fill_h > 0) {
+                /* Color: green below -12dB, yellow -12..0dB, red above 0dB */
+                if (db >= 0.0f)
+                    cairo_set_source_rgb(cr, 0.90, 0.15, 0.15);
+                else if (db >= -12.0f)
+                    cairo_set_source_rgb(cr, 0.85, 0.78, 0.10);
+                else
+                    cairo_set_source_rgb(cr, 0.15, 0.68, 0.20);
+
+                cairo_rectangle(cr, bx, h - fill_h, bar_w, fill_h);
+                cairo_fill(cr);
+            }
+        }
+    }
+    return FALSE;
+}
+
+static gboolean vu_timer_cb(gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (!JACKDAW_IS_TRACK_STRIP(strip)) return G_SOURCE_REMOVE;
+
+    gfloat pk_L = 0.0f, pk_R = 0.0f;
+    jackdaw_track_get_peaks(strip->track, &pk_L, &pk_R);
+
+    /* Instant rise, ~-20dB/s decay (0.89 per 50ms tick) */
+    strip->vu_peak_L = (pk_L > strip->vu_peak_L) ? pk_L : strip->vu_peak_L * 0.89f;
+    strip->vu_peak_R = (pk_R > strip->vu_peak_R) ? pk_R : strip->vu_peak_R * 0.89f;
+
+    gtk_widget_queue_draw(strip->vu_meter);
+    return G_SOURCE_CONTINUE;
+}
+
 /* ---- Input combo -------------------------------------------------------- */
 
 static gboolean input_row_sep_func(GtkTreeModel *model, GtkTreeIter *iter,
@@ -373,6 +447,10 @@ static void jackdaw_track_strip_get_preferred_width(GtkWidget *widget,
 static void jackdaw_track_strip_finalize(GObject *obj)
 {
     JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(obj);
+    if (strip->vu_timer) {
+        g_source_remove(strip->vu_timer);
+        strip->vu_timer = 0;
+    }
     g_object_unref(strip->track);
     g_object_unref(strip->project);
     if (strip->input_store) g_object_unref(strip->input_store);
@@ -394,15 +472,21 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->btn_arm         = NULL;
     strip->btn_mute        = NULL;
     strip->btn_solo        = NULL;
+    strip->btn_mono        = NULL;
     strip->vol_knob        = NULL;
     strip->pan_knob        = NULL;
     strip->input_combo     = NULL;
     strip->input_store     = NULL;
+    strip->vu_meter        = NULL;
+    strip->vu_peak_L       = 0.0f;
+    strip->vu_peak_R       = 0.0f;
+    strip->vu_timer        = 0;
     strip->suppress_update = FALSE;
 
+    /* Horizontal: [controls | vu_meter] */
     gtk_orientable_set_orientation(GTK_ORIENTABLE(strip),
-                                   GTK_ORIENTATION_VERTICAL);
-    gtk_box_set_spacing(GTK_BOX(strip), 2);
+                                   GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_set_spacing(GTK_BOX(strip), 0);
     gtk_container_set_border_width(GTK_CONTAINER(strip), 1);
 }
 
@@ -420,34 +504,43 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     strip->track   = g_object_ref(track);
     strip->project = g_object_ref(project);
 
-    /* ---- Row 1: editable track name ---- */
+    /* ---- Left controls box (vertical) ---- */
+    GtkWidget *left_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+
+    /* Row 1: editable track name */
     strip->name_entry = gtk_entry_new();
     gtk_entry_set_text(GTK_ENTRY(strip->name_entry),
                        jackdaw_track_get_name(track));
     gtk_entry_set_placeholder_text(GTK_ENTRY(strip->name_entry), "Track name");
     gtk_entry_set_has_frame(GTK_ENTRY(strip->name_entry), FALSE);
     gtk_widget_set_size_request(strip->name_entry, 1, -1);
-    gtk_box_pack_start(GTK_BOX(strip), strip->name_entry, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left_box), strip->name_entry, FALSE, FALSE, 0);
 
-    /* ---- Row 2: [A][M][S] | V knob + P knob ---- */
+    /* Row 2: [A][M][S][Mo] | V knob | P knob */
     GtkWidget *ctrl_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
 
     strip->btn_arm  = gtk_toggle_button_new_with_label("A");
     strip->btn_mute = gtk_toggle_button_new_with_label("M");
     strip->btn_solo = gtk_toggle_button_new_with_label("S");
+    /* Mono/stereo record toggle — default: Mo (mono) */
+    strip->btn_mono = gtk_toggle_button_new_with_label("Mo");
+
     gtk_widget_set_size_request(strip->btn_arm,  20, 20);
     gtk_widget_set_size_request(strip->btn_mute, 20, 20);
     gtk_widget_set_size_request(strip->btn_solo, 20, 20);
+    gtk_widget_set_size_request(strip->btn_mono, 26, 20);
+
     gtk_widget_set_tooltip_text(strip->btn_arm,  "Arm for recording");
     gtk_widget_set_tooltip_text(strip->btn_mute, "Mute");
     gtk_widget_set_tooltip_text(strip->btn_solo, "Solo");
+    gtk_widget_set_tooltip_text(strip->btn_mono,
+        "Record mode: Mo = mono (single channel), St = stereo");
 
     gfloat vol_linear = jackdaw_track_get_volume(track);
     double vol_db = (vol_linear > 0.0f)
                     ? CLAMP(20.0 * log10((double)vol_linear), -25.0, 25.0)
                     : -25.0;
-    strip->vol_knob = knob_new(-25.0, 25.0, vol_db,
-                               on_vol_changed, strip);
+    strip->vol_knob = knob_new(-25.0, 25.0, vol_db, on_vol_changed, strip);
     strip->pan_knob = knob_new( -1.0,  1.0,
                                (double)jackdaw_track_get_pan(track),
                                on_pan_changed, strip);
@@ -456,21 +549,20 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_widget_set_tooltip_text(strip->pan_knob,
         "Pan: drag up/down or scroll. Centre = C");
 
-    GtkWidget *sep     = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
     GtkWidget *vol_lbl = gtk_label_new("V");
     GtkWidget *pan_lbl = gtk_label_new("P");
 
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_arm,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mute, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_solo, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), sep,             FALSE, FALSE, 3);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mono, FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->vol_knob, FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,         FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->pan_knob, FALSE, FALSE, 1);
-    gtk_box_pack_start(GTK_BOX(strip), ctrl_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left_box), ctrl_row, FALSE, FALSE, 0);
 
-    /* ---- Row 3: Single input combo (audio + MIDI grouped) ---- */
+    /* Row 3: Single input combo (audio + MIDI grouped) */
     strip->input_store = gtk_list_store_new(ICOL_COUNT,
         G_TYPE_STRING,   /* ICOL_TEXT      */
         G_TYPE_STRING,   /* ICOL_PORT      */
@@ -494,7 +586,17 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
         "sensitive", ICOL_SENSITIVE,
         NULL);
 
-    gtk_box_pack_start(GTK_BOX(strip), strip->input_combo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(left_box), strip->input_combo, FALSE, FALSE, 0);
+
+    /* ---- VU meter (right side, 20px wide) ---- */
+    strip->vu_meter = gtk_drawing_area_new();
+    gtk_widget_set_size_request(strip->vu_meter, 20, -1);
+    gtk_widget_add_events(strip->vu_meter, 0);
+    g_signal_connect(strip->vu_meter, "draw", G_CALLBACK(vu_draw_cb), strip);
+
+    /* Pack left controls + VU into the strip (horizontal) */
+    gtk_box_pack_start(GTK_BOX(strip), left_box,      TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(strip), strip->vu_meter, FALSE, FALSE, 0);
 
     /* ---- Set initial button states (suppress callbacks) ---- */
     strip->suppress_update = TRUE;
@@ -504,6 +606,9 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
                                  jackdaw_track_is_muted(track));
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_solo),
                                  jackdaw_track_is_soloed(track));
+    /* btn_mono: active = stereo, inactive = mono (default) */
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_mono),
+                                 !track->mono_record);
     strip->suppress_update = FALSE;
 
     /* ---- Connect UI signals ---- */
@@ -515,6 +620,8 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
                      G_CALLBACK(on_mute_toggled), strip);
     g_signal_connect(strip->btn_solo, "toggled",
                      G_CALLBACK(on_solo_toggled), strip);
+    g_signal_connect(strip->btn_mono, "toggled",
+                     G_CALLBACK(on_mono_toggled), strip);
     g_signal_connect(strip->input_combo, "changed",
                      G_CALLBACK(on_input_combo_changed), strip);
 
@@ -524,6 +631,9 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
 
     /* Initial combo population */
     jackdaw_track_strip_refresh_ports(strip);
+
+    /* Start VU meter refresh timer */
+    strip->vu_timer = g_timeout_add(50, vu_timer_cb, strip);
 
     return GTK_WIDGET(strip);
 }

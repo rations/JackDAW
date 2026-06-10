@@ -46,12 +46,18 @@ struct _JackDawTrackStrip {
     GtkWidget    *btn_arm;
     GtkWidget    *btn_mute;
     GtkWidget    *btn_solo;
+    GtkWidget    *btn_mono;      /* mono/stereo record toggle */
 
     GtkWidget    *vol_knob;      /* GtkDrawingArea; KnobData via g_object_set_data */
     GtkWidget    *pan_knob;
 
     GtkWidget    *input_combo;   /* GtkComboBox backed by input_store */
     GtkListStore *input_store;
+
+    GtkWidget    *vu_meter;      /* GtkDrawingArea: L/R level bars */
+    gfloat        vu_peak_L;
+    gfloat        vu_peak_R;
+    guint         vu_timer;
 
     gboolean      suppress_update;
 };

@@ -234,6 +234,23 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
         }
     }
 
+    /* Recording region: growing red overlay while this track is armed and recording.
+     * Drawn over the clip (if any) so the user sees audio being captured in realtime. */
+    if (wv->track && jackdaw_engine_is_recording() &&
+        jackdaw_track_is_armed(wv->track) && spp > 0.0) {
+        off_t    rec_start = wv->track->rec_start_frame;
+        off_t    rec_end   = jackdaw_engine_get_play_pos();
+        gdouble  x0        = ((gdouble)rec_start - start) / spp;
+        gdouble  x1        = ((gdouble)rec_end   - start) / spp;
+        x0 = CLAMP(x0, 0.0, (gdouble)w);
+        x1 = CLAMP(x1, 0.0, (gdouble)w);
+        if (x1 > x0) {
+            cairo_set_source_rgba(cr, 0.85, 0.10, 0.10, 0.35);
+            cairo_rectangle(cr, x0, 0, x1 - x0, h);
+            cairo_fill(cr);
+        }
+    }
+
     /* Transport playhead (orange) */
     if (wv->cursor_adj && spp > 0.0) {
         double px = (gtk_adjustment_get_value(wv->cursor_adj) - start) / spp;

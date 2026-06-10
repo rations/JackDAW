@@ -457,6 +457,7 @@ typedef struct {
     char     path[512];       /* destination file path */
     off_t    written;         /* frames written so far */
     gint     finalize_req;    /* g_atomic: stop_recording sets to 1 */
+    int      channels;        /* 1 = mono, 2 = stereo; set when file is opened */
 } RecorderSlot;
 
 static RecorderSlot  recorder_slots[JACKDAW_MAX_TRACKS];
@@ -509,11 +510,15 @@ static void recorder_slot_finalize(guint i)
             jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
             jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
 
-            for (size_t f = 0; f < av; f++) {
-                rec_interleaved[f * 2]     = rec_scratch_L[f];
-                rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+            if (rs->channels == 1) {
+                rs->written += sf_writef_float(rs->sf, rec_scratch_L, (sf_count_t)av);
+            } else {
+                for (size_t f = 0; f < av; f++) {
+                    rec_interleaved[f * 2]     = rec_scratch_L[f];
+                    rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+                }
+                rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
             }
-            rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
         }
     }
 
@@ -561,11 +566,15 @@ static void *recorder_thread_func(void *arg)
                 jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
                 jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
 
-                for (size_t f = 0; f < av; f++) {
-                    rec_interleaved[f * 2]     = rec_scratch_L[f];
-                    rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+                if (rs->channels == 1) {
+                    rs->written += sf_writef_float(rs->sf, rec_scratch_L, (sf_count_t)av);
+                } else {
+                    for (size_t f = 0; f < av; f++) {
+                        rec_interleaved[f * 2]     = rec_scratch_L[f];
+                        rec_interleaved[f * 2 + 1] = rec_scratch_R[f];
+                    }
+                    rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
                 }
-                rs->written += sf_writef_float(rs->sf, rec_interleaved, (sf_count_t)av);
             }
         }
     }
@@ -1133,6 +1142,11 @@ gboolean jackdaw_engine_is_running(void)
     return engine.active;
 }
 
+gboolean jackdaw_engine_is_recording(void)
+{
+    return (g_atomic_int_get(&engine.transport_flags) & ENGINE_RECORDING) != 0;
+}
+
 /* ---- Port count management ---- */
 
 gboolean jackdaw_engine_set_audio_in_count(guint n)
@@ -1383,9 +1397,11 @@ void jackdaw_engine_start_recording(void)
         g_strlcpy(recorder_slots[i].path, fpath, sizeof(recorder_slots[i].path));
         g_free(fpath); g_free(fname); g_free(ts);
 
+        int channels = t->mono_record ? 1 : 2;
+
         SF_INFO sfi    = { 0 };
         sfi.samplerate = (int)sr;
-        sfi.channels   = 2;
+        sfi.channels   = channels;
         sfi.format     = SF_FORMAT_WAV | SF_FORMAT_PCM_24;
 
         SNDFILE *sf = sf_open(recorder_slots[i].path, SFM_WRITE, &sfi);
@@ -1394,9 +1410,13 @@ void jackdaw_engine_start_recording(void)
                       recorder_slots[i].path, sf_strerror(NULL));
             continue;
         }
-        recorder_slots[i].sf      = sf;
-        recorder_slots[i].written = 0;
+        recorder_slots[i].sf       = sf;
+        recorder_slots[i].written  = 0;
+        recorder_slots[i].channels = channels;
         g_atomic_int_set(&recorder_slots[i].finalize_req, 0);
+
+        /* Record where playback started so wave views can show the live region */
+        t->rec_start_frame = (off_t)engine.play_pos;
     }
 
     g_date_time_unref(now);

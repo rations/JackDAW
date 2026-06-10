@@ -64,13 +64,15 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->pan           = 0.0f;
     t->peak_L        = 0.0f;
     t->peak_R        = 0.0f;
-    t->play_buf_L    = NULL;
-    t->play_buf_R    = NULL;
-    t->rec_buf_L     = NULL;
-    t->rec_buf_R     = NULL;
-    t->midi_rec_buf  = NULL;
-    t->played_frames = 0;
-    t->rt_chain      = NULL;
+    t->play_buf_L      = NULL;
+    t->play_buf_R      = NULL;
+    t->rec_buf_L       = NULL;
+    t->rec_buf_R       = NULL;
+    t->midi_rec_buf    = NULL;
+    t->played_frames   = 0;
+    t->rec_start_frame = 0;
+    t->mono_record     = TRUE;
+    t->rt_chain        = NULL;
 }
 
 /* ---- Constructor ---- */

@@ -59,6 +59,10 @@ struct _JackDawTrack {
     /* Playback position in frames within clip */
     volatile off_t played_frames;
 
+    /* Recording state — main thread only */
+    off_t    rec_start_frame;  /* transport pos when Record was pressed */
+    gboolean mono_record;      /* TRUE = 1-ch WAV (default), FALSE = stereo */
+
     /* External JACK ports connected to this track's input ports (main-thread only).
      * NULL = no connection established by jackdaw. */
     gchar *audio_src_port;
