@@ -59,9 +59,11 @@ static void jackdaw_project_init(JackDawProject *p)
     p->project_file    = NULL;
     p->master_volume   = 1.0f;
     p->master_rt_chain = NULL;
-    p->audio_in_count  = settings_get_uint32("jackAudioInCount",  2);
-    p->audio_out_count = settings_get_uint32("jackAudioOutCount", 2);
-    p->midi_in_count   = settings_get_uint32("jackMidiInCount",   1);
+    /* 0 = auto-detect from physical JACK ports at engine init */
+    p->audio_in_count  = settings_get_uint32("jackAudioInCount",  0);
+    p->audio_out_count = settings_get_uint32("jackAudioOutCount", 0);
+    p->midi_in_count   = settings_get_uint32("jackMidiInCount",   0);
+    p->midi_out_count  = settings_get_uint32("jackMidiOutCount",  0);
 }
 
 /* ---- Constructor ---- */

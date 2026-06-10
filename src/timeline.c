@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "timeline.h"
+#include "trackstrip.h"
 #include "jackdaw-engine.h"
 #include "main.h"
 
@@ -668,20 +669,11 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     gtk_widget_set_size_request(outer, -1,
         TIMELINE_TRACK_HEIGHT + TIMELINE_RESIZE_HANDLE_H);
 
-    /* Track row: [header 180px][waveview →] */
+    /* Track row: [TrackStrip 180px][waveview →] */
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
-    /* Header — Phase 3 will replace with full TrackStrip widget */
-    GtkWidget *header = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(header, TIMELINE_HEADER_WIDTH, -1);
-    gtk_widget_set_name(header, "track-header");
-
-    const gchar *name = jackdaw_track_get_name(track);
-    GtkWidget *label = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(label), name ? name : "Track");
-    gtk_label_set_ellipsize(GTK_LABEL(label), PANGO_ELLIPSIZE_END);
-    gtk_label_set_xalign(GTK_LABEL(label), 0.05f);
-    gtk_box_pack_start(GTK_BOX(header), label, TRUE, FALSE, 4);
+    /* Track strip header (ARM/M/S, vol, pan, input selectors) */
+    GtkWidget *strip = jackdaw_track_strip_new(track, tl->project);
 
     /* WaveView */
     GtkWidget *wv = jackdaw_wave_view_new(track, tl->time_adj, tl->zoom_adj,
@@ -691,8 +683,8 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     g_signal_connect(wv, "scroll-event",
                      G_CALLBACK(timeline_wave_scroll), tl);
 
-    gtk_box_pack_start(GTK_BOX(row), header, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(row), wv,     TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(row), strip, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), wv,    TRUE,  TRUE,  0);
 
     /* Resize handle: 5px drawing area the user drags to change track height */
     GtkWidget *handle = gtk_drawing_area_new();

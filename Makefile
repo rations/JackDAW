@@ -68,6 +68,7 @@ SRCS := \
     $(SRCDIR)/track.c \
     $(SRCDIR)/project.c \
     $(SRCDIR)/jackdaw-engine.c \
+    $(SRCDIR)/trackstrip.c \
     $(SRCDIR)/timeline.c \
     $(SRCDIR)/mainwindow.c
 

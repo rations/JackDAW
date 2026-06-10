@@ -24,10 +24,12 @@ struct _JackDawProject {
     gfloat       master_volume;
     volatile gpointer master_rt_chain;  /* swapped atomically (Phase 5) */
 
-    /* JACK port counts (from Preferences; applied via jackdaw_engine_set_*) */
+    /* JACK port counts (0 = auto-detect from physical JACK ports at startup).
+     * Non-zero values are user overrides saved in the inifile. */
     guint        audio_in_count;
     guint        audio_out_count;
     guint        midi_in_count;
+    guint        midi_out_count;
 };
 
 struct _JackDawProjectClass {

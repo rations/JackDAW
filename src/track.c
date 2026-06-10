@@ -21,6 +21,8 @@ static void jackdaw_track_finalize(GObject *obj)
     JackDawTrack *t = JACKDAW_TRACK(obj);
 
     g_free(t->name);
+    g_free(t->audio_src_port);
+    g_free(t->midi_src_port);
     audio_clip_free(t->clip);
 
     if (t->play_buf_L)   jack_ringbuffer_free(t->play_buf_L);
@@ -55,6 +57,8 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->clip          = NULL;
     t->audio_in_idx  = -1;
     t->midi_in_idx   = -1;
+    t->audio_src_port = NULL;
+    t->midi_src_port  = NULL;
     t->state_flags   = 0;
     t->volume        = 1.0f;
     t->pan           = 0.0f;
@@ -166,7 +170,7 @@ gboolean jackdaw_track_is_soloed(JackDawTrack *t)
 void jackdaw_track_set_volume(JackDawTrack *t, gfloat vol)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(t));
-    t->volume = CLAMP(vol, 0.0f, 2.0f);
+    t->volume = CLAMP(vol, 0.0f, 18.0f); /* 18.0 ≈ linear gain for +25 dB */
 }
 
 gfloat jackdaw_track_get_volume(JackDawTrack *t)

@@ -59,6 +59,11 @@ struct _JackDawTrack {
     /* Playback position in frames within clip */
     volatile off_t played_frames;
 
+    /* External JACK ports connected to this track's input ports (main-thread only).
+     * NULL = no connection established by jackdaw. */
+    gchar *audio_src_port;
+    gchar *midi_src_port;
+
     /* RT plugin chain pointer — swapped atomically (Phase 5) */
     volatile gpointer rt_chain;
 };
