@@ -49,3 +49,18 @@ void settings_set_uint32(const gchar *key, guint32 val)
     if (!kf) return;
     g_key_file_set_int64(kf, "jackdaw", key, (gint64)val);
 }
+
+gchar *settings_get_string(const gchar *key, const gchar *def)
+{
+    if (!kf) return g_strdup(def ? def : "");
+    GError *err = NULL;
+    gchar *v = g_key_file_get_string(kf, "jackdaw", key, &err);
+    if (err) { g_error_free(err); return g_strdup(def ? def : ""); }
+    return v;
+}
+
+void settings_set_string(const gchar *key, const gchar *val)
+{
+    if (!kf) return;
+    g_key_file_set_string(kf, "jackdaw", key, val ? val : "");
+}

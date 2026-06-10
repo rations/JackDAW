@@ -87,9 +87,22 @@ struct _JackDawTrack {
     gchar *audio_src_port;
     gchar *midi_src_port;
 
-    /* RT plugin chain pointer — swapped atomically (Phase 5) */
-    volatile gpointer rt_chain;
+    /* FX: main-thread list of PluginInstance* (effects on this track). */
+    GPtrArray *fx_list;
+
+    /* Immutable FX chain snapshot read by the RT callback (JackDawFxChain*),
+     * published with g_atomic_pointer_set. Old chains/instances are reclaimed
+     * on the next edit (deferred so the RT thread is never left dangling). */
+    gpointer rt_chain;
+    GPtrArray *retire_chains;   /* JackDawFxChain* awaiting free */
+    GPtrArray *retire_fx;       /* PluginInstance* awaiting free */
 };
+
+/* Immutable FX chain snapshot. fx[i] is a PluginInstance* (opaque here). */
+typedef struct {
+    int       n;
+    gpointer *fx;
+} JackDawFxChain;
 
 struct _JackDawTrackClass {
     GObjectClass parent_class;
@@ -153,6 +166,15 @@ void jackdaw_track_set_midi_in (JackDawTrack *t, gint idx);
 
 /* Peak meter read (call from main thread, resets after read) */
 void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R);
+
+/* ---- FX chain (main thread) ----
+ * Instances are PluginInstance* (from pluginhost.h); kept as gpointer here to
+ * avoid pulling GTK/plugin headers into every track.h consumer. */
+void      jackdaw_track_fx_add   (JackDawTrack *t, gpointer instance);
+void      jackdaw_track_fx_remove(JackDawTrack *t, guint index);
+void      jackdaw_track_fx_move  (JackDawTrack *t, guint from, guint to);
+guint     jackdaw_track_fx_count (JackDawTrack *t);
+gpointer  jackdaw_track_fx_get   (JackDawTrack *t, guint index);
 
 G_END_DECLS
 

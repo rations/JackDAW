@@ -222,8 +222,8 @@ static gboolean mixer_vu_tick(gpointer data)
         if (!s || !s->track) continue;
         gfloat l = 0.0f, r = 0.0f;
         jackdaw_track_get_peaks(s->track, &l, &r);
-        s->pk_L = (l > s->pk_L) ? l : s->pk_L * 0.89f;
-        s->pk_R = (r > s->pk_R) ? r : s->pk_R * 0.89f;
+        s->pk_L = l;
+        s->pk_R = r;
         gtk_widget_queue_draw(s->vu);
     }
     return G_SOURCE_CONTINUE;

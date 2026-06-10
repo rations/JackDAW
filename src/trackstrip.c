@@ -6,6 +6,7 @@
 #include "timeline.h"       /* TIMELINE_HEADER_WIDTH */
 #include "jackdaw-engine.h"
 #include "knob.h"
+#include "fxwindow.h"
 
 G_DEFINE_TYPE(JackDawTrackStrip, jackdaw_track_strip, GTK_TYPE_BOX)
 
@@ -61,6 +62,13 @@ static void on_mono_toggled(GtkToggleButton *btn, gpointer data)
     gboolean stereo = gtk_toggle_button_get_active(btn);
     strip->track->mono_record = !stereo;
     gtk_button_set_label(GTK_BUTTON(btn), stereo ? "St" : "Mo");
+}
+
+static void on_fx_clicked(GtkButton *btn, gpointer data)
+{
+    (void)btn;
+    JackDawTrackStrip *strip = data;
+    jackdaw_fx_window_open(strip->track, strip->project);
 }
 
 /* ---- VU meter ----------------------------------------------------------- */
@@ -120,9 +128,9 @@ static gboolean vu_timer_cb(gpointer data)
     gfloat pk_L = 0.0f, pk_R = 0.0f;
     jackdaw_track_get_peaks(strip->track, &pk_L, &pk_R);
 
-    /* Instant rise, ~-20dB/s decay (0.89 per 50ms tick) */
-    strip->vu_peak_L = (pk_L > strip->vu_peak_L) ? pk_L : strip->vu_peak_L * 0.89f;
-    strip->vu_peak_R = (pk_R > strip->vu_peak_R) ? pk_R : strip->vu_peak_R * 0.89f;
+    /* RT applies the decay-hold; just mirror it. */
+    strip->vu_peak_L = pk_L;
+    strip->vu_peak_R = pk_R;
 
     gtk_widget_queue_draw(strip->vu_meter);
     return G_SOURCE_CONTINUE;
@@ -422,10 +430,16 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     GtkWidget *vol_lbl = gtk_label_new("V");
     GtkWidget *pan_lbl = gtk_label_new("P");
 
+    GtkWidget *btn_fx = gtk_button_new_with_label("Fx");
+    gtk_widget_set_size_request(btn_fx, 24, 20);
+    gtk_widget_set_tooltip_text(btn_fx, "Open the effects window for this track");
+    g_signal_connect(btn_fx, "clicked", G_CALLBACK(on_fx_clicked), strip);
+
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_arm,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mute, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_solo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mono, FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), btn_fx,          FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->vol_knob, FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,         FALSE, FALSE, 2);

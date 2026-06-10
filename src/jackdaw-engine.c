@@ -14,6 +14,7 @@
 #endif
 
 #include "jackdaw-engine.h"
+#include "pluginhost.h"
 #include "settings.h"
 #include "um.h"
 
@@ -705,32 +706,9 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         if (got_R < want)
             memset((char *)engine.tmp_R + got_R, 0, want - got_R);
 
-        /* Constant-power pan law:
-         *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] -> [0, pi/2]
-         *   L gain = vol * cos(angle), R gain = vol * sin(angle) */
-        gfloat vol   = t->volume;
-        gfloat pan   = t->pan;
-        float angle  = (pan + 1.0f) * (float)M_PI_4;
-        float gain_L = vol * cosf(angle);
-        float gain_R = vol * sinf(angle);
-
-        gfloat peak_L = 0.0f, peak_R = 0.0f;
-
-        /* Mix playback audio */
-        for (k = 0; k < nframes; k++) {
-            float sL = engine.tmp_L[k] * gain_L;
-            float sR = engine.tmp_R[k] * gain_R;
-            engine.master_L[k] += sL;
-            engine.master_R[k] += sR;
-            if (sL < 0.0f) sL = -sL;
-            if (sR < 0.0f) sR = -sR;
-            if (sL > peak_L) peak_L = sL;
-            if (sR > peak_R) peak_R = sR;
-        }
-
-        /* Input monitoring: when armed, the live input is always mixed into the
-         * master so the user hears their instrument before and during recording.
-         * The same buffer is also captured to rec_buf when ENGINE_RECORDING is set. */
+        /* Live input monitoring: when armed, the input is summed into the
+         * track signal (so it is heard through the FX chain), and the dry input
+         * is captured to rec_buf when recording. */
         float *live_in = NULL;
         if ((tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
             (guint)t->audio_in_idx < engine.audio_in_count &&
@@ -741,15 +719,9 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         if (live_in) {
             gfloat wf_mn = 0.0f, wf_mx = 0.0f;
             for (k = 0; k < nframes; k++) {
-                float s  = live_in[k];
-                float sL = s * gain_L;
-                float sR = s * gain_R;
-                engine.master_L[k] += sL;
-                engine.master_R[k] += sR;
-                if (sL < 0.0f) sL = -sL;
-                if (sR < 0.0f) sR = -sR;
-                if (sL > peak_L) peak_L = sL;
-                if (sR > peak_R) peak_R = sR;
+                float s = live_in[k];
+                engine.tmp_L[k] += s;   /* pre-FX, pre-fader monitor sum */
+                engine.tmp_R[k] += s;
                 if (s < wf_mn) wf_mn = s;
                 if (s > wf_mx) wf_mx = s;
             }
@@ -764,9 +736,44 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             }
         }
 
-        /* Update peaks for VU — racy write is acceptable */
-        if (peak_L > t->peak_L) t->peak_L = peak_L;
-        if (peak_R > t->peak_R) t->peak_R = peak_R;
+        /* Run the per-track FX chain in place (pre-fader). The chain is an
+         * immutable snapshot published by the main thread; pluginhost_process
+         * is RT-safe and skips bypassed effects. */
+        JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+        if (chain) {
+            for (int fi = 0; fi < chain->n; fi++)
+                pluginhost_process((PluginInstance *)chain->fx[fi],
+                                   engine.tmp_L, engine.tmp_R, (int)nframes);
+        }
+
+        /* Constant-power pan law:
+         *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] -> [0, pi/2]
+         *   L gain = vol * cos(angle), R gain = vol * sin(angle) */
+        gfloat vol   = t->volume;
+        gfloat pan   = t->pan;
+        float angle  = (pan + 1.0f) * (float)M_PI_4;
+        float gain_L = vol * cosf(angle);
+        float gain_R = vol * sinf(angle);
+
+        gfloat peak_L = 0.0f, peak_R = 0.0f;
+
+        /* Apply fader/pan into the master mix and meter post-FX/post-fader. */
+        for (k = 0; k < nframes; k++) {
+            float sL = engine.tmp_L[k] * gain_L;
+            float sR = engine.tmp_R[k] * gain_R;
+            engine.master_L[k] += sL;
+            engine.master_R[k] += sR;
+            if (sL < 0.0f) sL = -sL;
+            if (sR < 0.0f) sR = -sR;
+            if (sL > peak_L) peak_L = sL;
+            if (sR > peak_R) peak_R = sR;
+        }
+
+        /* Update peaks for VU — ballistic decay-hold applied here so the value
+         * can be read non-destructively by any number of meters (track strip
+         * AND mixer). Racy write/read is acceptable. */
+        t->peak_L = (peak_L > t->peak_L) ? peak_L : t->peak_L * 0.92f;
+        t->peak_R = (peak_R > t->peak_R) ? peak_R : t->peak_R * 0.92f;
 
         /* Capture live input to rec ringbuffers when recording */
         if (live_in && (flags & ENGINE_RECORDING)) {

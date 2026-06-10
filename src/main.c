@@ -9,6 +9,7 @@
 #include "project.h"
 #include "jackdaw-engine.h"
 #include "mainwindow.h"
+#include "pluginhost.h"
 
 /* ---- Globals ---- */
 
@@ -247,12 +248,18 @@ int main(int argc, char **argv)
     if (jackdaw_engine_init(project))
         g_warning("JACK engine failed to start — running without audio");
 
+    /* Plugin host: size buffers to the engine's rate / block. */
+    pluginhost_init((double)jackdaw_engine_get_sample_rate(),
+                    (int)jackdaw_engine_get_buffer_size());
+    pluginhost_load_paths_from_settings();
+
     GtkWidget *win = jackdaw_main_window_new(project);
     g_object_unref(project);  /* main window holds its own ref */
     (void)win;
 
     gtk_main();
 
+    pluginhost_shutdown();
     jackdaw_engine_quit();
     settings_set_uint32("timescaleMode", default_timescale_mode);
     settings_quit();
