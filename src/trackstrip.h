@@ -42,7 +42,7 @@ struct _JackDawTrackStrip {
     JackDawTrack   *track;    /* strong ref */
     JackDawProject *project;  /* strong ref */
 
-    GtkWidget    *label;         /* track name */
+    GtkWidget    *name_entry;    /* editable track name (GtkEntry) */
     GtkWidget    *btn_arm;
     GtkWidget    *btn_mute;
     GtkWidget    *btn_solo;

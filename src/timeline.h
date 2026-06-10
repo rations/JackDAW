@@ -109,6 +109,9 @@ struct _JackDawTimeline {
 
     JackDawTrack     *focused_track; /* weak ref; NULL when nothing focused */
 
+    /* Keeps ruler spacer and all track strips at the same width automatically */
+    GtkSizeGroup     *header_size_group;
+
     /* JackDawTrack* → JackDawWaveView* */
     GHashTable       *wave_views;
 

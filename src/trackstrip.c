@@ -157,6 +157,13 @@ static void on_pan_changed(double pan, gpointer data)
     jackdaw_track_set_pan(strip->track, (gfloat)pan);
 }
 
+static void on_name_changed(GtkEntry *entry, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update) return;
+    jackdaw_track_set_name(strip->track, gtk_entry_get_text(entry));
+}
+
 static void on_arm_toggled(GtkToggleButton *btn, gpointer data)
 {
     JackDawTrackStrip *strip = data;
@@ -383,7 +390,7 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
 {
     strip->track           = NULL;
     strip->project         = NULL;
-    strip->label           = NULL;
+    strip->name_entry      = NULL;
     strip->btn_arm         = NULL;
     strip->btn_mute        = NULL;
     strip->btn_solo        = NULL;
@@ -413,58 +420,55 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     strip->track   = g_object_ref(track);
     strip->project = g_object_ref(project);
 
-    /* ---- Row 1: ARM/M/S buttons + track name ---- */
-    GtkWidget *top_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    /* ---- Row 1: editable track name ---- */
+    strip->name_entry = gtk_entry_new();
+    gtk_entry_set_text(GTK_ENTRY(strip->name_entry),
+                       jackdaw_track_get_name(track));
+    gtk_entry_set_placeholder_text(GTK_ENTRY(strip->name_entry), "Track name");
+    gtk_entry_set_has_frame(GTK_ENTRY(strip->name_entry), FALSE);
+    gtk_widget_set_size_request(strip->name_entry, 1, -1);
+    gtk_box_pack_start(GTK_BOX(strip), strip->name_entry, FALSE, FALSE, 0);
+
+    /* ---- Row 2: [A][M][S] | V knob + P knob ---- */
+    GtkWidget *ctrl_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
 
     strip->btn_arm  = gtk_toggle_button_new_with_label("A");
     strip->btn_mute = gtk_toggle_button_new_with_label("M");
     strip->btn_solo = gtk_toggle_button_new_with_label("S");
-    gtk_widget_set_size_request(strip->btn_arm,  16, 16);
-    gtk_widget_set_size_request(strip->btn_mute, 16, 16);
-    gtk_widget_set_size_request(strip->btn_solo, 16, 16);
+    gtk_widget_set_size_request(strip->btn_arm,  20, 20);
+    gtk_widget_set_size_request(strip->btn_mute, 20, 20);
+    gtk_widget_set_size_request(strip->btn_solo, 20, 20);
     gtk_widget_set_tooltip_text(strip->btn_arm,  "Arm for recording");
     gtk_widget_set_tooltip_text(strip->btn_mute, "Mute");
     gtk_widget_set_tooltip_text(strip->btn_solo, "Solo");
-
-    strip->label = gtk_label_new(NULL);
-    gtk_label_set_text(GTK_LABEL(strip->label), jackdaw_track_get_name(track));
-    gtk_label_set_ellipsize(GTK_LABEL(strip->label), PANGO_ELLIPSIZE_END);
-    gtk_label_set_xalign(GTK_LABEL(strip->label), 0.0f);
-
-    gtk_box_pack_start(GTK_BOX(top_row), strip->btn_arm,  FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_row), strip->btn_mute, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_row), strip->btn_solo, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(top_row), strip->label,    TRUE,  TRUE,  2);
-    gtk_box_pack_start(GTK_BOX(strip), top_row, FALSE, FALSE, 0);
-
-    /* ---- Row 2: Vol knob + Pan knob ---- */
-    GtkWidget *knob_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
 
     gfloat vol_linear = jackdaw_track_get_volume(track);
     double vol_db = (vol_linear > 0.0f)
                     ? CLAMP(20.0 * log10((double)vol_linear), -25.0, 25.0)
                     : -25.0;
-
-    strip->vol_knob = knob_new(-25.0, 25.0, vol_db,   on_vol_changed, strip);
+    strip->vol_knob = knob_new(-25.0, 25.0, vol_db,
+                               on_vol_changed, strip);
     strip->pan_knob = knob_new( -1.0,  1.0,
-                                (double)jackdaw_track_get_pan(track),
-                                on_pan_changed, strip);
-
+                               (double)jackdaw_track_get_pan(track),
+                               on_pan_changed, strip);
     gtk_widget_set_tooltip_text(strip->vol_knob,
-        "Volume: drag up/down, scroll. Centre = 0 dB");
+        "Volume: drag up/down or scroll. Centre = 0 dB");
     gtk_widget_set_tooltip_text(strip->pan_knob,
-        "Pan: drag up/down, scroll. Centre = C");
+        "Pan: drag up/down or scroll. Centre = C");
 
+    GtkWidget *sep     = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
     GtkWidget *vol_lbl = gtk_label_new("V");
     GtkWidget *pan_lbl = gtk_label_new("P");
-    gtk_widget_set_size_request(vol_lbl, -1, -1);
-    gtk_widget_set_size_request(pan_lbl, -1, -1);
 
-    gtk_box_pack_start(GTK_BOX(knob_row), vol_lbl,        FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(knob_row), strip->vol_knob, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(knob_row), pan_lbl,        FALSE, FALSE, 4);
-    gtk_box_pack_start(GTK_BOX(knob_row), strip->pan_knob, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(strip), knob_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_arm,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mute, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_solo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), sep,             FALSE, FALSE, 3);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->vol_knob, FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,         FALSE, FALSE, 2);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->pan_knob, FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(strip), ctrl_row, FALSE, FALSE, 0);
 
     /* ---- Row 3: Single input combo (audio + MIDI grouped) ---- */
     strip->input_store = gtk_list_store_new(ICOL_COUNT,
@@ -503,6 +507,8 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     strip->suppress_update = FALSE;
 
     /* ---- Connect UI signals ---- */
+    g_signal_connect(strip->name_entry, "changed",
+                     G_CALLBACK(on_name_changed),  strip);
     g_signal_connect(strip->btn_arm,  "toggled",
                      G_CALLBACK(on_arm_toggled),  strip);
     g_signal_connect(strip->btn_mute, "toggled",

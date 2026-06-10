@@ -562,6 +562,10 @@ static void jackdaw_timeline_finalize(GObject *obj)
     g_object_unref(tl->time_adj);
     g_object_unref(tl->zoom_adj);
     g_object_unref(tl->cursor_adj);
+    if (tl->header_size_group) {
+        g_object_unref(tl->header_size_group);
+        tl->header_size_group = NULL;
+    }
     g_hash_table_destroy(tl->wave_views);
 
     G_OBJECT_CLASS(jackdaw_timeline_parent_class)->finalize(obj);
@@ -586,15 +590,16 @@ static void jackdaw_timeline_class_init(JackDawTimelineClass *klass)
 
 static void jackdaw_timeline_init(JackDawTimeline *tl)
 {
-    tl->project       = NULL;
-    tl->time_adj      = NULL;
-    tl->zoom_adj      = NULL;
-    tl->cursor_adj    = NULL;
-    tl->ruler         = NULL;
-    tl->tracks_scroll = NULL;
-    tl->tracks_box    = NULL;
-    tl->focused_track = NULL;
-    tl->wave_views    = g_hash_table_new(g_direct_hash, g_direct_equal);
+    tl->project            = NULL;
+    tl->time_adj           = NULL;
+    tl->zoom_adj           = NULL;
+    tl->cursor_adj         = NULL;
+    tl->ruler              = NULL;
+    tl->tracks_scroll      = NULL;
+    tl->tracks_box         = NULL;
+    tl->focused_track      = NULL;
+    tl->header_size_group  = NULL;
+    tl->wave_views         = g_hash_table_new(g_direct_hash, g_direct_equal);
     tl->update_timer  = 0;
     tl->prev_play_pos = 0;
 
@@ -617,11 +622,16 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
     tl->cursor_adj = gtk_adjustment_new(0.0, 0.0, (gdouble)G_MAXINT64,
                                         1.0, 1.0, 0.0);
 
+    /* Size group: keeps ruler spacer and every track strip at the same width.
+     * No fixed pixel values needed — GTK negotiates based on actual content. */
+    tl->header_size_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+
     /* ---- Ruler row ---- */
     GtkWidget *ruler_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_size_request(spacer, TIMELINE_HEADER_WIDTH, -1);
+    gtk_size_group_add_widget(tl->header_size_group, spacer);
 
     guint32 sr = jackdaw_engine_is_running()
                  ? (guint32)jackdaw_engine_get_sample_rate()
@@ -672,8 +682,10 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     /* Track row: [TrackStrip 180px][waveview →] */
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
-    /* Track strip header (ARM/M/S, vol, pan, input selectors) */
+    /* Track strip header (ARM/M/S, vol, pan, input selectors).
+     * Adding to header_size_group keeps it aligned with the ruler spacer. */
     GtkWidget *strip = jackdaw_track_strip_new(track, tl->project);
+    gtk_size_group_add_widget(tl->header_size_group, strip);
 
     /* WaveView */
     GtkWidget *wv = jackdaw_wave_view_new(track, tl->time_adj, tl->zoom_adj,
