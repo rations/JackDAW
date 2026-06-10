@@ -329,11 +329,12 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
                 cairo_stroke(cr);
             }
 
-            /* Region boundary line (left edge), if visible */
-            if (r_tl0 >= view0) {
+            /* Region boundary line (left edge) — skip the very first region
+             * at timeline 0 so the start edge isn't cluttered. */
+            if (r_tl0 > 0) {
                 double bx = ((gdouble)r_tl0 - start) / spp;
                 if (bx >= 0.0 && bx < (double)w) {
-                    cairo_set_source_rgba(cr, 0.55, 0.85, 0.60, 0.5);
+                    cairo_set_source_rgba(cr, 0.95, 0.95, 0.55, 0.9);
                     cairo_set_line_width(cr, 1.0);
                     cairo_move_to(cr, bx + 0.5, 0);
                     cairo_line_to(cr, bx + 0.5, h);
@@ -679,6 +680,31 @@ static off_t timeline_x_to_sample(JackDawTimeline *tl, gdouble x)
     return s;
 }
 
+/* Select the region of `track` that covers `frame` (highlight its full span);
+ * clears the selection if the frame is in a gap. */
+static void timeline_select_region_at(JackDawTimeline *tl, JackDawTrack *track,
+                                      off_t frame)
+{
+    ClipRegion *r = track
+        ? clip_region_list_at(jackdaw_track_get_regions(track), frame) : NULL;
+    if (r) {
+        tl->sel_active = TRUE;
+        tl->sel_start  = r->tl_pos;
+        tl->sel_end    = clip_region_end(r);
+    } else {
+        tl->sel_active = FALSE;
+    }
+    jackdaw_timeline_redraw_all(tl);
+}
+
+/* Move the edit playhead to `frame` (and seek the engine when stopped). */
+static void timeline_set_playhead(JackDawTimeline *tl, off_t frame)
+{
+    gtk_adjustment_set_value(tl->cursor_adj, (gdouble)frame);
+    if (!jackdaw_engine_is_playing())
+        jackdaw_engine_locate(frame);
+}
+
 /* ---- Region-edit undo/redo ---- */
 
 static void region_snapshot_free(gpointer p)
@@ -754,17 +780,25 @@ void jackdaw_timeline_redo(JackDawTimeline *tl)
 
 /* ---- Region edit operations ---- */
 
-void jackdaw_timeline_split_at_cursor(JackDawTimeline *tl)
+/* Split `t` at the playhead and select the region to the right of the split. */
+static void timeline_split_track_at_playhead(JackDawTimeline *tl,
+                                             JackDawTrack *t)
 {
-    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
-    JackDawTrack *t = tl->focused_track;
     if (!t) return;
     off_t cur = (off_t)gtk_adjustment_get_value(tl->cursor_adj);
     timeline_push_undo(tl, t);
     clip_region_list_split_at(jackdaw_track_get_regions(t), cur,
                               (int)timeline_jack_sr());
     jackdaw_track_commit_regions(t);
+    /* Focus the new right-hand region so it can be moved/deleted next. */
+    timeline_select_region_at(tl, t, cur);
     jackdaw_timeline_redraw_all(tl);
+}
+
+void jackdaw_timeline_split_at_cursor(JackDawTimeline *tl)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    timeline_split_track_at_playhead(tl, tl->focused_track);
 }
 
 /* ---- Context menu ---- */
@@ -773,12 +807,7 @@ static void menu_split_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawTimeline *tl = data;
-    if (!tl->menu_track) return;
-    timeline_push_undo(tl, tl->menu_track);
-    clip_region_list_split_at(jackdaw_track_get_regions(tl->menu_track),
-                              tl->menu_frame, (int)timeline_jack_sr());
-    jackdaw_track_commit_regions(tl->menu_track);
-    jackdaw_timeline_redraw_all(tl);
+    timeline_split_track_at_playhead(tl, tl->menu_track);
 }
 
 static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
@@ -847,7 +876,7 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
 {
     GtkWidget *menu = gtk_menu_new();
     struct { const char *label; GCallback cb; gboolean sens; } items[] = {
-        { "Split at Cursor",     G_CALLBACK(menu_split_cb),         TRUE },
+        { "Split at Playhead",   G_CALLBACK(menu_split_cb),         TRUE },
         { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    tl->sel_active },
         { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          tl->sel_active },
         { "Delete Region",       G_CALLBACK(menu_delete_region_cb), TRUE },
@@ -875,13 +904,16 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
     if (event->button == 3) {
         tl->menu_track = wv->track;
         tl->menu_frame = sample;
+        timeline_select_region_at(tl, wv->track, sample);
         timeline_show_context_menu(tl, event);
         return TRUE;
     }
 
     if (event->button != 1) return FALSE;
 
-    /* Start a potential drag-selection; also move the edit cursor. */
+    /* Move the playhead to the click (seeks the engine when stopped) and start
+     * a potential drag-selection. */
+    timeline_set_playhead(tl, sample);
     tl->selecting  = TRUE;
     tl->sel_active = FALSE;
     tl->sel_start  = sample;
@@ -913,9 +945,14 @@ static gboolean timeline_wave_motion(GtkWidget *widget,
 static gboolean timeline_wave_released(GtkWidget *widget,
                                        GdkEventButton *event, gpointer data)
 {
-    (void)widget; (void)event;
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    if (event->button != 1) return FALSE;
     tl->selecting = FALSE;
+    /* A plain click (no drag) selects the region under the pointer. */
+    if (!tl->sel_active) {
+        JackDawWaveView *wv = JACKDAW_WAVE_VIEW(widget);
+        timeline_select_region_at(tl, wv->track, tl->sel_start);
+    }
     return FALSE;
 }
 
@@ -980,6 +1017,10 @@ static gboolean timeline_update_timer(gpointer data)
     }
 
     if (!jackdaw_engine_is_running()) return G_SOURCE_CONTINUE;
+
+    /* Only drive the playhead from the transport while actually playing; when
+     * stopped, the cursor stays where the user clicked it. */
+    if (!jackdaw_engine_is_playing()) return G_SOURCE_CONTINUE;
 
     off_t pos = jackdaw_engine_get_play_pos();
     gtk_adjustment_set_value(tl->cursor_adj, (gdouble)pos);

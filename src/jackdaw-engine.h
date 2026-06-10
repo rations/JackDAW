@@ -39,6 +39,9 @@ gboolean jackdaw_engine_is_running(void);
 /* Returns TRUE while ENGINE_RECORDING flag is set. */
 gboolean jackdaw_engine_is_recording(void);
 
+/* Returns TRUE while ENGINE_PLAYING flag is set. */
+gboolean jackdaw_engine_is_playing(void);
+
 /* --- Port count management ---
  * Unregisters ports being removed and registers new ones.
  * Saves the new count to inifile and emits project::ports-changed.

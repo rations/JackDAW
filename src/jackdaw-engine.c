@@ -1231,6 +1231,11 @@ gboolean jackdaw_engine_is_recording(void)
     return (g_atomic_int_get(&engine.transport_flags) & ENGINE_RECORDING) != 0;
 }
 
+gboolean jackdaw_engine_is_playing(void)
+{
+    return (g_atomic_int_get(&engine.transport_flags) & ENGINE_PLAYING) != 0;
+}
+
 /* ---- Port count management ---- */
 
 gboolean jackdaw_engine_set_audio_in_count(guint n)

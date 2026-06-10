@@ -60,14 +60,31 @@ static gboolean mix_vu_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     return FALSE;
 }
 
+/* ---- Fader taper ----
+ * The fader runs 0..1 (bottom..top). 0 dB (unity) sits at 0.75 so there is a
+ * +6 dB region in the top quarter and a -inf..0 dB region in the bottom three
+ * quarters — like a normal mixing-desk fader. */
+static double fader_pos_to_db(double p)
+{
+    if (p >= 0.75) return (p - 0.75) / 0.25 * 6.0;   /* 0 .. +6 dB */
+    return -60.0 * (1.0 - p / 0.75);                  /* -60 .. 0 dB */
+}
+
+static double fader_db_to_pos(double db)
+{
+    if (db >= 0.0)   return 0.75 + CLAMP(db, 0.0, 6.0) / 6.0 * 0.25;
+    if (db <= -60.0) return 0.0;
+    return 0.75 * (1.0 + db / 60.0);
+}
+
 /* ---- Callbacks ---- */
 
 static void mix_fader_changed(GtkRange *range, gpointer data)
 {
     MixerStrip *s = data;
     if (s->suppress) return;
-    double db  = gtk_range_get_value(range);
-    gfloat lin = (db <= -60.0) ? 0.0f : (gfloat)pow(10.0, db / 20.0);
+    double db  = fader_pos_to_db(gtk_range_get_value(range));
+    gfloat lin = (db <= -59.5) ? 0.0f : (gfloat)pow(10.0, db / 20.0);
     if (s->track)
         jackdaw_track_set_volume(s->track, lin);
     else
@@ -127,16 +144,21 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     GtkWidget *mid = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
 
     s->fader = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL,
-                                        -60.0, 6.0, 0.5);
+                                        0.0, 1.0, 0.005);
     gtk_range_set_inverted(GTK_RANGE(s->fader), TRUE);  /* up = louder */
     gtk_scale_set_draw_value(GTK_SCALE(s->fader), FALSE);
-    gtk_widget_set_size_request(s->fader, 28, 120);
+    gtk_widget_set_size_request(s->fader, 34, 130);
+    /* Reference marks at 0 dB (~¾) and +6 dB (top). */
+    gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos(0.0),
+                       GTK_POS_LEFT, "0");
+    gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos(-12.0),
+                       GTK_POS_LEFT, "-12");
     {
         gfloat vol = track ? jackdaw_track_get_volume(track)
                            : jackdaw_project_get_master_volume(mixer->project);
         double db  = (vol > 0.0001f) ? 20.0 * log10((double)vol) : -60.0;
         s->suppress = TRUE;
-        gtk_range_set_value(GTK_RANGE(s->fader), CLAMP(db, -60.0, 6.0));
+        gtk_range_set_value(GTK_RANGE(s->fader), fader_db_to_pos(db));
         s->suppress = FALSE;
     }
     g_signal_connect(s->fader, "value-changed",

@@ -87,7 +87,7 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     char buf[24];
     knob_format(kd, buf, sizeof(buf));
     cairo_set_font_size(cr, 8.0);
-    cairo_set_source_rgb(cr, 0.80, 0.80, 0.80);
+    cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
     cairo_text_extents_t ext;
     cairo_text_extents(cr, buf, &ext);
     double tx = cx - ext.width / 2.0 - ext.x_bearing;

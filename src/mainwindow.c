@@ -424,6 +424,13 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     {
         GtkCssProvider *css = gtk_css_provider_new();
         gtk_css_provider_load_from_data(css,
+            /* Readable controls: dark text, visible button outlines. */
+            "button { color:#101010; border:1px solid #808080; }"
+            "button:checked { background-image:none; background-color:#b8c4d8;"
+            "  color:#101010; }"
+            "spinbutton, spinbutton entry { color:#101010; }"
+            "label { color:#101010; }"
+            /* Transport state colours override the generic button rules. */
             "button.transport-play {"
             "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
             "button.transport-rec  {"
