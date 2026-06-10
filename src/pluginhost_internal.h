@@ -38,16 +38,18 @@ PluginInstance *ph_instance_alloc(PluginFormat fmt, const char *name,
                                   double sr, int max_block);
 
 /* Append PluginInfo* entries to *catalog. extra = GList of char* dirs. */
-void ph_lv2_scan (GList **catalog, const GList *extra);
-void ph_vst2_scan(GList **catalog, const GList *extra);
-void ph_vst3_scan(GList **catalog, const GList *extra);
-void ph_clap_scan(GList **catalog, const GList *extra);
+void ph_lv2_scan   (GList **catalog, const GList *extra);
+void ph_vst2_scan  (GList **catalog, const GList *extra);
+void ph_vst3_scan  (GList **catalog, const GList *extra);
+void ph_clap_scan  (GList **catalog, const GList *extra);
+void ph_ladspa_scan(GList **catalog, const GList *extra);
 
 /* Instantiate (return NULL on failure). */
-PluginInstance *ph_lv2_instantiate (const PluginInfo *, double sr, int max_block);
-PluginInstance *ph_vst2_instantiate(const PluginInfo *, double sr, int max_block);
-PluginInstance *ph_vst3_instantiate(const PluginInfo *, double sr, int max_block);
-PluginInstance *ph_clap_instantiate(const PluginInfo *, double sr, int max_block);
+PluginInstance *ph_lv2_instantiate   (const PluginInfo *, double sr, int max_block);
+PluginInstance *ph_vst2_instantiate  (const PluginInfo *, double sr, int max_block);
+PluginInstance *ph_vst3_instantiate  (const PluginInfo *, double sr, int max_block);
+PluginInstance *ph_clap_instantiate  (const PluginInfo *, double sr, int max_block);
+PluginInstance *ph_ladspa_instantiate(const PluginInfo *, double sr, int max_block);
 
 /* Helpers shared by backends. */
 PluginInfo *ph_info_new(PluginFormat fmt, const char *key,

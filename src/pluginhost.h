@@ -16,6 +16,7 @@ typedef enum {
     PH_VST2,
     PH_VST3,
     PH_CLAP,
+    PH_LADSPA,
     PH_NFORMATS
 } PluginFormat;
 

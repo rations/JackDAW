@@ -23,11 +23,35 @@ static void lv2_world_init(void)
 {
     if (world) return;
     world = lilv_world_new();
-    lilv_world_load_all(world);
     n_audio   = lilv_new_uri(world, LILV_URI_AUDIO_PORT);
     n_control = lilv_new_uri(world, LILV_URI_CONTROL_PORT);
     n_input   = lilv_new_uri(world, LILV_URI_INPUT_PORT);
     n_output  = lilv_new_uri(world, LILV_URI_OUTPUT_PORT);
+}
+
+/* Build the LV2_PATH lilv should search: the user's env (or the standard
+ * directories) plus any extra dirs added in the FX window. */
+static void lv2_apply_search_path(const GList *extra)
+{
+    GString *p = g_string_new("");
+    const char *env = g_getenv("LV2_PATH");
+    if (env && *env) {
+        g_string_append(p, env);
+    } else {
+        gchar *home = g_build_filename(g_get_home_dir(), ".lv2", NULL);
+        g_string_append(p, home);
+        g_free(home);
+        g_string_append(p, ":/usr/lib/lv2:/usr/local/lib/lv2"
+                           ":/usr/lib/x86_64-linux-gnu/lv2");
+    }
+    for (const GList *l = extra; l; l = l->next) {
+        if (p->len) g_string_append_c(p, ':');
+        g_string_append(p, (const char *)l->data);
+    }
+    LilvNode *node = lilv_new_string(world, p->str);
+    lilv_world_set_option(world, LILV_OPTION_LV2_PATH, node);
+    lilv_node_free(node);
+    g_string_free(p, TRUE);
 }
 
 /* ---- Minimal URID map feature (thread-safe) ---- */
@@ -95,11 +119,7 @@ typedef struct {
 void ph_lv2_scan(GList **catalog, const GList *extra)
 {
     lv2_world_init();
-    for (const GList *l = extra; l; l = l->next) {
-        /* lilv uses LV2_PATH; extra dirs are best-effort via env at startup.
-         * Here we just reload so newly-dropped bundles in known dirs appear. */
-        (void)l;
-    }
+    lv2_apply_search_path(extra);
     lilv_world_load_all(world);
 
     const LilvPlugins *plugins = lilv_world_get_all_plugins(world);

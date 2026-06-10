@@ -18,7 +18,9 @@ static GList    *ph_cat       = NULL;   /* PluginInfo* */
 static gboolean  ph_scanned   = FALSE;
 static GList    *ph_paths[PH_NFORMATS]; /* char* extra dirs per format */
 
-static const char *ph_fmt_names[PH_NFORMATS] = { "LV2", "VST2", "VST3", "CLAP" };
+static const char *ph_fmt_names[PH_NFORMATS] = {
+    "LV2", "VST2", "VST3", "CLAP", "LADSPA"
+};
 
 const char *pluginhost_format_name(PluginFormat fmt)
 {
@@ -94,7 +96,24 @@ static void ph_do_scan(void)
 #ifdef HAVE_CLAP
     ph_clap_scan(&ph_cat, ph_paths[PH_CLAP]);
 #endif
+#ifdef HAVE_LADSPA
+    ph_ladspa_scan(&ph_cat, ph_paths[PH_LADSPA]);
+#endif
     ph_scanned = TRUE;
+
+    /* Diagnostics (visible in the terminal). */
+    guint n[PH_NFORMATS] = {0};
+    for (GList *l = ph_cat; l; l = l->next) {
+        PluginInfo *pi = l->data;
+        if (pi->format < PH_NFORMATS) n[pi->format]++;
+    }
+    g_message("plugin scan: LV2=%u VST2=%u VST3=%u CLAP=%u LADSPA=%u%s",
+              n[PH_LV2], n[PH_VST2], n[PH_VST3], n[PH_CLAP], n[PH_LADSPA],
+#ifdef HAVE_VST3
+              "");
+#else
+              "  (VST3 backend not compiled — build with: make VST3=1)");
+#endif
 }
 
 const GList *pluginhost_catalog(void)
@@ -135,7 +154,8 @@ const GList *pluginhost_search_paths(PluginFormat fmt)
 }
 
 static const char *ph_paths_key[PH_NFORMATS] = {
-    "pluginPathsLV2", "pluginPathsVST2", "pluginPathsVST3", "pluginPathsCLAP"
+    "pluginPathsLV2", "pluginPathsVST2", "pluginPathsVST3",
+    "pluginPathsCLAP", "pluginPathsLADSPA"
 };
 
 void pluginhost_load_paths_from_settings(void)
@@ -182,6 +202,9 @@ PluginInstance *pluginhost_instantiate(const PluginInfo *info)
 #endif
 #ifdef HAVE_CLAP
     case PH_CLAP: return ph_clap_instantiate(info, ph_sr, ph_maxblock);
+#endif
+#ifdef HAVE_LADSPA
+    case PH_LADSPA: return ph_ladspa_instantiate(info, ph_sr, ph_maxblock);
 #endif
     default: return NULL;
     }

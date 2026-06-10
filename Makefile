@@ -11,6 +11,8 @@ CC      := gcc
 CXX     := g++
 
 VST3SDK ?= /home/human/third_party/vst3sdk
+# VST3 backend is built by default (you have the SDK). Disable with: make VST3=0
+VST3    ?= 1
 
 # ---------------------------------------------------------------------------
 # Package detection via pkg-config
@@ -42,8 +44,15 @@ PKGS_OPT += suil-0
 OPT_DEFS += -DHAVE_SUIL=1
 endif
 
-# VST2 and CLAP backends use vendored headers in ext/ — always available.
-OPT_DEFS += -DHAVE_VST2=1 -DHAVE_CLAP=1
+# VST2, CLAP and LADSPA backends use vendored headers in ext/ — always available.
+OPT_DEFS += -DHAVE_VST2=1 -DHAVE_CLAP=1 -DHAVE_LADSPA=1
+
+# VST3 enable must be decided BEFORE COMMON captures OPT_DEFS.
+VST3_INC :=
+ifeq ($(VST3),1)
+OPT_DEFS += -DHAVE_VST3=1
+VST3_INC := -I$(VST3SDK) -DRELEASE=1
+endif
 
 PKG_CFLAGS := $(shell pkg-config --cflags $(PKGS_REQ) $(PKGS_OPT))
 PKG_LIBS   := $(shell pkg-config --libs   $(PKGS_REQ) $(PKGS_OPT))
@@ -56,7 +65,7 @@ WARN   := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 COMMON := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) $(PKG_CFLAGS) $(OPT_DEFS)
 
 CFLAGS   := $(COMMON) -std=gnu99
-CXXFLAGS := $(COMMON) -std=c++17
+CXXFLAGS := $(COMMON) -std=c++17 $(VST3_INC)
 
 LDFLAGS := \
     $(PKG_LIBS) \
@@ -78,6 +87,7 @@ SRCS_C := \
     $(SRCDIR)/pluginhost.c \
     $(SRCDIR)/pluginhost_lv2.c \
     $(SRCDIR)/pluginhost_clap.c \
+    $(SRCDIR)/pluginhost_ladspa.c \
     $(SRCDIR)/knob.c \
     $(SRCDIR)/trackstrip.c \
     $(SRCDIR)/timeline.c \
@@ -93,8 +103,6 @@ SRCS_CXX := \
 # your vst3sdk checkout differs.
 VST3_SDK_OBJ :=
 ifeq ($(VST3),1)
-OPT_DEFS += -DHAVE_VST3=1
-CXXFLAGS += -I$(VST3SDK) -DRELEASE=1
 SRCS_CXX += $(SRCDIR)/pluginhost_vst3.cpp
 VST3_SDK_SRC := \
     $(VST3SDK)/pluginterfaces/base/conststringtable.cpp \

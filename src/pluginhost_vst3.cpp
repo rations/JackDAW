@@ -141,7 +141,7 @@ static const char *vst3_param_name(PluginInstance *pi, guint i)
     buf[0] = 0;
     if (b->controller && i < b->param_ids.size()) {
         ParameterInfo info;
-        if (b->controller->getParameterInfoByIndex((int32)i, info) == kResultOk) {
+        if (b->controller->getParameterInfo((int32)i, info) == kResultOk) {
             for (int k = 0; k < 128 && info.title[k]; k++)
                 buf[k] = (char)info.title[k], buf[k + 1] = 0;
         }
@@ -241,7 +241,7 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
         int32 pc = b->controller->getParameterCount();
         for (int32 i = 0; i < pc; i++) {
             ParameterInfo pinf;
-            if (b->controller->getParameterInfoByIndex(i, pinf) == kResultOk)
+            if (b->controller->getParameterInfo(i, pinf) == kResultOk)
                 b->param_ids.push_back(pinf.id);
         }
     }
