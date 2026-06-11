@@ -23,6 +23,7 @@
 #include <lv2/ui/ui.h>
 #ifdef HAVE_SUIL
 #  include <suil/suil.h>
+#  include <gtk/gtkx.h>   /* GTK_IS_SOCKET (suil's wrapper is a GtkSocket) */
 #endif
 
 #include "pluginhost_internal.h"
@@ -547,7 +548,20 @@ static void lv2_destroy_gui(PluginInstance *pi)
     Lv2Backend *b = pi->backend;
     if (!b) return;
     if (b->ui_push_id) { g_source_remove(b->ui_push_id); b->ui_push_id = 0; }
-    if (b->ui) { suil_instance_free(b->ui); b->ui = NULL; }
+    if (b->ui) {
+        /* suil's x11_in_gtk3 wrapper only removes its internal idle timer in its
+         * "plug-removed" handler, but suil_instance_free destroys the socket
+         * BEFORE the plugin window, so that never fires — the idle then leaks and
+         * fires on freed memory in a long-running host (jalv survives only by
+         * quitting). Fire plug-removed first so suil tears the idle down. */
+        GtkWidget *w = (GtkWidget *)suil_instance_get_widget(b->ui);
+        if (w && GTK_IS_SOCKET(w)) {
+            gboolean ret = FALSE;
+            g_signal_emit_by_name(w, "plug-removed", &ret);
+        }
+        suil_instance_free(b->ui);
+        b->ui = NULL;
+    }
 }
 
 static GtkWidget *lv2_make_gui(PluginInstance *pi)

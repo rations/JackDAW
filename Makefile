@@ -90,6 +90,7 @@ SRCS_C := \
     $(SRCDIR)/pluginhost_lv2.c \
     $(SRCDIR)/pluginhost_clap.c \
     $(SRCDIR)/pluginhost_ladspa.c \
+    $(SRCDIR)/lv2ui_bridge.c \
     $(SRCDIR)/knob.c \
     $(SRCDIR)/trackstrip.c \
     $(SRCDIR)/timeline.c \
@@ -137,7 +138,33 @@ endif
 OBJS := $(SRCS_C:.c=.o) $(SRCS_CXX:.cpp=.o) $(VST3_SDK_OBJ)
 DEPS := $(SRCS_C:.c=.d) $(SRCS_CXX:.cpp=.d)
 
+# ---------------------------------------------------------------------------
+# Out-of-process LV2 UI helpers — only for toolkits that can't run in our GTK3
+# process (GtkUI/GTK2, Qt). X11/Gtk3 UIs are hosted in-process. Each helper is
+# built only if its toolkit + suil are present; otherwise that UI type falls
+# back to the generic parameter panel.
+# ---------------------------------------------------------------------------
 HELPERS :=
+HAS_GTK2 := $(shell pkg-config --exists gtk+-2.0 gtk+-x11-2.0 2>/dev/null && echo 1)
+HAS_QT5  := $(shell pkg-config --exists Qt5Widgets Qt5X11Extras 2>/dev/null && echo 1)
+HAS_QT6  := $(shell pkg-config --exists Qt6Widgets 2>/dev/null && echo 1)
+
+ifneq ($(HAS_LILV),)
+ifneq ($(HAS_SUIL),)
+ifneq ($(HAS_GTK2),)
+HELPER_GTK2   := $(SRCDIR)/jackdaw-lv2ui-gtk2
+HELPERS       += $(HELPER_GTK2)
+# (lv2ui_helper.c defaults HELPER_CONTAINER_URI to GtkUI, which is the gtk2 type.)
+H_GTK2_CFLAGS := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) \
+    $(shell pkg-config --cflags gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) -std=gnu99
+H_GTK2_LIBS   := $(shell pkg-config --libs gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) -lm
+
+$(HELPER_GTK2): $(SRCDIR)/lv2ui_helper.c $(SRCDIR)/lv2ui_ipc.h
+	$(CC) $(H_GTK2_CFLAGS) $< $(H_GTK2_LIBS) -o $@
+	@echo "Built: $@"
+endif
+endif
+endif
 
 # ---------------------------------------------------------------------------
 # Rules

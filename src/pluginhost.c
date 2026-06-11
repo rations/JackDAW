@@ -5,6 +5,7 @@
 
 #include "pluginhost.h"
 #include "pluginhost_internal.h"
+#include "lv2ui_bridge.h"
 #include "settings.h"
 
 #ifdef GDK_WINDOWING_X11
@@ -360,14 +361,18 @@ GtkWidget *pluginhost_make_gui(PluginInstance *inst)
     if (!inst) return gtk_label_new("(no plugin)");
     if (inst->gui) return inst->gui;     /* cached, owned by the instance */
 
-    /* Native in-process editor (suil, via the backend), else generic panel. */
+    /* Editor selection, in order:
+     *   1. in-process suil (X11/Gtk3 UIs) via the backend  -> gui_native
+     *   2. out-of-process helper (GtkUI/Qt UIs) via the bridge (GtkSocket)
+     *   3. generic parameter panel */
     GtkWidget *w = NULL;
     if (inst->ops && inst->ops->make_gui)
         w = inst->ops->make_gui(inst);
     if (w) {
-        inst->gui_native = TRUE;
+        inst->gui_native = TRUE;          /* backend (suil) owns teardown */
     } else {
-        w = ph_generic_param_panel(inst);
+        w = lv2ui_bridge_new(inst);       /* helper socket; self-tears on destroy */
+        if (!w) w = ph_generic_param_panel(inst);
         inst->gui_native = FALSE;
     }
     g_object_ref_sink(w);
