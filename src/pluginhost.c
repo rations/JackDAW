@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <config.h>
 #include <string.h>
+#include <math.h>
 
 #include "pluginhost.h"
 #include "pluginhost_internal.h"
@@ -32,6 +33,15 @@ void pluginhost_init(double sample_rate, int max_block)
     ph_sr       = sample_rate > 0 ? sample_rate : 48000.0;
     ph_maxblock = max_block   > 0 ? max_block   : 1024;
     ph_inited   = TRUE;
+}
+
+void pluginhost_ui_init(int *argc, char ***argv)
+{
+#ifdef HAVE_LV2
+    ph_lv2_ui_init(argc, argv);
+#else
+    (void)argc; (void)argv;
+#endif
 }
 
 /* ---- Helpers ---- */
@@ -72,8 +82,11 @@ PluginInstance *ph_instance_alloc(PluginFormat fmt, const char *name,
     inst->format      = fmt;
     inst->name        = g_strdup(name ? name : "fx");
     inst->active      = 1;
+    inst->mix_q15     = 32768;          /* fully wet by default */
     inst->sample_rate = sr;
     inst->max_block   = max_block;
+    inst->dry_L       = g_new0(float, max_block > 0 ? max_block : 1);
+    inst->dry_R       = g_new0(float, max_block > 0 ? max_block : 1);
     return inst;
 }
 
@@ -99,6 +112,28 @@ static void ph_do_scan(void)
 #ifdef HAVE_LADSPA
     ph_ladspa_scan(&ph_cat, ph_paths[PH_LADSPA]);
 #endif
+
+    /* De-duplicate by (format,key): overlapping search paths (e.g. a dir that is
+     * symlinked under two names) must not list the same plugin twice. */
+    {
+        GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                                 g_free, NULL);
+        GList *out = NULL;
+        for (GList *l = ph_cat; l; l = l->next) {
+            PluginInfo *pi = l->data;
+            gchar *id = g_strdup_printf("%d::%s", pi->format, pi->key);
+            if (g_hash_table_contains(seen, id)) {
+                g_free(id);
+                g_free(pi->key); g_free(pi->name); g_free(pi->category); g_free(pi);
+            } else {
+                g_hash_table_add(seen, id);
+                out = g_list_prepend(out, pi);
+            }
+        }
+        g_list_free(ph_cat);
+        ph_cat = g_list_reverse(out);
+        g_hash_table_destroy(seen);
+    }
     ph_scanned = TRUE;
 
     /* Diagnostics (visible in the terminal). */
@@ -158,8 +193,37 @@ static const char *ph_paths_key[PH_NFORMATS] = {
     "pluginPathsCLAP", "pluginPathsLADSPA"
 };
 
+/* Common install locations seeded into the visible/scanned path list. */
+static void ph_seed_default_paths(void)
+{
+    const char *home = g_get_home_dir();
+    struct { PluginFormat fmt; const char *sub; } user[] = {
+        { PH_LV2, ".lv2" }, { PH_VST2, ".vst" }, { PH_VST3, ".vst3" },
+        { PH_CLAP, ".clap" }, { PH_LADSPA, ".ladspa" },
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(user); i++) {
+        gchar *d = g_build_filename(home, user[i].sub, NULL);
+        pluginhost_add_search_path(user[i].fmt, d);
+        g_free(d);
+    }
+    pluginhost_add_search_path(PH_LV2, "/usr/lib/lv2");
+    pluginhost_add_search_path(PH_LV2, "/usr/local/lib/lv2");
+    pluginhost_add_search_path(PH_LV2, "/usr/lib/x86_64-linux-gnu/lv2");
+    pluginhost_add_search_path(PH_VST2, "/usr/lib/vst");
+    pluginhost_add_search_path(PH_VST2, "/usr/local/lib/vst");
+    pluginhost_add_search_path(PH_VST3, "/usr/lib/vst3");
+    pluginhost_add_search_path(PH_VST3, "/usr/local/lib/vst3");
+    pluginhost_add_search_path(PH_VST3, "/usr/lib/x86_64-linux-gnu/vst3");
+    pluginhost_add_search_path(PH_CLAP, "/usr/lib/clap");
+    pluginhost_add_search_path(PH_CLAP, "/usr/local/lib/clap");
+    pluginhost_add_search_path(PH_LADSPA, "/usr/lib/ladspa");
+    pluginhost_add_search_path(PH_LADSPA, "/usr/local/lib/ladspa");
+    pluginhost_add_search_path(PH_LADSPA, "/usr/lib/x86_64-linux-gnu/ladspa");
+}
+
 void pluginhost_load_paths_from_settings(void)
 {
+    ph_seed_default_paths();   /* common locations always present */
     for (int f = 0; f < PH_NFORMATS; f++) {
         gchar *s = settings_get_string(ph_paths_key[f], "");
         if (s && *s) {
@@ -220,6 +284,8 @@ void pluginhost_free(PluginInstance *inst)
     if (inst->ops && inst->ops->destroy) inst->ops->destroy(inst);
     if (inst->gui)
         g_object_unref(inst->gui);
+    g_free(inst->dry_L);
+    g_free(inst->dry_R);
     g_free(inst->name);
     g_free(inst);
 }
@@ -228,12 +294,51 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
 {
     if (!inst || !inst->ops || !inst->ops->process) return;
     if (!g_atomic_int_get(&inst->active)) return;   /* bypassed */
+
+    int mq = g_atomic_int_get(&inst->mix_q15);
+    gboolean blend = (mq < 32768) && inst->dry_L && inst->dry_R
+                     && nframes <= inst->max_block;
+    if (blend) {                       /* stash the dry signal for the mix */
+        memcpy(inst->dry_L, L, (size_t)nframes * sizeof(float));
+        memcpy(inst->dry_R, R, (size_t)nframes * sizeof(float));
+    }
+
     inst->ops->process(inst, L, R, nframes);
+
+    /* Safety net: a misbehaving plugin must never send NaN/inf or a runaway
+     * level to the speakers. Replace non-finite samples and clamp magnitude. */
+    for (int i = 0; i < nframes; i++) {
+        float a = L[i], b = R[i];
+        if (!isfinite(a)) a = 0.0f; else if (a >  4.0f) a =  4.0f; else if (a < -4.0f) a = -4.0f;
+        if (!isfinite(b)) b = 0.0f; else if (b >  4.0f) b =  4.0f; else if (b < -4.0f) b = -4.0f;
+        L[i] = a; R[i] = b;
+    }
+
+    if (blend) {                       /* wet/dry crossfade */
+        float wet = mq * (1.0f / 32768.0f);
+        float dry = 1.0f - wet;
+        for (int i = 0; i < nframes; i++) {
+            L[i] = inst->dry_L[i] * dry + L[i] * wet;
+            R[i] = inst->dry_R[i] * dry + R[i] * wet;
+        }
+    }
 }
 
 void pluginhost_set_active(PluginInstance *inst, gboolean on)
 {
     if (inst) g_atomic_int_set(&inst->active, on ? 1 : 0);
+}
+
+void pluginhost_set_mix(PluginInstance *inst, float mix)
+{
+    if (!inst) return;
+    if (mix < 0.0f) mix = 0.0f; else if (mix > 1.0f) mix = 1.0f;
+    g_atomic_int_set(&inst->mix_q15, (int)(mix * 32768.0f + 0.5f));
+}
+
+float pluginhost_get_mix(PluginInstance *inst)
+{
+    return inst ? g_atomic_int_get(&inst->mix_q15) * (1.0f / 32768.0f) : 1.0f;
 }
 
 gboolean pluginhost_is_active(PluginInstance *inst)
@@ -263,6 +368,11 @@ GtkWidget *pluginhost_make_gui(PluginInstance *inst)
     g_object_ref_sink(w);
     inst->gui = w;
     return w;
+}
+
+GtkWidget *pluginhost_peek_gui(PluginInstance *inst)
+{
+    return inst ? inst->gui : NULL;
 }
 
 /* ---- Generic parameter passthrough ---- */

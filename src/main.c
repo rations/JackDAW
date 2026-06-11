@@ -240,6 +240,7 @@ int main(int argc, char **argv)
     setlocale(LC_NUMERIC, "POSIX");
 
     gtk_init(&argc, &argv);
+    pluginhost_ui_init(&argc, &argv);   /* suil_init for native LV2 editors */
     settings_init();
 
     default_timescale_mode = settings_get_uint32("timescaleMode", 1);

@@ -119,10 +119,6 @@ static void clap_scan_dir(const char *dir, GList **catalog, int depth)
 
 void ph_clap_scan(GList **catalog, const GList *extra)
 {
-    gchar *home = g_build_filename(g_get_home_dir(), ".clap", NULL);
-    clap_scan_dir(home, catalog, 0);
-    g_free(home);
-    clap_scan_dir("/usr/lib/clap", catalog, 0);
     for (const GList *l = extra; l; l = l->next)
         clap_scan_dir((const char *)l->data, catalog, 0);
 }

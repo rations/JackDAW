@@ -21,10 +21,14 @@ struct PluginInstance {
     PluginFormat  format;
     char         *name;
     volatile gint active;       /* 1 = processing, 0 = bypassed */
+    volatile gint mix_q15;      /* wet/dry: 0=fully dry .. 32768=fully wet */
     double        sample_rate;
     int           max_block;
     const PhOps  *ops;
     void         *backend;      /* backend-private state */
+
+    /* Dry-signal scratch for the wet/dry mix (allocated to max_block). */
+    float        *dry_L, *dry_R;
 
     /* Cached editor widget (owned by the instance, ref-sunk). gui_native means
      * the backend's destroy() frees the widget (e.g. suil); otherwise it is a
@@ -43,6 +47,9 @@ void ph_vst2_scan  (GList **catalog, const GList *extra);
 void ph_vst3_scan  (GList **catalog, const GList *extra);
 void ph_clap_scan  (GList **catalog, const GList *extra);
 void ph_ladspa_scan(GList **catalog, const GList *extra);
+
+/* One-time native-UI toolkit init (suil_init for LV2). No-op if no suil. */
+void ph_lv2_ui_init(int *argc, char ***argv);
 
 /* Instantiate (return NULL on failure). */
 PluginInstance *ph_lv2_instantiate   (const PluginInfo *, double sr, int max_block);

@@ -82,10 +82,6 @@ static void vst3_scan_dir(const char *dir, GList **catalog, int depth)
 
 extern "C" void ph_vst3_scan(GList **catalog, const GList *extra)
 {
-    gchar *home = g_build_filename(g_get_home_dir(), ".vst3", NULL);
-    vst3_scan_dir(home, catalog, 0);
-    g_free(home);
-    vst3_scan_dir("/usr/lib/vst3", catalog, 0);
     for (const GList *l = extra; l; l = l->next)
         vst3_scan_dir((const char *)l->data, catalog, 0);
 }
@@ -102,6 +98,12 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
         memcpy(b->data.inputs[0].channelBuffers32[0], L, sizeof(float) * n);
         if (b->data.inputs[0].numChannels > 1)
             memcpy(b->data.inputs[0].channelBuffers32[1], R, sizeof(float) * n);
+    }
+    /* Zero the output buffers first: if the plugin fails to process (e.g. a
+     * bridge that isn't running) we get silence rather than stale garbage. */
+    if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
+        for (int ch = 0; ch < b->data.outputs[0].numChannels; ch++)
+            memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
     }
     b->data.inputParameterChanges = &b->in_params;
     b->processor->process(b->data);

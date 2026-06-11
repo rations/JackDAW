@@ -84,17 +84,14 @@ static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
 
 void ph_vst2_scan(GList **catalog, const GList *extra)
 {
-    gchar *home = g_build_filename(g_get_home_dir(), ".vst", NULL);
-    vst2_scan_dir(home, catalog, 0);
-    g_free(home);
+    for (const GList *l = extra; l; l = l->next)
+        vst2_scan_dir((const char *)l->data, catalog, 0);
     const char *envp = g_getenv("VST_PATH");
     if (envp) {
         gchar **parts = g_strsplit(envp, ":", -1);
         for (gchar **p = parts; *p; p++) if (**p) vst2_scan_dir(*p, catalog, 0);
         g_strfreev(parts);
     }
-    for (const GList *l = extra; l; l = l->next)
-        vst2_scan_dir((const char *)l->data, catalog, 0);
 }
 
 /* ---- Ops ---- */

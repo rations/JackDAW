@@ -25,9 +25,11 @@ typedef struct {
 
     float    *ctl;          /* per-port control store (PortCount) */
     float     ctl_out_dummy;
-    int       audio_in[2],  n_audio_in;
-    int       audio_out[2], n_audio_out;
+    int      *ain;  int n_ain;   /* ALL audio input port indices  */
+    int      *aout; int n_aout;  /* ALL audio output port indices */
+    int       n_audio_in, n_audio_out; /* same counts, kept for clarity */
     float    *outA, *outB;
+    float    *dummy_in, *dummy_out;    /* scratch for surplus audio ports */
     int       max_block;
 
     LadParam *params;
@@ -103,20 +105,15 @@ static void lad_scan_dir(const char *dir, GList **catalog, int depth)
 
 void ph_ladspa_scan(GList **catalog, const GList *extra)
 {
-    lad_scan_dir("/usr/lib/ladspa", catalog, 0);
-    lad_scan_dir("/usr/local/lib/ladspa", catalog, 0);
-    lad_scan_dir("/usr/lib/x86_64-linux-gnu/ladspa", catalog, 0);
-    gchar *home = g_build_filename(g_get_home_dir(), ".ladspa", NULL);
-    lad_scan_dir(home, catalog, 0);
-    g_free(home);
+    /* `extra` holds the full search-path list (common dirs are seeded into it). */
+    for (const GList *l = extra; l; l = l->next)
+        lad_scan_dir((const char *)l->data, catalog, 0);
     const char *env = g_getenv("LADSPA_PATH");
     if (env) {
         gchar **parts = g_strsplit(env, ":", -1);
         for (gchar **p = parts; *p; p++) if (**p) lad_scan_dir(*p, catalog, 0);
         g_strfreev(parts);
     }
-    for (const GList *l = extra; l; l = l->next)
-        lad_scan_dir((const char *)l->data, catalog, 0);
 }
 
 /* ---- Ops ---- */
@@ -125,26 +122,37 @@ static void lad_process(PluginInstance *pi, float *L, float *R, int n)
 {
     LadBackend *b = pi->backend;
     if (n > b->max_block) n = b->max_block;
-    if (b->n_audio_in == 0 || b->n_audio_out == 0) return;
+    if (b->n_ain == 0 || b->n_aout == 0) return;
     const LADSPA_Descriptor *d = b->desc;
 
     if (b->dual_mono) {
-        d->connect_port(b->h[0], b->audio_in[0],  L);
-        d->connect_port(b->h[0], b->audio_out[0], b->outA);
-        d->connect_port(b->h[1], b->audio_in[0],  R);
-        d->connect_port(b->h[1], b->audio_out[0], b->outB);
+        /* Exactly 1 in / 1 out: two instances handle L and R. */
+        d->connect_port(b->h[0], b->ain[0],  L);
+        d->connect_port(b->h[0], b->aout[0], b->outA);
+        d->connect_port(b->h[1], b->ain[0],  R);
+        d->connect_port(b->h[1], b->aout[0], b->outB);
         d->run(b->h[0], (unsigned long)n);
         d->run(b->h[1], (unsigned long)n);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
         memcpy(R, b->outB, (size_t)n * sizeof(float));
     } else {
-        d->connect_port(b->h[0], b->audio_in[0], L);
-        if (b->n_audio_in  > 1) d->connect_port(b->h[0], b->audio_in[1], R);
-        d->connect_port(b->h[0], b->audio_out[0], b->outA);
-        if (b->n_audio_out > 1) d->connect_port(b->h[0], b->audio_out[1], b->outB);
+        /* Single instance. Route the first one/two audio ins from L/R and the
+         * first one/two audio outs to outA/outB. EVERY other audio port (the
+         * plugin may have many, e.g. a surround encoder) is bound to a scratch
+         * buffer so run() never dereferences an unconnected (NULL) port. */
+        d->connect_port(b->h[0], b->ain[0], L);
+        if (b->n_ain > 1) d->connect_port(b->h[0], b->ain[1], R);
+        for (int i = 2; i < b->n_ain; i++)
+            d->connect_port(b->h[0], b->ain[i], b->dummy_in);
+
+        d->connect_port(b->h[0], b->aout[0], b->outA);
+        if (b->n_aout > 1) d->connect_port(b->h[0], b->aout[1], b->outB);
+        for (int i = 2; i < b->n_aout; i++)
+            d->connect_port(b->h[0], b->aout[i], b->dummy_out);
+
         d->run(b->h[0], (unsigned long)n);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
-        memcpy(R, (b->n_audio_out > 1) ? b->outB : b->outA, (size_t)n * sizeof(float));
+        memcpy(R, (b->n_aout > 1) ? b->outB : b->outA, (size_t)n * sizeof(float));
     }
 }
 
@@ -161,7 +169,9 @@ static void lad_destroy(PluginInstance *pi)
     for (guint i = 0; i < b->n_params; i++) g_free(b->params[i].name);
     g_free(b->params);
     g_free(b->ctl);
+    g_free(b->ain); g_free(b->aout);
     g_free(b->outA); g_free(b->outB);
+    g_free(b->dummy_in); g_free(b->dummy_out);
     if (b->dl) dlclose(b->dl);
     g_free(b);
 }
@@ -206,13 +216,17 @@ PluginInstance *ph_ladspa_instantiate(const PluginInfo *info, double sr, int max
     b->ctl  = g_new0(float, desc->PortCount ? desc->PortCount : 1);
     b->outA = g_new0(float, max_block);
     b->outB = g_new0(float, max_block);
+    b->dummy_in  = g_new0(float, max_block);
+    b->dummy_out = g_new0(float, max_block);
+    b->ain  = g_new0(int, desc->PortCount ? desc->PortCount : 1);
+    b->aout = g_new0(int, desc->PortCount ? desc->PortCount : 1);
 
     GArray *params = g_array_new(FALSE, FALSE, sizeof(LadParam));
     for (unsigned long i = 0; i < desc->PortCount; i++) {
         LADSPA_PortDescriptor pd = desc->PortDescriptors[i];
         if (LADSPA_IS_PORT_AUDIO(pd)) {
-            if (LADSPA_IS_PORT_INPUT(pd)  && b->n_audio_in  < 2) b->audio_in [b->n_audio_in++ ] = (int)i;
-            if (LADSPA_IS_PORT_OUTPUT(pd) && b->n_audio_out < 2) b->audio_out[b->n_audio_out++] = (int)i;
+            if (LADSPA_IS_PORT_INPUT(pd))  b->ain [b->n_ain++ ] = (int)i;
+            if (LADSPA_IS_PORT_OUTPUT(pd)) b->aout[b->n_aout++] = (int)i;
         } else if (LADSPA_IS_PORT_CONTROL(pd)) {
             float mn, mx, dfl;
             lad_hint(&desc->PortRangeHints[i], sr, &mn, &mx, &dfl);
@@ -228,8 +242,10 @@ PluginInstance *ph_ladspa_instantiate(const PluginInfo *info, double sr, int max
     }
     b->n_params = params->len;
     b->params   = (LadParam *)g_array_free(params, FALSE);
+    b->n_audio_in  = b->n_ain;
+    b->n_audio_out = b->n_aout;
 
-    b->dual_mono = (b->n_audio_in == 1 && b->n_audio_out == 1);
+    b->dual_mono = (b->n_ain == 1 && b->n_aout == 1);
     b->n_inst    = b->dual_mono ? 2 : 1;
 
     for (int k = 0; k < b->n_inst; k++) {
@@ -239,7 +255,10 @@ PluginInstance *ph_ladspa_instantiate(const PluginInfo *info, double sr, int max
                 if (desc->cleanup) desc->cleanup(b->h[j]);
             for (guint q = 0; q < b->n_params; q++) g_free(b->params[q].name);
             g_free(b->params); g_free(b->ctl);
-            g_free(b->outA); g_free(b->outB); dlclose(dl); g_free(b);
+            g_free(b->ain); g_free(b->aout);
+            g_free(b->outA); g_free(b->outB);
+            g_free(b->dummy_in); g_free(b->dummy_out);
+            dlclose(dl); g_free(b);
             return NULL;
         }
         /* Connect control ports to the shared value store. */

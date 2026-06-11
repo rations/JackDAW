@@ -148,8 +148,23 @@ static void paths_remove_clicked(GtkButton *b, gpointer data)
 
 static void paths_rescan_clicked(GtkButton *b, gpointer data)
 {
-    (void)b; (void)data;
+    (void)b;
+    PathsUI *ui = data;
     pluginhost_rescan();
+
+    guint n[PH_NFORMATS] = {0}, total = 0;
+    for (const GList *l = pluginhost_catalog(); l; l = l->next) {
+        PluginInfo *pi = (PluginInfo *)l->data;
+        if (pi->format < PH_NFORMATS) n[pi->format]++;
+        total++;
+    }
+    GtkWidget *m = gtk_message_dialog_new(GTK_WINDOW(ui->dialog),
+        GTK_DIALOG_MODAL, GTK_MESSAGE_INFO, GTK_BUTTONS_OK,
+        "Found %u plugin%s:\n\nLV2: %u\nVST2: %u\nVST3: %u\nCLAP: %u\nLADSPA: %u",
+        total, total == 1 ? "" : "s",
+        n[PH_LV2], n[PH_VST2], n[PH_VST3], n[PH_CLAP], n[PH_LADSPA]);
+    gtk_dialog_run(GTK_DIALOG(m));
+    gtk_widget_destroy(m);
 }
 
 void jackdaw_fx_paths_dialog(GtkWindow *parent)
@@ -208,29 +223,69 @@ typedef struct {
     GtkWidget      *list_box;    /* chain rows */
     GtkWidget      *gui_holder;  /* shows the selected effect's GUI */
     GtkWidget      *shown;       /* currently displayed GUI (owned by instance) */
+    GtkWidget      *mix_scale;   /* wet/dry for the selected effect */
+    GtkWidget      *mix_row;     /* the dry/wet header (hidden when none selected) */
+    guint           sel_index;   /* index of the selected effect */
 } FxWindow;
 
 static void fxwin_rebuild_list(FxWindow *fw);
 
-/* Detach the currently shown editor without destroying it (the instance owns it). */
-static void fxwin_clear_gui(FxWindow *fw)
+/* Detach an instance-owned editor from the stack WITHOUT destroying it (the
+ * instance owns the widget and keeps it across window close/reopen). Editors
+ * are never reparented while live — reparenting a GtkSocket-based native UI
+ * (e.g. a suil-wrapped X11 plugin GUI) destroys its embedding and blanks it. */
+static void fxwin_detach(FxWindow *fw, GtkWidget *gui)
 {
-    if (fw->shown && gtk_widget_get_parent(fw->shown) == fw->gui_holder)
-        gtk_container_remove(GTK_CONTAINER(fw->gui_holder), fw->shown);
+    if (gui && gtk_widget_get_parent(gui) == fw->gui_holder)
+        gtk_container_remove(GTK_CONTAINER(fw->gui_holder), gui);
+}
+
+/* Detach every effect's editor from the stack (used before the window dies). */
+static void fxwin_detach_all(FxWindow *fw)
+{
+    guint n = jackdaw_track_fx_count(fw->track);
+    for (guint i = 0; i < n; i++)
+        fxwin_detach(fw, pluginhost_peek_gui(jackdaw_track_fx_get(fw->track, i)));
     fw->shown = NULL;
+}
+
+static void fxwin_mix_changed(GtkRange *r, gpointer data)
+{
+    FxWindow *fw = data;
+    gpointer inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
+    if (inst) pluginhost_set_mix((PluginInstance *)inst,
+                                 (float)gtk_range_get_value(r));
 }
 
 static void fxwin_show_gui(FxWindow *fw, guint index)
 {
-    fxwin_clear_gui(fw);
     gpointer inst = jackdaw_track_fx_get(fw->track, index);
-    if (!inst) return;
+    if (!inst) {
+        if (fw->mix_row) gtk_widget_hide(fw->mix_row);
+        return;
+    }
+    fw->sel_index = index;
+
+    /* Reflect this effect's wet/dry without retriggering the change handler. */
+    if (fw->mix_scale) {
+        g_signal_handlers_block_by_func(fw->mix_scale, fxwin_mix_changed, fw);
+        gtk_range_set_value(GTK_RANGE(fw->mix_scale),
+                            pluginhost_get_mix((PluginInstance *)inst));
+        g_signal_handlers_unblock_by_func(fw->mix_scale, fxwin_mix_changed, fw);
+        gtk_widget_show_all(fw->mix_row);
+    }
+
+    /* Editors live in a GtkStack: add each one ONCE, then just switch the
+     * visible child. This never reparents a live native UI. */
     GtkWidget *gui = pluginhost_make_gui((PluginInstance *)inst);
-    if (gtk_widget_get_parent(gui))   /* defensive: detach from any old parent */
-        gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(gui)), gui);
-    gtk_box_pack_start(GTK_BOX(fw->gui_holder), gui, TRUE, TRUE, 0);
+    if (gtk_widget_get_parent(gui) != fw->gui_holder) {
+        if (gtk_widget_get_parent(gui))
+            gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(gui)), gui);
+        gtk_container_add(GTK_CONTAINER(fw->gui_holder), gui);
+    }
+    gtk_widget_show_all(gui);
+    gtk_stack_set_visible_child(GTK_STACK(fw->gui_holder), gui);
     fw->shown = gui;
-    gtk_widget_show_all(fw->gui_holder);
 }
 
 typedef struct { FxWindow *fw; guint index; } RowLink;
@@ -247,9 +302,16 @@ static void fxrow_remove_clicked(GtkButton *b, gpointer data)
 {
     (void)b;
     RowLink *rl = data;
-    fxwin_clear_gui(rl->fw);                 /* detach editor before freeing */
-    jackdaw_track_fx_remove(rl->fw->track, rl->index);
-    fxwin_rebuild_list(rl->fw);
+    FxWindow *fw = rl->fw;
+    /* Detach this effect's editor from the stack before it is (deferred-)freed,
+     * so switching to another effect never lands on a dead child. */
+    fxwin_detach(fw, pluginhost_peek_gui(jackdaw_track_fx_get(fw->track, rl->index)));
+    fw->shown = NULL;
+    jackdaw_track_fx_remove(fw->track, rl->index);
+    fxwin_rebuild_list(fw);
+    guint n = jackdaw_track_fx_count(fw->track);
+    if (n) fxwin_show_gui(fw, n - 1);
+    else if (fw->mix_row) gtk_widget_hide(fw->mix_row);
 }
 
 static void fxrow_selected(GtkListBox *lb, GtkListBoxRow *row, gpointer data)
@@ -326,9 +388,9 @@ static gboolean fxwin_delete(GtkWidget *w, GdkEvent *e, gpointer data)
 {
     (void)w; (void)e;
     FxWindow *fw = data;
-    /* Detach the editor so destroying the window doesn't free instance-owned
+    /* Detach all editors so destroying the window doesn't free instance-owned
      * GUI widgets (they live on the track and persist across reopen). */
-    fxwin_clear_gui(fw);
+    fxwin_detach_all(fw);
     g_object_set_data(G_OBJECT(fw->track), "fx-window", NULL);
     gtk_widget_destroy(fw->window);
     g_free(fw);
@@ -377,12 +439,32 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     g_signal_connect(paths, "clicked", G_CALLBACK(fxwin_paths_clicked), fw);
     gtk_box_pack_start(GTK_BOX(left), paths, FALSE, FALSE, 0);
 
-    /* Right GUI holder */
-    fw->gui_holder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(fw->gui_holder, 460, -1);
+    /* Right panel: wet/dry header above the selected effect's GUI. */
+    GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(right, 460, -1);
+
+    fw->mix_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(fw->mix_row), 4);
+    GtkWidget *mix_lbl = gtk_label_new("Dry / Wet");
+    fw->mix_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
+                                             0.0, 1.0, 0.01);
+    gtk_scale_set_value_pos(GTK_SCALE(fw->mix_scale), GTK_POS_RIGHT);
+    gtk_range_set_value(GTK_RANGE(fw->mix_scale), 1.0);
+    gtk_widget_set_hexpand(fw->mix_scale, TRUE);
+    g_signal_connect(fw->mix_scale, "value-changed",
+                     G_CALLBACK(fxwin_mix_changed), fw);
+    gtk_box_pack_start(GTK_BOX(fw->mix_row), mix_lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fw->mix_row), fw->mix_scale, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(right), fw->mix_row, FALSE, FALSE, 0);
+
+    /* A stack so each effect's editor is added once and shown by switching the
+     * visible child — never reparented (which would blank a native X11 UI). */
+    fw->gui_holder = gtk_stack_new();
+    gtk_widget_set_vexpand(fw->gui_holder, TRUE);
+    gtk_box_pack_start(GTK_BOX(right), fw->gui_holder, TRUE, TRUE, 0);
 
     gtk_paned_pack1(GTK_PANED(paned), left, FALSE, FALSE);
-    gtk_paned_pack2(GTK_PANED(paned), fw->gui_holder, TRUE, TRUE);
+    gtk_paned_pack2(GTK_PANED(paned), right, TRUE, TRUE);
 
     g_object_set_data(G_OBJECT(track), "fx-window", fw);
 
