@@ -113,6 +113,7 @@ VST3_SDK_SRC := \
     $(VST3SDK)/pluginterfaces/base/ustring.cpp \
     $(VST3SDK)/pluginterfaces/base/coreiids.cpp \
     $(VST3SDK)/public.sdk/source/vst/vstinitiids.cpp \
+    $(VST3SDK)/public.sdk/source/common/commoniids.cpp \
     $(VST3SDK)/base/source/fobject.cpp \
     $(VST3SDK)/base/source/fstring.cpp \
     $(VST3SDK)/base/source/fbuffer.cpp \

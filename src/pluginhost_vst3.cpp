@@ -7,6 +7,7 @@
 
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
+#include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
@@ -14,11 +15,116 @@
 #include "pluginterfaces/vst/ivsteditcontroller.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/vst/vstspeaker.h"
+#include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/base/funknownimpl.h"
 
 #include "pluginhost_internal.h"
 
+/* X11 + raw-fd watches come LAST: <gdk/gdkx.h> pulls in Xlib, whose macros
+ * (None, Bool, Status, …) collide with C++ identifiers. All VST3/SDK headers are
+ * included above, so those macros never reach SDK code. */
+#include <gdk/gdkx.h>
+#include <glib-unix.h>
+
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+struct Vst3Backend;   /* fwd: the component handler holds a back-pointer */
+
+/* Host IComponentHandler — the plug-in's editor calls performEdit() when the
+ * user moves a control; we mirror it to the controller and queue it for the RT
+ * process() (same path the generic panel uses via vst3_param_set). Without this
+ * a native editor's knobs would not affect the audio. */
+class HostComponentHandler
+    : public U::ImplementsNonDestroyable<U::Directly<IComponentHandler>> {
+public:
+    Vst3Backend *b = nullptr;
+    tresult PLUGIN_API beginEdit  (ParamID) override { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue value) override;   /* below */
+    tresult PLUGIN_API endEdit    (ParamID) override { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+};
+
+/* Host IPlugFrame + Linux::IRunLoop in one object (per editor). On Linux the
+ * plug-in's X11 UI has no global event loop, so it registers its X-connection fd
+ * and timers with the IRunLoop the host exposes through the frame; we back those
+ * with GLib sources so they run inside JackDAW's existing GTK main loop (rather
+ * than the SDK editorhost's standalone select() loop). resizeView lets the
+ * plug-in drive its own size. (SDK refs: pluginterfaces/gui/iplugview.h,
+ * editorhost/.../linux/irunloopimpl.h.) */
+class HostPlugFrame
+    : public U::ImplementsNonDestroyable<U::Directly<IPlugFrame, Linux::IRunLoop>> {
+public:
+    GtkWidget *widget = nullptr;
+
+    struct FdWatch { guint src; Linux::IEventHandler *h; int fd; };
+    struct TimerWatch { guint src; Linux::ITimerHandler *h; };
+    std::vector<FdWatch>    fds;
+    std::vector<TimerWatch> timers;
+
+    /* IPlugFrame */
+    tresult PLUGIN_API resizeView(IPlugView *view, ViewRect *r) override
+    {
+        if (widget && r) {
+            gtk_widget_set_size_request(widget, r->getWidth(), r->getHeight());
+            if (view) view->onSize(r);
+        }
+        return kResultOk;
+    }
+
+    /* Linux::IRunLoop */
+    static gboolean fd_cb(gint fd, GIOCondition, gpointer d)
+    { ((Linux::IEventHandler *)d)->onFDIsSet(fd); return G_SOURCE_CONTINUE; }
+    static gboolean timer_cb(gpointer d)
+    { ((Linux::ITimerHandler *)d)->onTimer(); return G_SOURCE_CONTINUE; }
+
+    tresult PLUGIN_API registerEventHandler(Linux::IEventHandler *h,
+                                            Linux::FileDescriptor fd) override
+    {
+        if (!h) return kInvalidArgument;
+        guint s = g_unix_fd_add(fd,
+            (GIOCondition)(G_IO_IN | G_IO_PRI | G_IO_HUP | G_IO_ERR), fd_cb, h);
+        fds.push_back({ s, h, fd });
+        return kResultTrue;
+    }
+    tresult PLUGIN_API unregisterEventHandler(Linux::IEventHandler *h) override
+    {
+        if (!h) return kInvalidArgument;
+        for (auto it = fds.begin(); it != fds.end(); ++it)
+            if (it->h == h) { g_source_remove(it->src); fds.erase(it); return kResultTrue; }
+        return kResultFalse;
+    }
+    tresult PLUGIN_API registerTimer(Linux::ITimerHandler *h,
+                                     Linux::TimerInterval ms) override
+    {
+        if (!h || ms == 0) return kInvalidArgument;
+        guint s = g_timeout_add((guint)ms, timer_cb, h);
+        timers.push_back({ s, h });
+        return kResultTrue;
+    }
+    tresult PLUGIN_API unregisterTimer(Linux::ITimerHandler *h) override
+    {
+        if (!h) return kInvalidArgument;
+        for (auto it = timers.begin(); it != timers.end(); ++it)
+            if (it->h == h) { g_source_remove(it->src); timers.erase(it); return kResultTrue; }
+        return kResultFalse;
+    }
+
+    void remove_all_sources()
+    {
+        for (auto &f : fds)    g_source_remove(f.src);
+        for (auto &t : timers) g_source_remove(t.src);
+        fds.clear(); timers.clear();
+    }
+};
+
+struct Vst3Editor {
+    IPtr<IPlugView> view;
+    HostPlugFrame  *frame   = nullptr;
+    GtkWidget      *widget  = nullptr;   /* GtkDrawingArea: the X11 embed parent */
+    gulong          realize_id = 0, unrealize_id = 0;
+    bool            attached = false;
+};
 
 struct Vst3Backend {
     VST3::Hosting::Module::Ptr     module;
@@ -31,7 +137,19 @@ struct Vst3Backend {
     ParameterChanges               in_params;
     int                            max_block = 0;
     std::vector<ParamID>           param_ids;
+    HostComponentHandler           handler;            /* set on the controller */
+    Vst3Editor                    *editor = nullptr;   /* live native editor, if any */
 };
+
+tresult PLUGIN_API HostComponentHandler::performEdit(ParamID id, ParamValue value)
+{
+    if (!b) return kResultOk;
+    if (b->controller) b->controller->setParamNormalized(id, value);
+    int32 idx = 0;
+    IParamValueQueue *q = b->in_params.addParameterData(id, idx);
+    if (q) { int32 pidx = 0; q->addPoint(0, value, pidx); }
+    return kResultOk;
+}
 
 /* ---- Scan ---- */
 
@@ -117,10 +235,14 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
     }
 }
 
+static void vst3_destroy_gui(PluginInstance *pi);   /* fwd */
+
 static void vst3_destroy(PluginInstance *pi)
 {
     Vst3Backend *b = (Vst3Backend *)pi->backend;
     if (!b) return;
+    if (b->editor) vst3_destroy_gui(pi);   /* defensive: normally already gone */
+    if (b->controller) b->controller->setComponentHandler(nullptr);
     if (b->processor) b->processor->setProcessing(false);
     if (b->component) b->component->setActive(false);
     b->data.unprepare();
@@ -172,8 +294,99 @@ static void vst3_param_set(PluginInstance *pi, guint i, float v)
 static void vst3_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; } /* normalised */
 
+/* ---- Native editor (IPlugView embedded in a GTK X11 window) ---- */
+
+/* Attach once the GtkDrawingArea has a real X11 window. The plug-in creates its
+ * UI as a child of our window id; it talks to us back through the frame
+ * (resize) and the run loop (its own X fd + timers). */
+static void vst3_on_realize(GtkWidget *w, gpointer data)
+{
+    Vst3Editor *ed = (Vst3Editor *)data;
+    if (!ed->view || ed->attached) return;
+    GdkWindow *gw = gtk_widget_get_window(w);
+    if (!gw) return;
+    Window xid = gdk_x11_window_get_xid(gw);
+
+    ed->view->setFrame(ed->frame);
+    if (ed->view->attached((void *)(uintptr_t)xid,
+                           kPlatformTypeX11EmbedWindowID) == kResultOk) {
+        ed->attached = true;
+        ViewRect r;
+        if (ed->view->getSize(&r) == kResultOk && r.getWidth() > 0)
+            gtk_widget_set_size_request(w, r.getWidth(), r.getHeight());
+    }
+}
+
+/* The window is going away (e.g. switching tabs never unrealizes a GtkStack
+ * child, so this is effectively the close path). Detach the plug-in while its
+ * parent X window still exists. */
+static void vst3_on_unrealize(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    Vst3Editor *ed = (Vst3Editor *)data;
+    if (ed->view && ed->attached) { ed->view->removed(); ed->attached = false; }
+}
+
+static GtkWidget *vst3_make_gui(PluginInstance *pi)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b->controller) { g_printerr("[vst3 ui] no controller\n"); return NULL; }
+
+    IPlugView *view = b->controller->createView(ViewType::kEditor);
+    if (!view) { g_printerr("[vst3 ui] createView(editor) returned NULL\n"); return NULL; }
+    if (view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) != kResultTrue) {
+        g_printerr("[vst3 ui] view does not support X11EmbedWindowID\n");
+        view->release();
+        return NULL;        /* host falls back to the generic parameter panel */
+    }
+
+    Vst3Editor *ed = new Vst3Editor();
+    ed->view   = owned(view);
+    ed->frame  = new HostPlugFrame();
+    ed->widget = gtk_drawing_area_new();   /* has its own native X11 window */
+    ed->frame->widget = ed->widget;
+    gtk_widget_set_hexpand(ed->widget, TRUE);
+    gtk_widget_set_vexpand(ed->widget, TRUE);
+
+    ViewRect r;                            /* seed a size so the FX window fits */
+    if (view->getSize(&r) == kResultOk && r.getWidth() > 0)
+        gtk_widget_set_size_request(ed->widget, r.getWidth(), r.getHeight());
+
+    ed->realize_id   = g_signal_connect(ed->widget, "realize",
+                                        G_CALLBACK(vst3_on_realize), ed);
+    ed->unrealize_id = g_signal_connect(ed->widget, "unrealize",
+                                        G_CALLBACK(vst3_on_unrealize), ed);
+    b->editor = ed;
+    return ed->widget;
+}
+
+static void vst3_destroy_gui(PluginInstance *pi)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b || !b->editor) return;
+    Vst3Editor *ed = b->editor;
+
+    /* Stop our handlers firing during the gtk_widget_destroy the host does next. */
+    if (ed->widget) {
+        if (ed->realize_id)   g_signal_handler_disconnect(ed->widget, ed->realize_id);
+        if (ed->unrealize_id) g_signal_handler_disconnect(ed->widget, ed->unrealize_id);
+    }
+    if (ed->view) {
+        if (ed->attached) { ed->view->removed(); ed->attached = false; }
+        ed->view->setFrame(nullptr);
+        ed->view = nullptr;            /* IPtr drops the view's last ref */
+    }
+    if (ed->frame) {                   /* frame outlives removed() (it may unregister) */
+        ed->frame->remove_all_sources();
+        delete ed->frame;
+        ed->frame = nullptr;
+    }
+    delete ed;
+    b->editor = nullptr;
+}
+
 static const PhOps vst3_ops = {
-    vst3_process, vst3_destroy, NULL, NULL,
+    vst3_process, vst3_destroy, vst3_make_gui, vst3_destroy_gui,
     vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
     vst3_param_range
 };
@@ -183,6 +396,17 @@ static const PhOps vst3_ops = {
 extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
                                                double sr, int max_block)
 {
+    /* Expose an IHostApplication to plug-ins via the plugin context, registered
+     * once. JUCE (and other) VST3 plug-ins query the host context during
+     * controller initialize() to create IMessage/IAttributeList objects; without
+     * it their createView() returns NULL and we'd never get the editor. The SDK's
+     * PlugProvider passes this context to component+controller initialize(). */
+    static Steinberg::Vst::HostApplication *gHostApp = nullptr;
+    if (!gHostApp) {
+        gHostApp = new Steinberg::Vst::HostApplication();
+        PluginContextFactory::instance().setPluginContext(gHostApp);
+    }
+
     gchar **parts = g_strsplit(info->key, "\n", 2);
     if (!parts[0] || !parts[1]) { g_strfreev(parts); return NULL; }
     std::string path = parts[0];
@@ -240,6 +464,10 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
     b->data.symbolicSampleSize = kSample32;
 
     if (b->controller) {
+        /* Route editor knob edits to the DSP (needed for native-editor controls). */
+        b->handler.b = b;
+        b->controller->setComponentHandler(&b->handler);
+
         int32 pc = b->controller->getParameterCount();
         for (int32 i = 0; i < pc; i++) {
             ParameterInfo pinf;
