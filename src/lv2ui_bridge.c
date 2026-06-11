@@ -85,8 +85,12 @@ static gboolean on_helper_out(GIOChannel *src, GIOCondition cond, gpointer data)
     g_strchomp(line);
 
     if (!strncmp(line, "WID ", 4)) {
-        unsigned long xid = strtoul(line + 4, NULL, 10);
+        unsigned long xid = 0; int w = 0, h = 0;
+        sscanf(line + 4, "%lu %d %d", &xid, &w, &h);
         if (xid && GTK_IS_SOCKET(b->socket)) {
+            /* Give the socket the plugin's natural size so the non-homogeneous
+             * stack and the FX window can fit themselves to it. */
+            if (w > 0 && h > 0) gtk_widget_set_size_request(b->socket, w, h);
             gtk_socket_add_id(GTK_SOCKET(b->socket), (Window)xid);
             b->embedded = TRUE;
             push_ports(b, FALSE);   /* seed control inputs once */

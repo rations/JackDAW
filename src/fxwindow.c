@@ -226,6 +226,10 @@ typedef struct {
     GtkWidget      *mix_scale;   /* wet/dry for the selected effect */
     GtkWidget      *mix_row;     /* the dry/wet header (hidden when none selected) */
     guint           sel_index;   /* index of the selected effect */
+    guint           fit_id;      /* deferred "fit window to plugin" timer */
+    int             fit_ticks;   /* retries left to catch late-negotiating UIs */
+    int             fit_stable;  /* consecutive ticks at an unchanged size */
+    int             fit_w, fit_h;/* last natural size we resized to */
 } FxWindow;
 
 static void fxwin_rebuild_list(FxWindow *fw);
@@ -250,6 +254,38 @@ static void fxwin_mix_changed(GtkRange *r, gpointer data)
     gpointer inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
     if (inst) pluginhost_set_mix((PluginInstance *)inst,
                                  (float)gtk_range_get_value(r));
+}
+
+/* Resize the FX window to the currently shown plugin's natural size. Native UIs
+ * (in-process suil, or the out-of-process bridge whose WID + size arrives a beat
+ * later) report 1x1 until their embedded window negotiates, so we retry for a
+ * short while and stop once the size holds steady. A GtkWindow never shrinks to
+ * its content on its own, so this is what makes switching between differently
+ * sized plugins re-fit instead of stretching the last (largest) size. */
+static gboolean fxwin_fit_cb(gpointer data)
+{
+    FxWindow *fw = data;
+    if (!fw->window || !fw->shown) { fw->fit_id = 0; return G_SOURCE_REMOVE; }
+
+    GtkWidget *content = gtk_bin_get_child(GTK_BIN(fw->window));   /* the paned */
+    GtkRequisition nat;
+    gtk_widget_get_preferred_size(content, NULL, &nat);
+
+    if (nat.width > 0 && nat.height > 0) {
+        gtk_window_resize(GTK_WINDOW(fw->window), nat.width, nat.height);
+        if (nat.width == fw->fit_w && nat.height == fw->fit_h) fw->fit_stable++;
+        else { fw->fit_stable = 0; fw->fit_w = nat.width; fw->fit_h = nat.height; }
+    }
+    if (fw->fit_stable >= 2 || --fw->fit_ticks <= 0) { fw->fit_id = 0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;
+}
+
+static void fxwin_fit_later(FxWindow *fw)
+{
+    fw->fit_ticks = 12;   /* ~1.2s cap; stops early once the size is steady */
+    fw->fit_stable = 0;
+    fw->fit_w = fw->fit_h = -1;
+    if (!fw->fit_id) fw->fit_id = g_timeout_add(100, fxwin_fit_cb, fw);
 }
 
 static void fxwin_show_gui(FxWindow *fw, guint index)
@@ -288,6 +324,7 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
     gtk_widget_show_all(gui);
     gtk_stack_set_visible_child(GTK_STACK(fw->gui_holder), gui);
     fw->shown = gui;
+    fxwin_fit_later(fw);
 }
 
 typedef struct { FxWindow *fw; guint index; } RowLink;
@@ -390,6 +427,7 @@ static gboolean fxwin_delete(GtkWidget *w, GdkEvent *e, gpointer data)
 {
     (void)w; (void)e;
     FxWindow *fw = data;
+    if (fw->fit_id) { g_source_remove(fw->fit_id); fw->fit_id = 0; }
     /* Free all editors (suil instances + timers) BEFORE destroying the window. */
     fxwin_release_all(fw);
     g_object_set_data(G_OBJECT(fw->track), "fx-window", NULL);
@@ -440,9 +478,10 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     g_signal_connect(paths, "clicked", G_CALLBACK(fxwin_paths_clicked), fw);
     gtk_box_pack_start(GTK_BOX(left), paths, FALSE, FALSE, 0);
 
-    /* Right panel: wet/dry header above the selected effect's GUI. */
+    /* Right panel: wet/dry header above the selected effect's GUI. No forced
+     * width — the panel fits the shown plugin's natural size (see fxwin_fit_*). */
     GtkWidget *right = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(right, 460, -1);
+    gtk_widget_set_size_request(right, 300, -1);
 
     fw->mix_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_container_set_border_width(GTK_CONTAINER(fw->mix_row), 4);
@@ -461,6 +500,10 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     /* A stack so each effect's editor is added once and shown by switching the
      * visible child — never reparented (which would blank a native X11 UI). */
     fw->gui_holder = gtk_stack_new();
+    /* Size to the VISIBLE child, not the largest — otherwise a small plugin gets
+     * stretched to the biggest one ever loaded and the window can't shrink. */
+    gtk_stack_set_hhomogeneous(GTK_STACK(fw->gui_holder), FALSE);
+    gtk_stack_set_vhomogeneous(GTK_STACK(fw->gui_holder), FALSE);
     gtk_widget_set_hexpand(fw->gui_holder, TRUE);
     gtk_widget_set_vexpand(fw->gui_holder, TRUE);
     gtk_box_pack_start(GTK_BOX(right), fw->gui_holder, TRUE, TRUE, 0);
