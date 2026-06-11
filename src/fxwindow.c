@@ -312,13 +312,18 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
     if (gtk_widget_get_parent(gui) != fw->gui_holder) {
         if (gtk_widget_get_parent(gui))
             gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(gui)), gui);
-        /* The editor MUST expand to fill: a native X11-wrapped UI reports a 1x1
-         * natural size until its embedded window negotiates size, and without
-         * expand the stack would lock it at 1x1 (blank). */
+        /* Expand so the editor claims the stack cell (and the fit logic has room
+         * to work), but CENTER at its natural size rather than FILL: suil's
+         * x11_in_gtk3 wrapper XResizeWindow()s the embedded plugin window to
+         * whatever allocation it gets (clamped only by max-size hints, which
+         * fixed-size pedals don't set). FILL therefore stretches such UIs into
+         * jumbled/oversized graphics whenever the window is momentarily larger
+         * than the plugin (e.g. just after switching from a bigger plugin). The
+         * wrapper reports a correct natural size, so CENTER renders it true. */
         gtk_widget_set_hexpand(gui, TRUE);
         gtk_widget_set_vexpand(gui, TRUE);
-        gtk_widget_set_halign(gui, GTK_ALIGN_FILL);
-        gtk_widget_set_valign(gui, GTK_ALIGN_FILL);
+        gtk_widget_set_halign(gui, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(gui, GTK_ALIGN_CENTER);
         gtk_container_add(GTK_CONTAINER(fw->gui_holder), gui);
     }
     gtk_widget_show_all(gui);
