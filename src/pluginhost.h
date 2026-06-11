@@ -78,6 +78,24 @@ GtkWidget      *pluginhost_make_gui(PluginInstance *inst);
 /* The cached editor widget if one was already built, else NULL (never builds). */
 GtkWidget      *pluginhost_peek_gui(PluginInstance *inst);
 
+/* --- Out-of-process native UI support (used by lv2ui_bridge) --- */
+/* Returns TRUE + the plugin/UI URIs and UI type if a wrappable native editor
+ * exists (LV2 only for now); the bridge spawns the matching helper process. */
+gboolean        pluginhost_ui_meta(PluginInstance *inst, const char **plugin_uri,
+                                   const char **ui_uri, const char **ui_type);
+/* Raw control-port value access by LV2 port index (UI <-> DSP bridging). */
+void            pluginhost_ctl_set(PluginInstance *inst, guint port, float v);
+float           pluginhost_ctl_get(PluginInstance *inst, guint port);
+/* Enumerate control input (outputs=FALSE) or output (TRUE) port indices. */
+void            pluginhost_ctl_ports(PluginInstance *inst, gboolean outputs,
+                                     const guint **ports, guint *n);
+double          pluginhost_sample_rate(PluginInstance *inst);
+
+/* Tear down the cached editor (frees a native UI / destroys the generic panel)
+ * so the next pluginhost_make_gui() builds it fresh. The caller MUST have
+ * removed the widget from any container first. DSP state is unaffected. */
+void            pluginhost_release_gui(PluginInstance *inst);
+
 /* Generic parameter access (used by the fallback parameter panel). */
 guint           pluginhost_param_count(PluginInstance *inst);
 const char     *pluginhost_param_name (PluginInstance *inst, guint i);

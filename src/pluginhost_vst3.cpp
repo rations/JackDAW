@@ -173,7 +173,7 @@ static void vst3_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; } /* normalised */
 
 static const PhOps vst3_ops = {
-    vst3_process, vst3_destroy, NULL,
+    vst3_process, vst3_destroy, NULL, NULL,
     vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
     vst3_param_range
 };

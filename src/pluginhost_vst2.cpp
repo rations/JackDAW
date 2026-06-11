@@ -150,7 +150,7 @@ static void vst2_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; }  /* normalised */
 
 static const PhOps vst2_ops = {
-    vst2_process, vst2_destroy, NULL,
+    vst2_process, vst2_destroy, NULL, NULL,
     vst2_param_count, vst2_param_name, vst2_param_get, vst2_param_set,
     vst2_param_range
 };

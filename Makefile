@@ -7,6 +7,8 @@ SRCDIR  := src
 EXTDIR  := ext
 TARGET  := $(SRCDIR)/jackdaw
 
+.DEFAULT_GOAL := all
+
 CC      := gcc
 CXX     := g++
 
@@ -18,7 +20,7 @@ VST3    ?= 1
 # Package detection via pkg-config
 # ---------------------------------------------------------------------------
 
-PKGS_REQ := gtk+-3.0 jack sndfile
+PKGS_REQ := gtk+-3.0 gtk+-x11-3.0 jack sndfile
 
 HAS_ALSA := $(shell pkg-config --exists alsa       2>/dev/null && echo 1)
 HAS_SR   := $(shell pkg-config --exists samplerate 2>/dev/null && echo 1)
@@ -135,13 +137,15 @@ endif
 OBJS := $(SRCS_C:.c=.o) $(SRCS_CXX:.cpp=.o) $(VST3_SDK_OBJ)
 DEPS := $(SRCS_C:.c=.d) $(SRCS_CXX:.cpp=.d)
 
+HELPERS :=
+
 # ---------------------------------------------------------------------------
 # Rules
 # ---------------------------------------------------------------------------
 
 .PHONY: all clean
 
-all: $(TARGET)
+all: $(TARGET) $(HELPERS)
 
 $(TARGET): $(OBJS)
 	$(CXX) $^ $(LDFLAGS) -o $@
@@ -160,4 +164,4 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 -include $(DEPS)
 
 clean:
-	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.d $(TARGET)
+	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.d $(TARGET) $(HELPERS)

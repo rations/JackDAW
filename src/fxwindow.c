@@ -281,6 +281,13 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
     if (gtk_widget_get_parent(gui) != fw->gui_holder) {
         if (gtk_widget_get_parent(gui))
             gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(gui)), gui);
+        /* The editor MUST expand to fill: a native X11-wrapped UI reports a 1x1
+         * natural size until its embedded window negotiates size, and without
+         * expand the stack would lock it at 1x1 (blank). */
+        gtk_widget_set_hexpand(gui, TRUE);
+        gtk_widget_set_vexpand(gui, TRUE);
+        gtk_widget_set_halign(gui, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(gui, GTK_ALIGN_FILL);
         gtk_container_add(GTK_CONTAINER(fw->gui_holder), gui);
     }
     gtk_widget_show_all(gui);
@@ -460,6 +467,7 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     /* A stack so each effect's editor is added once and shown by switching the
      * visible child — never reparented (which would blank a native X11 UI). */
     fw->gui_holder = gtk_stack_new();
+    gtk_widget_set_hexpand(fw->gui_holder, TRUE);
     gtk_widget_set_vexpand(fw->gui_holder, TRUE);
     gtk_box_pack_start(GTK_BOX(right), fw->gui_holder, TRUE, TRUE, 0);
 

@@ -29,6 +29,12 @@
 
 #define LV2_GTK3_UI_URI "http://lv2plug.in/ns/extensions/ui#Gtk3UI"
 
+/* Native plugin editors are hosted IN-PROCESS via suil, modeled on jalv
+ * (jalv/src/gtk/jalv_gtk.c + jalv/src/jalv.c): the suil widget is embedded in a
+ * GtkEventBox passed as ui:parent, with jalv's exact feature set; suil drives
+ * the UI idle loop itself (we must NOT). Control-output values are pushed to the
+ * UI on a 30 Hz timer (jalv_update analog). */
+
 /* ---- Shared LilvWorld + cached nodes ---- */
 
 static LilvWorld *world;
@@ -275,10 +281,13 @@ typedef struct {
 
     guint   n_ports;
     float  *ctl;                 /* per-port control value store (n_ports) */
-    float   ctl_out_dummy;
 
     int    *ain;  int n_audio_in;   /* ALL audio input port indices  */
     int    *aout; int n_audio_out;  /* ALL audio output port indices */
+    guint  *ctl_in;  guint n_ctl_in;   /* control INPUT ports  (UI knobs)   */
+    guint  *ctl_out; guint n_ctl_out;  /* control OUTPUT ports (UI meters)  */
+
+    char   *uri, *ui_uri, *ui_type;    /* cached UI metadata */
 
     float  *outA, *outB;         /* scratch out buffers (max_block) */
     float  *dummy_in, *dummy_out;/* scratch for surplus audio ports */
@@ -298,8 +307,8 @@ typedef struct {
     const LV2_Feature *features[2][10]; /* per-instance feature list */
 
 #ifdef HAVE_SUIL
-    SuilInstance *ui;
-    guint         ui_idle_id;    /* g_timeout driving suil/X11 UI idle */
+    SuilInstance *ui;              /* in-process editor (suil), or NULL */
+    guint         ui_push_id;      /* 30 Hz timer pushing ctl_out -> UI */
     LV2_Extension_Data_Feature ui_ext_data; /* backing for data-access feature */
 #endif
 } Lv2Backend;
@@ -372,14 +381,13 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
     }
 }
 
+static void lv2_destroy_gui(PluginInstance *pi);   /* fwd (suil section below) */
+
 static void lv2_destroy(PluginInstance *pi)
 {
     Lv2Backend *b = pi->backend;
     if (!b) return;
-#ifdef HAVE_SUIL
-    if (b->ui_idle_id) { g_source_remove(b->ui_idle_id); b->ui_idle_id = 0; }
-    if (b->ui) { suil_instance_free(b->ui); b->ui = NULL; }
-#endif
+    lv2_destroy_gui(pi);              /* stop UI push timer + free suil instance */
     for (int i = 0; i < b->n_inst; i++) {
         if (b->inst[i]) {
             lilv_instance_deactivate(b->inst[i]);
@@ -390,12 +398,70 @@ static void lv2_destroy(PluginInstance *pi)
     for (guint i = 0; i < b->n_params; i++) g_free(b->params[i].name);
     g_free(b->params);
     g_free(b->ctl);
-    g_free(b->ain); g_free(b->aout);
+    g_free(b->ain); g_free(b->aout); g_free(b->ctl_in); g_free(b->ctl_out);
     g_free(b->outA);
     g_free(b->outB);
     g_free(b->dummy_in); g_free(b->dummy_out);
     g_free(b->misc);
+    g_free(b->uri); g_free(b->ui_uri); g_free(b->ui_type);
     g_free(b);
+}
+
+/* ---- Out-of-process UI metadata + control-port access (for lv2ui_bridge) ---- */
+
+/* Choose the best UI we have a helper for, preferring the gtk3-handled types.
+ * Caches the plugin URI + chosen UI URI/type on the backend. */
+gboolean ph_lv2_ui_meta(PluginInstance *pi, const char **plugin_uri,
+                        const char **ui_uri, const char **ui_type)
+{
+    Lv2Backend *b = pi->backend;
+    if (!b->uri)
+        b->uri = g_strdup(lilv_node_as_uri(lilv_plugin_get_uri(b->plugin)));
+
+    if (!b->ui_uri) {
+        LilvUIs *uis = lilv_plugin_get_uis(b->plugin);
+        if (uis) {
+            /* preference order: X11/Gtk3 (gtk3 helper) > Gtk2 > Qt5 > Qt6 */
+            static const char *pref[] = {
+                "http://lv2plug.in/ns/extensions/ui#X11UI",
+                "http://lv2plug.in/ns/extensions/ui#Gtk3UI",
+                "http://lv2plug.in/ns/extensions/ui#GtkUI",
+                "http://lv2plug.in/ns/extensions/ui#Qt5UI",
+                "http://lv2plug.in/ns/extensions/ui#Qt6UI", NULL };
+            for (int pi_i = 0; pref[pi_i] && !b->ui_uri; pi_i++) {
+                LilvNode *want = lilv_new_uri(world, pref[pi_i]);
+                LILV_FOREACH(uis, it, uis) {
+                    const LilvUI *ui = lilv_uis_get(uis, it);
+                    if (lilv_ui_is_a(ui, want)) {
+                        b->ui_uri  = g_strdup(lilv_node_as_uri(lilv_ui_get_uri(ui)));
+                        b->ui_type = g_strdup(pref[pi_i]);
+                        break;
+                    }
+                }
+                lilv_node_free(want);
+            }
+            lilv_uis_free(uis);
+        }
+    }
+    if (!b->ui_uri) return FALSE;
+    if (plugin_uri) *plugin_uri = b->uri;
+    if (ui_uri)     *ui_uri     = b->ui_uri;
+    if (ui_type)    *ui_type    = b->ui_type;
+    return TRUE;
+}
+
+void ph_lv2_ctl_set(PluginInstance *pi, guint port, float v)
+{ Lv2Backend *b = pi->backend; if (port < b->n_ports) b->ctl[port] = v; }
+
+float ph_lv2_ctl_get(PluginInstance *pi, guint port)
+{ Lv2Backend *b = pi->backend; return port < b->n_ports ? b->ctl[port] : 0.0f; }
+
+void ph_lv2_ctl_ports(PluginInstance *pi, gboolean outputs,
+                      const guint **ports, guint *n)
+{
+    Lv2Backend *b = pi->backend;
+    if (outputs) { *ports = b->ctl_out; *n = b->n_ctl_out; }
+    else         { *ports = b->ctl_in;  *n = b->n_ctl_in;  }
 }
 
 static guint lv2_param_count(PluginInstance *pi)
@@ -416,19 +482,21 @@ static void lv2_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { Lv2Backend *b = pi->backend;
   if (i < b->n_params) { if (mn) *mn = b->params[i].min; if (mx) *mx = b->params[i].max; } }
 
-/* ---- Native GUI via suil ----
- * Embeds the plugin's own editor (Gtk3 UIs directly; X11/other UIs wrapped by
- * suil). suil-wrapped UIs require the host to drive an idle loop, otherwise they
- * never repaint and crash on interaction — that is done by lv2_ui_idle_cb. */
+/* ---- In-process native GUI via suil (modeled on jalv) ----------------------
+ * jalv/src/jalv.c:jalv_instantiate_ui + jalv/src/gtk/jalv_gtk.c. Key points:
+ *  - the suil widget is embedded in a GtkEventBox passed as ui:parent;
+ *  - features = map, unmap, instance-access, data-access, log, parent, options,
+ *    idleInterface;
+ *  - suil drives the UI idle loop itself (we must NOT);
+ *  - control values are pushed to the UI on a timer (jalv_update analog).
+ */
 
-/* suil_init() must run once, after gtk_init() and before any UI is wrapped, or
- * the X11-in-Gtk3 wrapper is not set up and editors come up blank. */
 void ph_lv2_ui_init(int *argc, char ***argv)
 {
 #ifdef HAVE_SUIL
     static gboolean done = FALSE;
     if (done) return;
-    suil_init(argc, argv, SUIL_ARG_NONE);
+    suil_init(argc, argv, SUIL_ARG_NONE);   /* once, before any UI is wrapped */
     done = TRUE;
 #else
     (void)argc; (void)argv;
@@ -438,44 +506,48 @@ void ph_lv2_ui_init(int *argc, char ***argv)
 #ifdef HAVE_SUIL
 static SuilHost *suil_host;
 
-static void lv2_ui_write(SuilController controller, uint32_t port,
-                         uint32_t size, uint32_t protocol, const void *buffer)
+/* UI wrote a control port -> store it; the RT thread reads b->ctl (float). */
+static void lv2_ui_write(SuilController c, uint32_t port, uint32_t size,
+                         uint32_t protocol, const void *buffer)
 {
-    PluginInstance *pi = (PluginInstance *)controller;
+    PluginInstance *pi = (PluginInstance *)c;
     Lv2Backend *b = pi->backend;
     if (protocol == 0 && size == sizeof(float) && port < b->n_ports)
-        b->ctl[port] = *(const float *)buffer;   /* control-port edit from UI */
+        b->ctl[port] = *(const float *)buffer;
 }
 
-static uint32_t lv2_ui_port_index(SuilController controller, const char *symbol)
+static uint32_t lv2_ui_port_index(SuilController c, const char *symbol)
 {
-    PluginInstance *pi = (PluginInstance *)controller;
+    PluginInstance *pi = (PluginInstance *)c;
     Lv2Backend *b = pi->backend;
     for (guint i = 0; i < b->n_ports; i++) {
         const LilvPort *port = lilv_plugin_get_port_by_index(b->plugin, i);
-        const LilvNode *sym = lilv_port_get_symbol(b->plugin, port);
+        const LilvNode *sym  = lilv_port_get_symbol(b->plugin, port);
         if (sym && !g_strcmp0(lilv_node_as_string(sym), symbol)) return i;
     }
     return LV2UI_INVALID_PORT_INDEX;
 }
 
-/* Drive the UI's idle interface (required for suil-wrapped X11 UIs) and feed it
- * the latest control values so its widgets track the DSP state. */
-static gboolean lv2_ui_idle_cb(gpointer data)
+/* Push control-OUTPUT values (meters/tuner) to the UI — the jalv_update analog
+ * (control ports only; no atom/event ports yet). Does NOT drive idle (suil does
+ * that internally for X11 UIs). */
+static gboolean lv2_ui_push_cb(gpointer data)
 {
     Lv2Backend *b = data;
     if (!b->ui) return G_SOURCE_REMOVE;
-    /* The editor widget persists on the instance but is detached from the FX
-     * window when the effect is deselected/removed/closed. Servicing the UI's
-     * idle while its widget is unrealized crashes the suil X11 wrapper, so only
-     * drive idle when the widget is actually realized on screen. */
-    GtkWidget *w = (GtkWidget *)suil_instance_get_widget(b->ui);
-    if (!w || !gtk_widget_get_mapped(w)) return G_SOURCE_CONTINUE;
-    const LV2UI_Idle_Interface *idle =
-        suil_instance_extension_data(b->ui, LV2_UI__idleInterface);
-    if (idle && idle->idle)
-        idle->idle(suil_instance_get_handle(b->ui));
+    for (guint i = 0; i < b->n_ctl_out; i++) {
+        guint idx = b->ctl_out[i];
+        suil_instance_port_event(b->ui, idx, sizeof(float), 0, &b->ctl[idx]);
+    }
     return G_SOURCE_CONTINUE;
+}
+
+static void lv2_destroy_gui(PluginInstance *pi)
+{
+    Lv2Backend *b = pi->backend;
+    if (!b) return;
+    if (b->ui_push_id) { g_source_remove(b->ui_push_id); b->ui_push_id = 0; }
+    if (b->ui) { suil_instance_free(b->ui); b->ui = NULL; }
 }
 
 static GtkWidget *lv2_make_gui(PluginInstance *pi)
@@ -485,14 +557,15 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
         suil_host = suil_host_new(lv2_ui_write, lv2_ui_port_index, NULL, NULL);
     if (!suil_host) return NULL;
 
+    /* Pick a UI suil can wrap into Gtk3 (native Gtk3UI, or X11UI via
+     * libsuil_x11_in_gtk3). */
     LilvUIs *uis = lilv_plugin_get_uis(b->plugin);
     if (!uis) return NULL;
-
     LilvNode *gtk3 = lilv_new_uri(world, LV2_GTK3_UI_URI);
     const LilvUI   *use_ui   = NULL;
     const LilvNode *use_type = NULL;
-    LILV_FOREACH(uis, i, uis) {
-        const LilvUI *ui = lilv_uis_get(uis, i);
+    LILV_FOREACH(uis, it, uis) {
+        const LilvUI *ui = lilv_uis_get(uis, it);
         const LilvNode *type = NULL;
         if (lilv_ui_is_supported(ui, suil_ui_supported, gtk3, &type)) {
             use_ui = ui; use_type = type; break;
@@ -500,63 +573,75 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
     }
     if (!use_ui) { lilv_node_free(gtk3); lilv_uis_free(uis); return NULL; }
 
-    const char *plugin_uri = lilv_node_as_uri(lilv_plugin_get_uri(b->plugin));
-    const char *ui_uri     = lilv_node_as_uri(lilv_ui_get_uri(use_ui));
-    const char *ui_type    = lilv_node_as_uri(use_type);
+    /* Parent the editor in a GtkEventBox (its own native X window) — this is
+     * what jalv does and what makes embedding reliable. */
+    GtkWidget *box = gtk_event_box_new();
+    gtk_widget_set_halign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_valign(box, GTK_ALIGN_FILL);
+    gtk_widget_set_hexpand(box, TRUE);
+    gtk_widget_set_vexpand(box, TRUE);
+
+    /* UI options (jalv passes these): sample rate + UI update rate. */
+    float f_sr   = (float)pi->sample_rate;
+    float f_rate = 30.0f;
+    const LV2_URID urid_float = urid_map_cb(NULL, LV2_ATOM__Float);
+    LV2_Options_Option ui_opts[] = {
+        { LV2_OPTIONS_INSTANCE, 0, urid_map_cb(NULL, LV2_PARAMETERS__sampleRate),
+          sizeof(float), urid_float, &f_sr },
+        { LV2_OPTIONS_INSTANCE, 0, urid_map_cb(NULL, LV2_UI__updateRate),
+          sizeof(float), urid_float, &f_rate },
+        { LV2_OPTIONS_INSTANCE, 0, 0, 0, 0, NULL }
+    };
+
+    b->ui_ext_data.data_access =
+        lilv_instance_get_descriptor(b->inst[0])->extension_data;
+
+    LV2_Feature feat_inst = { LV2_INSTANCE_ACCESS_URI,
+                              lilv_instance_get_handle(b->inst[0]) };
+    LV2_Feature feat_data = { LV2_DATA_ACCESS_URI, &b->ui_ext_data };
+    LV2_Feature feat_parent = { LV2_UI__parent, box };
+    LV2_Feature feat_uiopts = { LV2_OPTIONS__options, ui_opts };
+    LV2_Feature feat_idle = { LV2_UI__idleInterface, NULL };
+    const LV2_Feature *ui_features[] = {
+        &feat_map, &feat_unmap, &feat_inst, &feat_data, &feat_log,
+        &feat_parent, &feat_uiopts, &feat_idle, NULL };
+
     char *bundle = lilv_node_get_path(lilv_ui_get_bundle_uri(use_ui), NULL);
     char *binary = lilv_node_get_path(lilv_ui_get_binary_uri(use_ui), NULL);
 
-    /* The editor gets its OWN feature list — NOT the DSP one. It must not be
-     * handed worker:schedule (which can confuse a UI), but it DOES need
-     * instance-access + data-access so UIs like guitarix can bind directly to
-     * the running DSP instance (without them they render blank / inert). */
-    b->ui_ext_data.data_access =
-        lilv_instance_get_descriptor(b->inst[0])->extension_data;
-    LV2_Feature feat_inst_access = {
-        LV2_INSTANCE_ACCESS_URI, lilv_instance_get_handle(b->inst[0]) };
-    LV2_Feature feat_data_access = {
-        LV2_DATA_ACCESS_URI, &b->ui_ext_data };
-    /* Many X11 UIs (e.g. guitarix) declare ui:idleInterface as a REQUIRED
-     * feature: the host must pass it to signal it will drive idle(). Without it
-     * the UI fails to instantiate and suil shows an empty wrapper. Worker/
-     * options/log belong to the DSP, not the editor. */
-    LV2_Feature feat_ui_idle = { LV2_UI__idleInterface, NULL };
-    const LV2_Feature *ui_features[] = {
-        &feat_map, &feat_inst_access, &feat_data_access, &feat_ui_idle, NULL };
+    b->ui = suil_instance_new(
+        suil_host, pi, LV2_GTK3_UI_URI,
+        lilv_node_as_uri(lilv_plugin_get_uri(b->plugin)),
+        lilv_node_as_uri(lilv_ui_get_uri(use_ui)),
+        lilv_node_as_uri(use_type),
+        bundle ? bundle : "", binary ? binary : "", ui_features);
 
-    b->ui = suil_instance_new(suil_host, pi, LV2_GTK3_UI_URI,
-                              plugin_uri, ui_uri, ui_type,
-                              bundle ? bundle : "", binary ? binary : "",
-                              ui_features);
-    lilv_free(bundle);
-    lilv_free(binary);
-    lilv_node_free(gtk3);
-    lilv_uis_free(uis);
+    lilv_free(bundle); lilv_free(binary);
+    lilv_node_free(gtk3); lilv_uis_free(uis);
 
-    if (!b->ui) return NULL;   /* no usable native UI → caller uses generic panel */
+    if (!b->ui) { gtk_widget_destroy(box); return NULL; }
     GtkWidget *w = (GtkWidget *)suil_instance_get_widget(b->ui);
-    if (!w) { suil_instance_free(b->ui); b->ui = NULL; return NULL; }
+    if (!w) { suil_instance_free(b->ui); b->ui = NULL; gtk_widget_destroy(box); return NULL; }
+    gtk_container_add(GTK_CONTAINER(box), w);
 
-    /* Seed the UI with the current input control values so its knobs/sliders
-     * start in the right position. */
-    for (guint i = 0; i < b->n_ports; i++) {
-        const LilvPort *port = lilv_plugin_get_port_by_index(b->plugin, i);
-        if (lilv_port_is_a(b->plugin, port, n_control) &&
-            lilv_port_is_a(b->plugin, port, n_input))
-            suil_instance_port_event(b->ui, i, sizeof(float), 0, &b->ctl[i]);
+    /* Seed the UI with current control-input values so knobs start correct. */
+    for (guint i = 0; i < b->n_ctl_in; i++) {
+        guint idx = b->ctl_in[i];
+        suil_instance_port_event(b->ui, idx, sizeof(float), 0, &b->ctl[idx]);
     }
-
-    b->ui_idle_id = g_timeout_add(30, lv2_ui_idle_cb, b);
-    return w;   /* NULL → caller falls back to the generic panel */
+    b->ui_push_id = g_timeout_add(33, lv2_ui_push_cb, b);
+    return box;
 }
-#else
+#else  /* !HAVE_SUIL */
 static GtkWidget *lv2_make_gui(PluginInstance *pi) { (void)pi; return NULL; }
+static void lv2_destroy_gui(PluginInstance *pi) { (void)pi; }
 #endif
 
 static const PhOps lv2_ops = {
     .process     = lv2_process,
     .destroy     = lv2_destroy,
     .make_gui    = lv2_make_gui,
+    .destroy_gui = lv2_destroy_gui,
     .param_count = lv2_param_count,
     .param_name  = lv2_param_name,
     .param_get   = lv2_param_get,
@@ -607,8 +692,10 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
      * requires EVERY port be connected before run(); leaving one NULL crashes
      * the plugin. A zeroed buffer reads as an empty atom sequence. */
     b->misc      = g_malloc0(MAX((gsize)max_block * sizeof(float), (gsize)8192));
-    b->ain       = g_new0(int, b->n_ports ? b->n_ports : 1);
-    b->aout      = g_new0(int, b->n_ports ? b->n_ports : 1);
+    b->ain       = g_new0(int,   b->n_ports ? b->n_ports : 1);
+    b->aout      = g_new0(int,   b->n_ports ? b->n_ports : 1);
+    b->ctl_in    = g_new0(guint, b->n_ports ? b->n_ports : 1);
+    b->ctl_out   = g_new0(guint, b->n_ports ? b->n_ports : 1);
 
     /* Default control values */
     float *mins = g_new0(float, b->n_ports);
@@ -633,6 +720,7 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
             if (d != d) d = 0.0f;   /* NaN guard */
             b->ctl[i] = d;
             if (is_in) {
+                b->ctl_in[b->n_ctl_in++] = i;     /* knobs/sliders (UI sync) */
                 Lv2Param pr;
                 pr.port_index = i;
                 LilvNode *pn = lilv_port_get_name(p, port);
@@ -641,9 +729,10 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
                 pr.min = mins[i]; pr.max = maxs[i];
                 if (pr.max <= pr.min) pr.max = pr.min + 1.0f;
                 g_array_append_val(params, pr);
+            } else if (is_out) {
+                b->ctl_out[b->n_ctl_out++] = i;   /* meters/tuner feed UI */
             }
         }
-        (void)is_out;
     }
     g_free(mins); g_free(maxs); g_free(defs);
 
@@ -704,23 +793,21 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
             for (int j = 0; j < k; j++) { worker_destroy(&b->workers[j]); lilv_instance_free(b->inst[j]); }
             for (guint q = 0; q < b->n_params; q++) g_free(b->params[q].name);
             g_free(b->params); g_free(b->ctl);
-            g_free(b->ain); g_free(b->aout);
+            g_free(b->ain); g_free(b->aout); g_free(b->ctl_in); g_free(b->ctl_out);
             g_free(b->outA); g_free(b->outB);
             g_free(b->dummy_in); g_free(b->dummy_out); g_free(b->misc);
             g_free(b);
             return NULL;
         }
-        /* Connect EVERY port up front. Control ports → shared value store
-         * (outputs → dummy). Audio ports are (re)connected per process call,
-         * but bind them to scratch now so an unused one is never NULL. Any
-         * other port type (atom/event/CV) → the zeroed misc buffer. */
+        /* Connect EVERY port up front. Control ports → their own slot in the
+         * value store (so output controls — meters/tuner — can be read and fed
+         * to the UI). Audio ports are (re)connected per process call, but bind
+         * them to scratch now so an unused one is never NULL. Any other port
+         * type (atom/event/CV) → the zeroed misc buffer. */
         for (guint i = 0; i < b->n_ports; i++) {
             const LilvPort *port = lilv_plugin_get_port_by_index(p, i);
             if (lilv_port_is_a(p, port, n_control)) {
-                if (lilv_port_is_a(p, port, n_input))
-                    lilv_instance_connect_port(b->inst[k], i, &b->ctl[i]);
-                else
-                    lilv_instance_connect_port(b->inst[k], i, &b->ctl_out_dummy);
+                lilv_instance_connect_port(b->inst[k], i, &b->ctl[i]);
             } else if (lilv_port_is_a(p, port, n_audio)) {
                 lilv_instance_connect_port(b->inst[k], i,
                     lilv_port_is_a(p, port, n_input) ? b->dummy_in : b->dummy_out);

@@ -277,13 +277,17 @@ PluginInstance *pluginhost_instantiate(const PluginInfo *info)
 void pluginhost_free(PluginInstance *inst)
 {
     if (!inst) return;
-    /* Generic panels are owned by the host; native (suil/X11) editors are freed
-     * by the backend's destroy(). */
-    if (inst->gui && !inst->gui_native)
+    /* Tear the native editor (suil) down first, while the DSP instance it is
+     * bound to (instance-access) is still alive; then destroy the cached widget
+     * and free the backend. */
+    if (inst->gui_native && inst->ops && inst->ops->destroy_gui)
+        inst->ops->destroy_gui(inst);
+    if (inst->gui) {
         gtk_widget_destroy(inst->gui);
-    if (inst->ops && inst->ops->destroy) inst->ops->destroy(inst);
-    if (inst->gui)
         g_object_unref(inst->gui);
+        inst->gui = NULL;
+    }
+    if (inst->ops && inst->ops->destroy) inst->ops->destroy(inst);
     g_free(inst->dry_L);
     g_free(inst->dry_R);
     g_free(inst->name);
@@ -356,6 +360,7 @@ GtkWidget *pluginhost_make_gui(PluginInstance *inst)
     if (!inst) return gtk_label_new("(no plugin)");
     if (inst->gui) return inst->gui;     /* cached, owned by the instance */
 
+    /* Native in-process editor (suil, via the backend), else generic panel. */
     GtkWidget *w = NULL;
     if (inst->ops && inst->ops->make_gui)
         w = inst->ops->make_gui(inst);
@@ -373,6 +378,66 @@ GtkWidget *pluginhost_make_gui(PluginInstance *inst)
 GtkWidget *pluginhost_peek_gui(PluginInstance *inst)
 {
     return inst ? inst->gui : NULL;
+}
+
+/* ---- Out-of-process native UI support (LV2 only for now) ---- */
+
+gboolean pluginhost_ui_meta(PluginInstance *inst, const char **plugin_uri,
+                            const char **ui_uri, const char **ui_type)
+{
+#ifdef HAVE_LV2
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_ui_meta(inst, plugin_uri, ui_uri, ui_type);
+#else
+    (void)inst; (void)plugin_uri; (void)ui_uri; (void)ui_type;
+#endif
+    return FALSE;
+}
+
+void pluginhost_ctl_set(PluginInstance *inst, guint port, float v)
+{
+#ifdef HAVE_LV2
+    if (inst && inst->format == PH_LV2) ph_lv2_ctl_set(inst, port, v);
+#else
+    (void)inst; (void)port; (void)v;
+#endif
+}
+
+float pluginhost_ctl_get(PluginInstance *inst, guint port)
+{
+#ifdef HAVE_LV2
+    if (inst && inst->format == PH_LV2) return ph_lv2_ctl_get(inst, port);
+#else
+    (void)inst; (void)port;
+#endif
+    return 0.0f;
+}
+
+void pluginhost_ctl_ports(PluginInstance *inst, gboolean outputs,
+                          const guint **ports, guint *n)
+{
+    *ports = NULL; *n = 0;
+#ifdef HAVE_LV2
+    if (inst && inst->format == PH_LV2) ph_lv2_ctl_ports(inst, outputs, ports, n);
+#else
+    (void)inst; (void)outputs;
+#endif
+}
+
+double pluginhost_sample_rate(PluginInstance *inst)
+{
+    return inst ? inst->sample_rate : 48000.0;
+}
+
+void pluginhost_release_gui(PluginInstance *inst)
+{
+    if (!inst || !inst->gui) return;
+    if (inst->gui_native && inst->ops && inst->ops->destroy_gui)
+        inst->ops->destroy_gui(inst);   /* free suil instance + push timer */
+    gtk_widget_destroy(inst->gui);
+    g_object_unref(inst->gui);          /* drop our ref_sink reference */
+    inst->gui = NULL;
+    inst->gui_native = FALSE;
 }
 
 /* ---- Generic parameter passthrough ---- */

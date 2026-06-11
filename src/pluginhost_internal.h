@@ -10,6 +10,7 @@ typedef struct {
     void        (*process)    (PluginInstance *, float *L, float *R, int n);
     void        (*destroy)    (PluginInstance *);
     GtkWidget  *(*make_gui)   (PluginInstance *);   /* NULL = use generic panel */
+    void        (*destroy_gui)(PluginInstance *);   /* tear down native editor */
     guint       (*param_count)(PluginInstance *);
     const char *(*param_name) (PluginInstance *, guint);
     float       (*param_get)  (PluginInstance *, guint);
@@ -48,8 +49,17 @@ void ph_vst3_scan  (GList **catalog, const GList *extra);
 void ph_clap_scan  (GList **catalog, const GList *extra);
 void ph_ladspa_scan(GList **catalog, const GList *extra);
 
-/* One-time native-UI toolkit init (suil_init for LV2). No-op if no suil. */
+/* One-time native-UI toolkit init. No-op now that UIs are out-of-process. */
 void ph_lv2_ui_init(int *argc, char ***argv);
+
+/* Out-of-process UI support (consumed by lv2ui_bridge via pluginhost.c).
+ * ph_lv2_ui_meta returns FALSE if the plugin has no UI we have a helper for. */
+gboolean ph_lv2_ui_meta(PluginInstance *, const char **plugin_uri,
+                        const char **ui_uri, const char **ui_type);
+void  ph_lv2_ctl_set  (PluginInstance *, guint port, float v);
+float ph_lv2_ctl_get  (PluginInstance *, guint port);
+void  ph_lv2_ctl_ports(PluginInstance *, gboolean outputs,
+                       const guint **ports, guint *n);
 
 /* Instantiate (return NULL on failure). */
 PluginInstance *ph_lv2_instantiate   (const PluginInfo *, double sr, int max_block);
