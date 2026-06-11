@@ -230,22 +230,17 @@ typedef struct {
 
 static void fxwin_rebuild_list(FxWindow *fw);
 
-/* Detach an instance-owned editor from the stack WITHOUT destroying it (the
- * instance owns the widget and keeps it across window close/reopen). Editors
- * are never reparented while live — reparenting a GtkSocket-based native UI
- * (e.g. a suil-wrapped X11 plugin GUI) destroys its embedding and blanks it. */
-static void fxwin_detach(FxWindow *fw, GtkWidget *gui)
-{
-    if (gui && gtk_widget_get_parent(gui) == fw->gui_holder)
-        gtk_container_remove(GTK_CONTAINER(fw->gui_holder), gui);
-}
-
-/* Detach every effect's editor from the stack (used before the window dies). */
-static void fxwin_detach_all(FxWindow *fw)
+/* Release (free) every effect's native editor before the window dies. Like jalv
+ * (jalv_close -> suil_instance_free), the suil instance and its idle/push timers
+ * MUST be torn down before the containing window is destroyed — keeping an
+ * unparented editor alive leaves those timers running on a dead widget and
+ * crashes. The plugin DSP instances stay alive; reopening rebuilds the editors
+ * via pluginhost_make_gui. */
+static void fxwin_release_all(FxWindow *fw)
 {
     guint n = jackdaw_track_fx_count(fw->track);
     for (guint i = 0; i < n; i++)
-        fxwin_detach(fw, pluginhost_peek_gui(jackdaw_track_fx_get(fw->track, i)));
+        pluginhost_release_gui(jackdaw_track_fx_get(fw->track, i));
     fw->shown = NULL;
 }
 
@@ -310,9 +305,9 @@ static void fxrow_remove_clicked(GtkButton *b, gpointer data)
     (void)b;
     RowLink *rl = data;
     FxWindow *fw = rl->fw;
-    /* Detach this effect's editor from the stack before it is (deferred-)freed,
-     * so switching to another effect never lands on a dead child. */
-    fxwin_detach(fw, pluginhost_peek_gui(jackdaw_track_fx_get(fw->track, rl->index)));
+    /* Free this effect's editor (suil instance + timers) before the DSP instance
+     * is (deferred-)freed, so nothing lingers pointing at a dead widget. */
+    pluginhost_release_gui(jackdaw_track_fx_get(fw->track, rl->index));
     fw->shown = NULL;
     jackdaw_track_fx_remove(fw->track, rl->index);
     fxwin_rebuild_list(fw);
@@ -395,9 +390,8 @@ static gboolean fxwin_delete(GtkWidget *w, GdkEvent *e, gpointer data)
 {
     (void)w; (void)e;
     FxWindow *fw = data;
-    /* Detach all editors so destroying the window doesn't free instance-owned
-     * GUI widgets (they live on the track and persist across reopen). */
-    fxwin_detach_all(fw);
+    /* Free all editors (suil instances + timers) BEFORE destroying the window. */
+    fxwin_release_all(fw);
     g_object_set_data(G_OBJECT(fw->track), "fx-window", NULL);
     gtk_widget_destroy(fw->window);
     g_free(fw);
