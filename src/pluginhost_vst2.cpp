@@ -6,6 +6,8 @@
 #include <string.h>
 #include <stdint.h>
 
+#include <gdk/gdkx.h>          /* gdk_x11_window_get_xid for the embedded editor */
+
 #include "vestige/aeffectx.h"
 #include "pluginhost_internal.h"
 
@@ -23,6 +25,16 @@
 #define EFF_STOP_PROCESS    72
 #define VST_PLUG_CATEG_SYNTH 2
 #define VST_FLAGS_IS_SYNTH  (1 << 8)
+#define VST_FLAGS_HAS_EDITOR 1
+
+/* Editor opcodes (VST 2.4). The plug-in draws into an X11 window we own. */
+#define EFF_EDIT_GET_RECT   13
+#define EFF_EDIT_OPEN       14
+#define EFF_EDIT_CLOSE      15
+#define EFF_EDIT_IDLE       19
+
+/* effEditGetRect returns a pointer to this (not in vestige's header). */
+struct ERect { short top, left, bottom, right; };
 
 typedef AEffect *(VST_CALL_CONV *Vst2EntryProc)(audioMasterCallback);
 
@@ -76,15 +88,29 @@ static intptr_t VST_CALL_CONV vst2_master(AEffect *e, int op, int idx,
 typedef struct {
     void    *dl;
     AEffect *eff;
-    float   *outL, *outR;   /* scratch (not guaranteed in-place) */
-    float   *silence;       /* zeroed input for instruments (max_block) */
+    /* Channel buffers sized to the plug-in's ACTUAL port counts. processReplacing
+     * writes every numOutputs channel, so a fixed [2] array overruns for multi-out
+     * instruments (Superior Drummer) -> the plug-in writes to a bogus pointer. */
+    int      n_in, n_out;   /* eff->numInputs / numOutputs (>= the audio we use) */
+    float  **in_ptrs;       /* [n_in]  channel pointers handed to the plug-in */
+    float  **out_ptrs;      /* [n_out] channel pointers handed to the plug-in */
+    float  **out_bufs;      /* [n_out] backing scratch the plug-in fills */
+    float   *silence;       /* zeroed input (shared, read-only; max_block) */
     int      max_block;
     gboolean is_synth;
 
     /* Pre-allocated VST event block for MIDI delivery (no RT malloc). */
     VstMidiEvent *midi_pool;   /* VST2_MAX_EVENTS entries */
     VstEvents    *vst_events;  /* header + VST2_MAX_EVENTS event pointers */
+
+    /* Native editor (effEditOpen into our X11 window), mirrors the VST3 path. */
+    GtkWidget *gui;            /* GtkDrawingArea with its own X11 window */
+    gulong     realize_id, unrealize_id;
+    guint      idle_id;        /* effEditIdle pump */
+    gboolean   editor_open;
 } Vst2Backend;
+
+static void vst2_close_editor(Vst2Backend *b);   /* fwd (used by vst2_destroy) */
 
 static AEffect *vst2_load(const char *path, void **dl_out)
 {
@@ -160,11 +186,17 @@ static void vst2_run(Vst2Backend *b, float *inL, float *inR,
 {
     AEffect *e = b->eff;
     if (!e->processReplacing) return;
-    float *ins[2]  = { inL, (e->numInputs > 1) ? inR : inL };
-    float *outs[2] = { b->outL, (e->numOutputs > 1) ? b->outR : b->outL };
-    e->processReplacing(e, ins, outs, n);
-    memcpy(L, b->outL, (size_t)n * sizeof(float));
-    memcpy(R, (e->numOutputs > 1) ? b->outR : b->outL, (size_t)n * sizeof(float));
+    /* Bind EVERY channel the plug-in expects: ch0=inL, ch1=inR, the rest silence;
+     * each output channel gets its own scratch (the plug-in writes all n_out). */
+    for (int i = 0; i < b->n_in; i++)
+        b->in_ptrs[i] = (i == 0) ? inL : (i == 1) ? inR : b->silence;
+    for (int i = 0; i < b->n_out; i++)
+        b->out_ptrs[i] = b->out_bufs[i];
+    e->processReplacing(e, b->in_ptrs, b->out_ptrs, n);
+    if (b->n_out > 0) {
+        memcpy(L, b->out_bufs[0], (size_t)n * sizeof(float));
+        memcpy(R, b->out_bufs[b->n_out > 1 ? 1 : 0], (size_t)n * sizeof(float));
+    }
 }
 
 static void vst2_process(PluginInstance *pi, float *L, float *R, int n)
@@ -206,12 +238,15 @@ static void vst2_destroy(PluginInstance *pi)
 {
     Vst2Backend *b = (Vst2Backend *)pi->backend;
     if (!b) return;
+    vst2_close_editor(b);            /* defensive: normally already closed */
     if (b->eff) {
         b->eff->dispatcher(b->eff, EFF_MAINS_CHANGED, 0, 0, NULL, 0.0f);
         b->eff->dispatcher(b->eff, EFF_CLOSE, 0, 0, NULL, 0.0f);
     }
     if (b->dl) dlclose(b->dl);
-    g_free(b->outL); g_free(b->outR); g_free(b->silence);
+    for (int i = 0; i < b->n_out; i++) g_free(b->out_bufs[i]);
+    g_free(b->out_bufs); g_free(b->out_ptrs); g_free(b->in_ptrs);
+    g_free(b->silence);
     g_free(b->midi_pool); g_free(b->vst_events);
     g_free(b);
 }
@@ -243,8 +278,92 @@ static void vst2_param_set(PluginInstance *pi, guint i, float v)
 static void vst2_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; }  /* normalised */
 
+/* ---- Native editor (effEditOpen into a GTK X11 window) ---- */
+
+/* Apply the plug-in's reported editor size to our drawing area. */
+static void vst2_apply_rect(Vst2Backend *b)
+{
+    ERect *r = NULL;
+    b->eff->dispatcher(b->eff, EFF_EDIT_GET_RECT, 0, 0, &r, 0.0f);
+    if (r && r->right > r->left && r->bottom > r->top)
+        gtk_widget_set_size_request(b->gui, r->right - r->left,
+                                            r->bottom - r->top);
+}
+
+/* Periodic idle so the editor repaints (VST 2.4 hosts must pump effEditIdle). */
+static gboolean vst2_idle_cb(gpointer data)
+{
+    Vst2Backend *b = (Vst2Backend *)data;
+    if (b->editor_open && b->eff)
+        b->eff->dispatcher(b->eff, EFF_EDIT_IDLE, 0, 0, NULL, 0.0f);
+    return G_SOURCE_CONTINUE;
+}
+
+/* Attach once the drawing area has a real X11 window. The plug-in (via the
+ * yabridge XEmbed bridge for Windows VSTs) reparents its UI into our window. */
+static void vst2_on_realize(GtkWidget *w, gpointer data)
+{
+    Vst2Backend *b = (Vst2Backend *)data;
+    if (b->editor_open) return;
+    GdkWindow *gw = gtk_widget_get_window(w);
+    if (!gw) return;
+    Window xid = gdk_x11_window_get_xid(gw);
+    if (b->eff->dispatcher(b->eff, EFF_EDIT_OPEN, 0, 0,
+                           (void *)(uintptr_t)xid, 0.0f)) {
+        /* some plug-ins return 0 on success; treat reaching here as opened */
+    }
+    b->editor_open = TRUE;
+    vst2_apply_rect(b);
+    if (!b->idle_id) b->idle_id = g_timeout_add(40, vst2_idle_cb, b);
+}
+
+static void vst2_close_editor(Vst2Backend *b)
+{
+    if (b->idle_id) { g_source_remove(b->idle_id); b->idle_id = 0; }
+    if (b->editor_open && b->eff)
+        b->eff->dispatcher(b->eff, EFF_EDIT_CLOSE, 0, 0, NULL, 0.0f);
+    b->editor_open = FALSE;
+}
+
+/* Drawing area going away: close the editor while its X parent still exists. */
+static void vst2_on_unrealize(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    vst2_close_editor((Vst2Backend *)data);
+}
+
+static GtkWidget *vst2_make_gui(PluginInstance *pi)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (!(b->eff->flags & VST_FLAGS_HAS_EDITOR))
+        return NULL;                 /* no editor -> host uses the generic panel */
+
+    b->gui = gtk_drawing_area_new();  /* has its own native X11 window */
+    gtk_widget_set_hexpand(b->gui, TRUE);
+    gtk_widget_set_vexpand(b->gui, TRUE);
+    vst2_apply_rect(b);               /* seed a size so the FX window fits */
+
+    b->realize_id   = g_signal_connect(b->gui, "realize",
+                                       G_CALLBACK(vst2_on_realize), b);
+    b->unrealize_id = g_signal_connect(b->gui, "unrealize",
+                                       G_CALLBACK(vst2_on_unrealize), b);
+    return b->gui;
+}
+
+static void vst2_destroy_gui(PluginInstance *pi)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (!b || !b->gui) return;
+    if (b->realize_id)   g_signal_handler_disconnect(b->gui, b->realize_id);
+    if (b->unrealize_id) g_signal_handler_disconnect(b->gui, b->unrealize_id);
+    b->realize_id = b->unrealize_id = 0;
+    vst2_close_editor(b);
+    b->gui = NULL;                    /* the host destroys the widget itself */
+}
+
 static const PhOps vst2_ops = {
-    vst2_process, vst2_process_midi, vst2_destroy, NULL, NULL,
+    vst2_process, vst2_process_midi, vst2_destroy,
+    vst2_make_gui, vst2_destroy_gui,
     vst2_param_count, vst2_param_name, vst2_param_get, vst2_param_set,
     vst2_param_range
 };
@@ -259,8 +378,14 @@ PluginInstance *ph_vst2_instantiate(const PluginInfo *info, double sr, int max_b
 
     Vst2Backend *b = g_new0(Vst2Backend, 1);
     b->dl = dl; b->eff = eff; b->max_block = max_block;
-    b->outL = g_new0(float, max_block);
-    b->outR = g_new0(float, max_block);
+    /* Size channel arrays to the plug-in's real port counts (clamped to >=1 so the
+     * pointer arrays handed to processReplacing are never NULL). */
+    b->n_in  = eff->numInputs  > 0 ? eff->numInputs  : 0;
+    b->n_out = eff->numOutputs > 0 ? eff->numOutputs : 0;
+    b->in_ptrs  = g_new0(float *, b->n_in  > 0 ? b->n_in  : 1);
+    b->out_ptrs = g_new0(float *, b->n_out > 0 ? b->n_out : 1);
+    b->out_bufs = g_new0(float *, b->n_out > 0 ? b->n_out : 1);
+    for (int i = 0; i < b->n_out; i++) b->out_bufs[i] = g_new0(float, max_block);
     b->silence = g_new0(float, max_block);
     b->is_synth = (eff->flags & VST_FLAGS_IS_SYNTH) ||
         eff->dispatcher(eff, EFF_GET_PLUG_CATEGORY, 0, 0, NULL, 0.0f)
