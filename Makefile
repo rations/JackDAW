@@ -160,6 +160,22 @@ HAS_QT6  := $(shell pkg-config --exists Qt6Widgets 2>/dev/null && echo 1)
 
 ifneq ($(HAS_LILV),)
 ifneq ($(HAS_SUIL),)
+# X11 helper: hosts X11UI editors out-of-process in a PURE-Xlib process (NO GTK,
+# NO pango). Many X11 UIs draw with cairo's toy-font API; in any GTK/pango host
+# that races libcairo's shared font cache -> use-after-free inside libcairo
+# (gxtuner). Isolating the plugin as the sole cairo consumer fixes it — exactly
+# how Reaper (which has no GTK/pango) stays immune. suil instantiates the X11UI
+# natively (container == ui type == X11UI), so no wrapper/GTK is ever loaded.
+HELPER_X11    := $(SRCDIR)/jackdaw-lv2ui-x11
+HELPERS       += $(HELPER_X11)
+H_X11_CFLAGS  := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) \
+    $(shell pkg-config --cflags glib-2.0 x11 lilv-0 suil-0) -std=gnu99
+H_X11_LIBS    := $(shell pkg-config --libs glib-2.0 x11 lilv-0 suil-0) -lm
+
+$(HELPER_X11): $(SRCDIR)/lv2ui_x11_helper.c $(SRCDIR)/lv2ui_ipc.h
+	$(CC) $(H_X11_CFLAGS) $< $(H_X11_LIBS) -o $@
+	@echo "Built: $@"
+
 ifneq ($(HAS_GTK2),)
 HELPER_GTK2   := $(SRCDIR)/jackdaw-lv2ui-gtk2
 HELPERS       += $(HELPER_GTK2)

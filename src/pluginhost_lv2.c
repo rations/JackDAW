@@ -618,8 +618,14 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
         suil_host = suil_host_new(lv2_ui_write, lv2_ui_port_index, NULL, NULL);
     if (!suil_host) return NULL;
 
-    /* Pick a UI suil can wrap into Gtk3 (native Gtk3UI, or X11UI via
-     * libsuil_x11_in_gtk3). */
+    /* Host ONLY native Gtk3UI editors in-process. These are GTK/pango based
+     * (e.g. guitarix) and share our libcairo/pango font caches safely. Toolkit-
+     * agnostic X11UI editors are deliberately NOT hosted here: many draw with
+     * cairo's "toy" font API (cairo_select_font_face/text_extents), which fights
+     * our pango usage over libcairo's single global font-face cache and triggers
+     * a use-after-free *inside libcairo* (confirmed by ASan on gxtuner). Those go
+     * out-of-process via the bridge (jackdaw-lv2ui-gtk3), where the plugin is the
+     * sole cairo consumer — the same isolation that makes them work in Reaper. */
     LilvUIs *uis = lilv_plugin_get_uis(b->plugin);
     if (!uis) return NULL;
     LilvNode *gtk3 = lilv_new_uri(world, LV2_GTK3_UI_URI);
@@ -627,9 +633,8 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
     const LilvNode *use_type = NULL;
     LILV_FOREACH(uis, it, uis) {
         const LilvUI *ui = lilv_uis_get(uis, it);
-        const LilvNode *type = NULL;
-        if (lilv_ui_is_supported(ui, suil_ui_supported, gtk3, &type)) {
-            use_ui = ui; use_type = type; break;
+        if (lilv_ui_is_a(ui, gtk3)) {   /* native Gtk3UI only */
+            use_ui = ui; use_type = gtk3; break;
         }
     }
     if (!use_ui) { lilv_node_free(gtk3); lilv_uis_free(uis); return NULL; }

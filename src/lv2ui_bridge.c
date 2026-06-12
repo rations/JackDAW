@@ -38,10 +38,17 @@ static char *find_helper(const char *name)
 
 static const char *helper_for_ui_type(const char *ui_type)
 {
-    if (ui_type && strstr(ui_type, "#GtkUI")) return "jackdaw-lv2ui-gtk2";
-    if (ui_type && strstr(ui_type, "#Qt5UI")) return "jackdaw-lv2ui-qt5";
-    if (ui_type && strstr(ui_type, "#Qt6UI")) return "jackdaw-lv2ui-qt6";
-    return NULL;   /* X11/Gtk3 are hosted in-process, not here */
+    if (!ui_type) return NULL;
+    if (strstr(ui_type, "#GtkUI")) return "jackdaw-lv2ui-gtk2";
+    if (strstr(ui_type, "#Qt5UI")) return "jackdaw-lv2ui-qt5";
+    if (strstr(ui_type, "#Qt6UI")) return "jackdaw-lv2ui-qt6";
+    /* X11UI is toolkit-agnostic; many draw with cairo's toy-font API which
+     * corrupts libcairo's shared font cache when run inside ANY GTK/pango process
+     * (gxtuner UAF — reproduced even in a GTK3 helper). Host it out-of-process in
+     * a PURE-Xlib helper (no GTK/pango at all), so the plugin is the only cairo
+     * consumer — Reaper's isolation model. */
+    if (strstr(ui_type, "#X11UI")) return "jackdaw-lv2ui-x11";
+    return NULL;   /* native Gtk3UI is hosted in-process, not here */
 }
 
 static void bridge_send(Bridge *b, const char *line)
@@ -95,6 +102,11 @@ static gboolean on_helper_out(GIOChannel *src, GIOCondition cond, gpointer data)
             b->embedded = TRUE;
             push_ports(b, FALSE);   /* seed control inputs once */
         }
+    } else if (!strncmp(line, "SIZE ", 5)) {
+        int w = 0, h = 0;
+        if (sscanf(line + 5, "%d %d", &w, &h) == 2 && w > 0 && h > 0 &&
+            GTK_IS_SOCKET(b->socket))
+            gtk_widget_set_size_request(b->socket, w, h);   /* plugin asked to resize */
     } else {
         guint32 idx; float val;
         if (lv2ui_ipc_parse_port(line, &idx, &val))
