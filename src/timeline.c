@@ -422,11 +422,27 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
         x1 = CLAMP(x1, 0.0, (gdouble)w);
 
         if (x1 > x0) {
-            /* Red background */
+            /* Red background (recording indicator, both audio + MIDI) */
             cairo_set_source_rgba(cr, 0.80, 0.08, 0.08, 0.25);
             cairo_rectangle(cr, x0, 0, x1 - x0, h);
             cairo_fill(cr);
 
+          if (jackdaw_track_is_instrument(rec_t)) {
+            /* Live MIDI notes captured so far — peeked non-destructively so the
+             * RT thread keeps writing and the finalizer still gets them on stop.
+             * Same pitch->y mapping as the finalized region preview. */
+            guint nn = 0;
+            const JackDawRecNote *rn = jackdaw_engine_rec_preview(rec_t, &nn);
+            cairo_set_source_rgb(cr, 1.0, 0.88, 0.88);  /* bright over the red */
+            for (guint i = 0; i < nn; i++) {
+                double nx0 = ((double)rn[i].start_frame - start) / spp;
+                double nx1 = ((double)rn[i].end_frame   - start) / spp;
+                if (nx1 < 0 || nx0 > w) continue;
+                double nw = nx1 - nx0; if (nw < 1) nw = 1;
+                double ny = h - ((rn[i].pitch / 127.0) * (h - 2)) - 1;
+                cairo_rectangle(cr, nx0, ny, nw, 2); cairo_fill(cr);
+            }
+          } else {
             /* Live waveform — read peak buffer written by the RT callback */
             gint    pk_count = rec_t->rec_peak_count; /* read once: RT may still write */
             gfloat *pk_buf   = rec_t->rec_peak_buf;
@@ -472,6 +488,7 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
                 }
                 cairo_stroke(cr);
             }
+          }
         }
     }
 
@@ -1086,6 +1103,13 @@ static gboolean timeline_update_timer(gpointer data)
                         jackdaw_project_get_track(tl->project, i));
                     if (tf > maxf) maxf = tf;
                 }
+            }
+            /* While rolling (play OR record), grow the range with the playhead so
+             * recording past the end of existing content can still auto-scroll —
+             * otherwise set_value below clamps to the content length. */
+            if (jackdaw_engine_is_playing()) {
+                off_t pp = jackdaw_engine_get_play_pos();
+                if (pp > maxf) maxf = pp;
             }
             gdouble start = gtk_adjustment_get_value(tl->time_adj);
             gdouble upper = (gdouble)maxf + page;

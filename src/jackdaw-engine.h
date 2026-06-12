@@ -88,6 +88,18 @@ off_t jackdaw_engine_get_play_pos(void);
 /* Post-master-fader peak levels (master VU). Resets the stored peak on read. */
 void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
 
+/* --- Live MIDI recording preview (main thread / draw only) ---
+ * One in-progress recorded note, in ABSOLUTE timeline frames. Note-ons are
+ * paired with note-offs; notes still held are extended to the current playhead. */
+typedef struct {
+    off_t  start_frame, end_frame;
+    guint8 pitch, velocity, channel;
+} JackDawRecNote;
+/* Non-destructively peek the MIDI captured so far for `t` (instrument track being
+ * recorded). Returns a borrowed pointer to a static array valid until the next
+ * call, with *count set; NULL/0 if nothing is being recorded. */
+const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count);
+
 /* --- Input port enumeration (main thread only) ---
  * Returns NULL-terminated array of available external JACK audio/MIDI output
  * port names (i.e. sources jackdaw can record from), excluding jackdaw's own

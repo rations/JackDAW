@@ -1766,6 +1766,51 @@ static gboolean midi_finalize_idle(gpointer data)
     return G_SOURCE_REMOVE;
 }
 
+#define ENG_REC_PREVIEW_MAX 16384
+const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
+{
+    static MidiRecEvent   ev[ENG_REC_PREVIEW_MAX];
+    static JackDawRecNote notes[ENG_REC_PREVIEW_MAX];
+    if (count) *count = 0;
+    if (!t || !t->midi_rec_buf) return NULL;
+
+    size_t avail = jack_ringbuffer_read_space(t->midi_rec_buf);
+    guint  ne    = (guint)(avail / sizeof(MidiRecEvent));
+    if (ne == 0) return NULL;
+    if (ne > ENG_REC_PREVIEW_MAX) ne = ENG_REC_PREVIEW_MAX;
+    size_t got = jack_ringbuffer_peek(t->midi_rec_buf, (char *)ev,
+                                      (size_t)ne * sizeof(MidiRecEvent));
+    ne = (guint)(got / sizeof(MidiRecEvent));
+
+    off_t now = (off_t)engine.play_pos;
+    gint  on_idx[16][128];
+    for (int ch = 0; ch < 16; ch++)
+        for (int p = 0; p < 128; p++) on_idx[ch][p] = -1;
+
+    guint nn = 0;
+    for (guint e = 0; e < ne; e++) {
+        int st = ev[e].data[0] & 0xF0, ch = ev[e].data[0] & 0x0F,
+            p  = ev[e].data[1] & 0x7F;
+        if (st == 0x90 && ev[e].data[2] > 0) {
+            if (nn >= ENG_REC_PREVIEW_MAX) break;
+            notes[nn].start_frame = (off_t)ev[e].frame;
+            notes[nn].end_frame   = now;            /* held -> extend to playhead */
+            notes[nn].pitch       = (guint8)p;
+            notes[nn].velocity    = ev[e].data[2];
+            notes[nn].channel     = (guint8)ch;
+            on_idx[ch][p] = (gint)nn;
+            nn++;
+        } else if (st == 0x80 || (st == 0x90 && ev[e].data[2] == 0)) {
+            if (on_idx[ch][p] >= 0) {
+                notes[on_idx[ch][p]].end_frame = (off_t)ev[e].frame;
+                on_idx[ch][p] = -1;
+            }
+        }
+    }
+    if (count) *count = nn;
+    return nn ? notes : NULL;
+}
+
 void jackdaw_engine_stop_recording(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_RECORDING);
