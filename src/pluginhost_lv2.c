@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <config.h>
 #include <string.h>
+#include <math.h>
 
 #ifdef HAVE_LV2
 
@@ -538,7 +539,13 @@ static gboolean lv2_ui_push_cb(gpointer data)
     if (!b->ui) return G_SOURCE_REMOVE;
     for (guint i = 0; i < b->n_ctl_out; i++) {
         guint idx = b->ctl_out[i];
-        suil_instance_port_event(b->ui, idx, sizeof(float), 0, &b->ctl[idx]);
+        float v = b->ctl[idx];
+        /* Never hand a non-finite meter value to the UI: a NaN/Inf from the DSP
+         * (e.g. a tuner's detected frequency) can drive the plugin's own drawing
+         * code out of bounds and crash it (gxtuner aborts in cairo). RT-side
+         * denormal flushing should prevent these, but guard the UI regardless. */
+        if (!isfinite(v)) continue;
+        suil_instance_port_event(b->ui, idx, sizeof(float), 0, &v);
     }
     return G_SOURCE_CONTINUE;
 }

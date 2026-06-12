@@ -267,17 +267,34 @@ static gboolean fxwin_fit_cb(gpointer data)
     FxWindow *fw = data;
     if (!fw->window || !fw->shown) { fw->fit_id = 0; return G_SOURCE_REMOVE; }
 
-    GtkWidget *content = gtk_bin_get_child(GTK_BIN(fw->window));   /* the paned */
-    GtkRequisition nat;
-    gtk_widget_get_preferred_size(content, NULL, &nat);
+    /* Wait for the editor to report a real, steady natural size before touching
+     * the window. A suil X11 editor reports ~1x1 until its embedded window comes
+     * up; resizing to that would collapse the window (blank). We impose NO fixed
+     * size floor — that forced short UIs (e.g. gxtuner's tuner) to a wrong height
+     * and crashed their drawing. While the editor is still 1x1 we just leave the
+     * window where it is, so FILL gives the UI room to negotiate; once it reports
+     * a real size we resize ONCE and pin it to CENTER (so a later switch can't
+     * stretch a fixed UI, and window resizes never churn it). */
+    GtkRequisition cn;
+    gtk_widget_get_preferred_size(fw->shown, NULL, &cn);
+    gboolean real   = (cn.width >= 32 && cn.height >= 32);
+    gboolean steady = (cn.width == fw->fit_w && cn.height == fw->fit_h);
+    fw->fit_w = cn.width; fw->fit_h = cn.height;
 
-    if (nat.width > 0 && nat.height > 0) {
-        gtk_window_resize(GTK_WINDOW(fw->window), nat.width, nat.height);
-        if (nat.width == fw->fit_w && nat.height == fw->fit_h) fw->fit_stable++;
-        else { fw->fit_stable = 0; fw->fit_w = nat.width; fw->fit_h = nat.height; }
+    if ((!real || !steady) && --fw->fit_ticks > 0)
+        return G_SOURCE_CONTINUE;   /* not negotiated/steady yet — keep waiting */
+
+    if (real) {
+        GtkWidget *content = gtk_bin_get_child(GTK_BIN(fw->window));  /* the paned */
+        GtkRequisition nat;
+        gtk_widget_get_preferred_size(content, NULL, &nat);
+        if (nat.width > 0 && nat.height > 0)
+            gtk_window_resize(GTK_WINDOW(fw->window), nat.width, nat.height);
+        gtk_widget_set_halign(fw->shown, GTK_ALIGN_CENTER);
+        gtk_widget_set_valign(fw->shown, GTK_ALIGN_CENTER);
     }
-    if (fw->fit_stable >= 2 || --fw->fit_ticks <= 0) { fw->fit_id = 0; return G_SOURCE_REMOVE; }
-    return G_SOURCE_CONTINUE;
+    fw->fit_id = 0;
+    return G_SOURCE_REMOVE;
 }
 
 static void fxwin_fit_later(FxWindow *fw)
@@ -312,22 +329,25 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
     if (gtk_widget_get_parent(gui) != fw->gui_holder) {
         if (gtk_widget_get_parent(gui))
             gtk_container_remove(GTK_CONTAINER(gtk_widget_get_parent(gui)), gui);
-        /* Expand so the editor claims the stack cell (and the fit logic has room
-         * to work), but CENTER at its natural size rather than FILL: suil's
-         * x11_in_gtk3 wrapper XResizeWindow()s the embedded plugin window to
-         * whatever allocation it gets (clamped only by max-size hints, which
-         * fixed-size pedals don't set). FILL therefore stretches such UIs into
-         * jumbled/oversized graphics whenever the window is momentarily larger
-         * than the plugin (e.g. just after switching from a bigger plugin). The
-         * wrapper reports a correct natural size, so CENTER renders it true. */
+        /* Start FILL + expand, exactly like jalv (jalv_gtk.c embeds the suil
+         * widget GTK_ALIGN_FILL/expand): many X11/Gtk3 UIs report a 1x1 natural
+         * size until their embedded window is given a real allocation to
+         * negotiate against — without FILL the (non-homogeneous) stack would lock
+         * them at 1x1 and they never display. Once the UI has negotiated a real,
+         * steady size, fxwin_fit_cb flips it to CENTER so that switching back to
+         * it (while the window is briefly sized for a larger plugin) no longer
+         * stretches a fixed-size UI — suil's wrapper XResizeWindow()s the plugin
+         * to whatever allocation it gets, and fixed pedals set no max-size hint to
+         * clamp it, which is what produced the jumbled/oversized graphics. */
         gtk_widget_set_hexpand(gui, TRUE);
         gtk_widget_set_vexpand(gui, TRUE);
-        gtk_widget_set_halign(gui, GTK_ALIGN_CENTER);
-        gtk_widget_set_valign(gui, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(gui, GTK_ALIGN_FILL);
+        gtk_widget_set_valign(gui, GTK_ALIGN_FILL);
         gtk_container_add(GTK_CONTAINER(fw->gui_holder), gui);
     }
     gtk_widget_show_all(gui);
     gtk_stack_set_visible_child(GTK_STACK(fw->gui_holder), gui);
+    gtk_widget_queue_resize(fw->gui_holder);   /* re-allocate the newly shown child */
     fw->shown = gui;
     fxwin_fit_later(fw);
 }

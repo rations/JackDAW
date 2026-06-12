@@ -441,7 +441,8 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
     b->processor  = FUnknownPtr<IAudioProcessor>(b->component);
     if (!b->processor) { delete b; return NULL; }
 
-    /* Stereo in/out arrangement. */
+    /* Stereo in/out arrangement (best effort; if the plug-in rejects it, it keeps
+     * its own default and our buffers follow its actual bus channel counts). */
     SpeakerArrangement in = SpeakerArr::kStereo, out = SpeakerArr::kStereo;
     b->processor->setBusArrangements(&in, 1, &out, 1);
 
@@ -452,16 +453,31 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
     setup.sampleRate         = sr;
     b->processor->setupProcessing(setup);
 
-    b->component->setActive(true);
-    b->processor->setProcessing(true);
+    /* VST3 buses are INACTIVE by default — "The plug-in should only process an
+     * activated bus" — so without this most plug-ins emit silence. Activate every
+     * audio bus the plug-in flags kDefaultActive (its main I/O).
+     * (SDK ref: pluginterfaces/vst/ivstcomponent.h, BusInfo::kDefaultActive.) */
+    for (int d = 0; d < 2; d++) {
+        BusDirection bd = (d == 0) ? kInput : kOutput;
+        int32 nb = b->component->getBusCount(kAudio, bd);
+        for (int32 i = 0; i < nb; i++) {
+            BusInfo bi;
+            if (b->component->getBusInfo(kAudio, bd, i, bi) == kResultOk &&
+                (bi.flags & BusInfo::kDefaultActive))
+                b->component->activateBus(kAudio, bd, i, true);
+        }
+    }
 
-    /* Buffer management handled by HostProcessData. */
+    /* Buffer management handled by HostProcessData (prepare before activation). */
     b->data.prepare(*b->component, max_block, kSample32);
     memset(&b->ctx, 0, sizeof(b->ctx));
     b->ctx.sampleRate = sr;
     b->data.processContext = &b->ctx;
     b->data.processMode = kRealtime;
     b->data.symbolicSampleSize = kSample32;
+
+    b->component->setActive(true);
+    b->processor->setProcessing(true);
 
     if (b->controller) {
         /* Route editor knob edits to the DSP (needed for native-editor controls). */
