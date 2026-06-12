@@ -73,6 +73,13 @@ gfloat jackdaw_project_get_master_volume(JackDawProject *p);
 void         jackdaw_project_set_file(JackDawProject *p, const gchar *path);
 const gchar *jackdaw_project_get_file(JackDawProject *p);
 
+/* Save/load the whole session (tracks: audio regions, MIDI regions+notes, FX
+ * chain incl. the instrument; tempo/grid/master). Boolean convention: TRUE =
+ * failure, FALSE = success (matches the codebase). load() first clears all
+ * existing tracks and re-registers the loaded ones with the engine. */
+gboolean     jackdaw_project_save(JackDawProject *p, const gchar *path);
+gboolean     jackdaw_project_load(JackDawProject *p, const gchar *path);
+
 /* Signal to refresh port selectors after port count change */
 void jackdaw_project_emit_ports_changed(JackDawProject *p);
 

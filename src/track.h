@@ -5,8 +5,16 @@
 #include <jack/ringbuffer.h>
 #include "audio_clip.h"
 #include "clipregion.h"
+#include "midiclip.h"
 
 G_BEGIN_DECLS
+
+/* Track kind: an audio track streams AudioClip regions; an instrument track
+ * sequences MidiRegions into its first FX-chain plugin (the instrument). */
+typedef enum {
+    JACKDAW_TRACK_AUDIO = 0,
+    JACKDAW_TRACK_INSTRUMENT
+} JackDawTrackKind;
 
 #define JACKDAW_TYPE_TRACK (jackdaw_track_get_type())
 #define JACKDAW_TRACK(obj) \
@@ -33,6 +41,14 @@ struct _JackDawTrack {
 
     gchar     *name;
     guint      slot;          /* index in engine track slot array */
+    JackDawTrackKind kind;    /* audio (default) or instrument */
+
+    /* MIDI sequence regions (instrument tracks; main-thread list). The RT
+     * callback reads the immutable rt_midi snapshot, published lock-free like
+     * rt_chain (atomic pointer + deferred retire). */
+    GPtrArray         *midi_regions;  /* GPtrArray of MidiRegion* */
+    gpointer           rt_midi;       /* MidiEventSnapshot* (atomic) */
+    GPtrArray         *retire_midi;   /* MidiEventSnapshot* awaiting free */
 
     /* Timeline clip regions (main-thread list, ordered by tl_pos).
      * The feeder thread never touches this directly — it reads the immutable
@@ -134,6 +150,20 @@ void         jackdaw_track_place_clip(JackDawTrack *t, AudioClip *clip, off_t tl
 
 /* Borrowed region list — edit in place, then call jackdaw_track_commit_regions(). */
 GPtrArray   *jackdaw_track_get_regions(JackDawTrack *t);
+
+/* ---- Track kind / MIDI (main thread) ---- */
+JackDawTrackKind jackdaw_track_get_kind(JackDawTrack *t);
+void             jackdaw_track_set_kind(JackDawTrack *t, JackDawTrackKind kind);
+gboolean         jackdaw_track_is_instrument(JackDawTrack *t);
+
+/* Borrowed MIDI region list — edit in place (regions/notes), then call
+ * jackdaw_track_commit_midi() to republish the RT event snapshot. */
+GPtrArray   *jackdaw_track_get_midi_regions(JackDawTrack *t);
+
+/* Rebuild + publish the immutable RT MIDI event snapshot from midi_regions.
+ * frames_per_beat = sample_rate * 60 / bpm (caller computes via the project).
+ * Emits state-changed so timeline previews redraw. */
+void         jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat);
 
 /* Rebuild the immutable feeder snapshot from the current region list and emit
  * state-changed so wave views redraw.  Call after any region-list edit. */

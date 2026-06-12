@@ -58,7 +58,40 @@ PluginInfo *ph_info_new(PluginFormat fmt, const char *key,
     pi->name     = g_strdup(name ? name : "(unnamed)");
     pi->category = g_strdup((category && *category) ? category
                                                     : ph_fmt_names[fmt]);
+    pi->is_instrument = ph_category_is_instrument(pi->category);
     return pi;
+}
+
+/* The scan backends encode "instrument-ness" in the category string: LV2 sets
+ * the lilv class label ("Instrument"), VST3 the subcategory ("Instrument|Synth"),
+ * VST2 sets "Instrument" when effGetPlugCategory==kPlugCategSynth. */
+gboolean ph_category_is_instrument(const char *category)
+{
+    if (!category) return FALSE;
+    return strstr(category, "Instrument") != NULL ||
+           strstr(category, "Synth")      != NULL;
+}
+
+/* ---- Transport (published by the engine each RT block; read by backends) ---- */
+static double  ph_xport_bpm     = 120.0;
+static double  ph_xport_sr      = 48000.0;
+static gint64  ph_xport_frame   = 0;
+static gboolean ph_xport_playing = FALSE;
+
+void pluginhost_set_transport(double bpm, double sr, gint64 frame, gboolean playing)
+{
+    ph_xport_bpm     = bpm > 0.0 ? bpm : 120.0;
+    ph_xport_sr      = sr  > 0.0 ? sr  : ph_sr;
+    ph_xport_frame   = frame;
+    ph_xport_playing = playing;
+}
+
+void ph_get_transport(double *bpm, double *sr, gint64 *frame, gboolean *playing)
+{
+    if (bpm)     *bpm     = ph_xport_bpm;
+    if (sr)      *sr      = ph_xport_sr;
+    if (frame)   *frame   = ph_xport_frame;
+    if (playing) *playing = ph_xport_playing;
 }
 
 static void ph_info_free(gpointer p)
@@ -449,23 +482,64 @@ void pluginhost_save_paths_to_settings(void)
 PluginInstance *pluginhost_instantiate(const PluginInfo *info)
 {
     if (!info) return NULL;
+    PluginInstance *inst = NULL;
     switch (info->format) {
 #ifdef HAVE_LV2
-    case PH_LV2:  return ph_lv2_instantiate (info, ph_sr, ph_maxblock);
+    case PH_LV2:  inst = ph_lv2_instantiate (info, ph_sr, ph_maxblock); break;
 #endif
 #ifdef HAVE_VST2
-    case PH_VST2: return ph_vst2_instantiate(info, ph_sr, ph_maxblock);
+    case PH_VST2: inst = ph_vst2_instantiate(info, ph_sr, ph_maxblock); break;
 #endif
 #ifdef HAVE_VST3
-    case PH_VST3: return ph_vst3_instantiate(info, ph_sr, ph_maxblock);
+    case PH_VST3: inst = ph_vst3_instantiate(info, ph_sr, ph_maxblock); break;
 #endif
 #ifdef HAVE_CLAP
-    case PH_CLAP: return ph_clap_instantiate(info, ph_sr, ph_maxblock);
+    case PH_CLAP: inst = ph_clap_instantiate(info, ph_sr, ph_maxblock); break;
 #endif
 #ifdef HAVE_LADSPA
-    case PH_LADSPA: return ph_ladspa_instantiate(info, ph_sr, ph_maxblock);
+    case PH_LADSPA: inst = ph_ladspa_instantiate(info, ph_sr, ph_maxblock); break;
 #endif
     default: return NULL;
+    }
+    if (inst) {
+        inst->is_instrument = info->is_instrument;
+        inst->key      = g_strdup(info->key);
+        inst->category = g_strdup(info->category);
+    }
+    return inst;
+}
+
+gboolean pluginhost_is_instrument(PluginInstance *inst)
+{
+    return inst ? inst->is_instrument : FALSE;
+}
+
+PluginFormat pluginhost_format(PluginInstance *inst)
+{ return inst ? inst->format : PH_LV2; }
+
+const char *pluginhost_key(PluginInstance *inst)
+{ return inst ? inst->key : NULL; }
+
+const char *pluginhost_category(PluginInstance *inst)
+{ return inst ? inst->category : NULL; }
+
+void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev,
+                             int n_ev, float *L, float *R, int nframes)
+{
+    if (!inst || !inst->ops) return;
+    if (!g_atomic_int_get(&inst->active)) return;   /* bypassed: leave L/R as-is */
+
+    if (inst->ops->process_midi)
+        inst->ops->process_midi(inst, ev, n_ev, L, R, nframes);
+    else if (inst->ops->process)
+        inst->ops->process(inst, L, R, nframes);    /* no MIDI path: audio only */
+
+    /* Same speaker-safety net as pluginhost_process. */
+    for (int i = 0; i < nframes; i++) {
+        float a = L[i], b = R[i];
+        if (!isfinite(a)) a = 0.0f; else if (a >  4.0f) a =  4.0f; else if (a < -4.0f) a = -4.0f;
+        if (!isfinite(b)) b = 0.0f; else if (b >  4.0f) b =  4.0f; else if (b < -4.0f) b = -4.0f;
+        L[i] = a; R[i] = b;
     }
 }
 
@@ -486,6 +560,8 @@ void pluginhost_free(PluginInstance *inst)
     g_free(inst->dry_L);
     g_free(inst->dry_R);
     g_free(inst->name);
+    g_free(inst->key);
+    g_free(inst->category);
     g_free(inst);
 }
 

@@ -30,6 +30,15 @@ static void jackdaw_track_finalize(GObject *obj)
     if (t->rt_snapshot) clip_region_snapshot_unref(t->rt_snapshot);
     g_mutex_clear(&t->region_lock);
 
+    /* MIDI: drop the live snapshot + any retired ones, then the region list. */
+    if (t->rt_midi) midi_event_snapshot_free((MidiEventSnapshot *)t->rt_midi);
+    if (t->retire_midi) {
+        for (guint i = 0; i < t->retire_midi->len; i++)
+            midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
+        g_ptr_array_free(t->retire_midi, TRUE);
+    }
+    if (t->midi_regions) g_ptr_array_free(t->midi_regions, TRUE);
+
     /* Tear down FX: drop the live chain, then free every instance/chain. */
     JackDawFxChain *live = t->rt_chain;
     t->rt_chain = NULL;
@@ -81,6 +90,10 @@ static void jackdaw_track_init(JackDawTrack *t)
 {
     t->name          = NULL;
     t->slot          = G_MAXUINT;
+    t->kind          = JACKDAW_TRACK_AUDIO;
+    t->midi_regions  = midi_region_list_new();
+    t->rt_midi       = NULL;
+    t->retire_midi   = g_ptr_array_new();
     t->regions       = clip_region_list_new();
     g_mutex_init(&t->region_lock);
     t->rt_snapshot   = clip_region_snapshot_new(t->regions);
@@ -195,6 +208,53 @@ GPtrArray *jackdaw_track_get_regions(JackDawTrack *t)
 {
     g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
     return t->regions;
+}
+
+/* ---- Track kind / MIDI ---- */
+
+JackDawTrackKind jackdaw_track_get_kind(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), JACKDAW_TRACK_AUDIO);
+    return t->kind;
+}
+
+void jackdaw_track_set_kind(JackDawTrack *t, JackDawTrackKind kind)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    t->kind = kind;
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
+}
+
+gboolean jackdaw_track_is_instrument(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), FALSE);
+    return t->kind == JACKDAW_TRACK_INSTRUMENT;
+}
+
+GPtrArray *jackdaw_track_get_midi_regions(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
+    return t->midi_regions;
+}
+
+/* Publish a fresh MIDI event snapshot for the RT thread. Mirrors
+ * track_publish_chain: reclaim the PREVIOUS edit's retired snapshot (the RT
+ * thread has moved past it), build the new one, atomic-swap, retire the old. */
+void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+
+    for (guint i = 0; i < t->retire_midi->len; i++)
+        midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
+    g_ptr_array_set_size(t->retire_midi, 0);
+
+    MidiEventSnapshot *ns = midi_event_snapshot_new(t->midi_regions,
+                                                    frames_per_beat);
+    MidiEventSnapshot *old = t->rt_midi;
+    g_atomic_pointer_set(&t->rt_midi, ns);
+    if (old) g_ptr_array_add(t->retire_midi, old);
+
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
 }
 
 void jackdaw_track_commit_regions(JackDawTrack *t)

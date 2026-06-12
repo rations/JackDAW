@@ -237,7 +237,7 @@ static void clap_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 }
 
 static const PhOps clap_ops = {
-    clap_process_cb, clap_destroy, NULL, NULL,
+    clap_process_cb, NULL /*process_midi*/, clap_destroy, NULL, NULL,
     clap_param_count, clap_param_name, clap_param_get, clap_param_set,
     clap_param_range
 };

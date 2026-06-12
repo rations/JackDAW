@@ -8,6 +8,9 @@ G_BEGIN_DECLS
 /* Backend vtable. Every backend fills one of these on a PluginInstance. */
 typedef struct {
     void        (*process)    (PluginInstance *, float *L, float *R, int n);
+    /* Optional: deliver MIDI then render (instruments). NULL for effects. */
+    void        (*process_midi)(PluginInstance *, const PhMidiEvent *, int n_ev,
+                                float *L, float *R, int n);
     void        (*destroy)    (PluginInstance *);
     GtkWidget  *(*make_gui)   (PluginInstance *);   /* NULL = use generic panel */
     void        (*destroy_gui)(PluginInstance *);   /* tear down native editor */
@@ -21,6 +24,9 @@ typedef struct {
 struct PluginInstance {
     PluginFormat  format;
     char         *name;
+    char         *key;          /* PluginInfo.key — for project save/reload */
+    char         *category;     /* PluginInfo.category — for project save/reload */
+    gboolean      is_instrument; /* set from PluginInfo at instantiate */
     volatile gint active;       /* 1 = processing, 0 = bypassed */
     volatile gint mix_q15;      /* wet/dry: 0=fully dry .. 32768=fully wet */
     double        sample_rate;
@@ -91,6 +97,12 @@ PluginInfo *ph_info_new(PluginFormat fmt, const char *key,
 
 /* Path validation before dlopen: absolute, no "..", no NUL. (CLAUDE.md) */
 gboolean ph_path_is_safe(const char *path);
+
+/* TRUE if a scan category string denotes an instrument/synth. */
+gboolean ph_category_is_instrument(const char *category);
+
+/* Read the transport published by pluginhost_set_transport (backend use, RT). */
+void ph_get_transport(double *bpm, double *sr, gint64 *frame, gboolean *playing);
 
 /* Build a generic parameter panel GtkWidget from the instance's param API. */
 GtkWidget *ph_generic_param_panel(PluginInstance *inst);

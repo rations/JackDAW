@@ -191,7 +191,7 @@ static void lad_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
   if (i < b->n_params) { if (mn) *mn = b->params[i].min; if (mx) *mx = b->params[i].max; } }
 
 static const PhOps lad_ops = {
-    lad_process, lad_destroy, NULL, NULL,
+    lad_process, NULL /*process_midi*/, lad_destroy, NULL, NULL,
     lad_param_count, lad_param_name, lad_param_get, lad_param_set, lad_param_range
 };
 

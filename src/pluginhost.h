@@ -26,9 +26,18 @@ typedef struct {
     char        *key;        /* LV2 URI; abs file path ("path" or "path\nN") else */
     char        *name;
     char        *category;   /* declared class/category, else format name */
+    gboolean     is_instrument; /* synth/instrument (takes MIDI, makes audio) */
 } PluginInfo;
 
 typedef struct PluginInstance PluginInstance;
+
+/* One MIDI event for delivery to an instrument plugin. `time` is the sample
+ * offset within the current process block; size is 1..3 bytes. */
+typedef struct {
+    guint32 time;
+    guint8  size;
+    guint8  data[3];
+} PhMidiEvent;
 
 /* Call once at startup with the engine sample rate / max JACK block. */
 void          pluginhost_init(double sample_rate, int max_block);
@@ -69,6 +78,26 @@ void            pluginhost_free(PluginInstance *inst);
 /* RT processing — in-place stereo. Does nothing when bypassed. */
 void            pluginhost_process(PluginInstance *inst,
                                    float *L, float *R, int nframes);
+
+/* RT processing for an INSTRUMENT: deliver this block's MIDI events then render
+ * audio into L/R (which the caller has pre-filled, typically with silence).
+ * Falls back to plain audio process if the backend has no MIDI path. */
+void            pluginhost_process_midi(PluginInstance *inst,
+                                        const PhMidiEvent *ev, int n_ev,
+                                        float *L, float *R, int nframes);
+
+/* TRUE if this plugin is an instrument (synth) rather than an audio effect. */
+gboolean        pluginhost_is_instrument(PluginInstance *inst);
+
+/* Identity for project save/reload (recreate via a PluginInfo + instantiate). */
+PluginFormat    pluginhost_format(PluginInstance *inst);
+const char     *pluginhost_key(PluginInstance *inst);
+const char     *pluginhost_category(PluginInstance *inst);
+
+/* Publish transport state for plugins that query host time (e.g. VST2
+ * audioMasterGetTime). Called from the RT thread at the top of each block. */
+void            pluginhost_set_transport(double bpm, double sr,
+                                         gint64 frame, gboolean playing);
 
 /* Bypass (atomic; read in the RT thread). */
 void            pluginhost_set_active(PluginInstance *inst, gboolean on);

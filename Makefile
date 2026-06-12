@@ -91,6 +91,7 @@ SRCS_C := \
     $(SRCDIR)/um.c \
     $(SRCDIR)/audio_clip.c \
     $(SRCDIR)/clipregion.c \
+    $(SRCDIR)/midiclip.c \
     $(SRCDIR)/track.c \
     $(SRCDIR)/project.c \
     $(SRCDIR)/jackdaw-engine.c \
@@ -104,6 +105,7 @@ SRCS_C := \
     $(SRCDIR)/timeline.c \
     $(SRCDIR)/mixer.c \
     $(SRCDIR)/fxwindow.c \
+    $(SRCDIR)/midiwindow.c \
     $(SRCDIR)/mainwindow.c
 
 SRCS_CXX := \

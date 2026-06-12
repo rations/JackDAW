@@ -85,6 +85,54 @@ static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
     gtk_widget_destroy(dlg);
 }
 
+static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Save Project", GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    const gchar *cur = jackdaw_project_get_file(win->project);
+    if (cur) gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dlg), cur);
+    else     gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "untitled.jdaw");
+
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (path) {
+            if (jackdaw_project_save(win->project, path))   /* TRUE = failure */
+                user_error("Could not save project.");
+            g_free(path);
+        }
+    }
+    gtk_widget_destroy(dlg);
+}
+
+static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Open Project", GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+    GtkFileFilter *ff = gtk_file_filter_new();
+    gtk_file_filter_set_name(ff, "JackDAW projects (*.jdaw)");
+    gtk_file_filter_add_pattern(ff, "*.jdaw");
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), ff);
+
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        if (path) {
+            if (jackdaw_project_load(win->project, path))   /* TRUE = failure */
+                user_error("Could not open project.");
+            else
+                win->track_counter = jackdaw_project_track_count(win->project);
+            g_free(path);
+        }
+    }
+    gtk_widget_destroy(dlg);
+}
+
 static void mw_quit_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item; (void)data;
@@ -102,6 +150,26 @@ static void mw_add_track_cb(GtkMenuItem *item, gpointer data)
     gchar *name = g_strdup_printf("Track %u", win->track_counter);
     JackDawTrack *t = jackdaw_track_new(name, NULL);
     g_free(name);
+
+    if (jackdaw_engine_add_track(t)) {
+        user_error("Engine: could not add track (slot limit reached)");
+        g_object_unref(t);
+        return;
+    }
+    jackdaw_project_add_track(win->project, t);
+    g_object_unref(t);
+}
+
+static void mw_add_instrument_track_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+
+    win->track_counter++;
+    gchar *name = g_strdup_printf("Instrument %u", win->track_counter);
+    JackDawTrack *t = jackdaw_track_new(name, NULL);
+    g_free(name);
+    jackdaw_track_set_kind(t, JACKDAW_TRACK_INSTRUMENT);
 
     if (jackdaw_engine_add_track(t)) {
         user_error("Engine: could not add track (slot limit reached)");
@@ -462,6 +530,13 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "_Load File as New Track…",
               G_CALLBACK(mw_load_file_cb), win, 0, 0, ag);
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);
+    menu_item(m, "_Open Project…",
+              G_CALLBACK(mw_open_project_cb), win,
+              GDK_KEY_o, GDK_CONTROL_MASK, ag);
+    menu_item(m, "_Save Project…",
+              G_CALLBACK(mw_save_project_cb), win,
+              GDK_KEY_s, GDK_CONTROL_MASK, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "_New Session",
               G_CALLBACK(mw_new_project_cb), win,
               GDK_KEY_n, GDK_CONTROL_MASK, ag);
@@ -474,6 +549,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     m = make_submenu_item(menubar, "_Track");
     menu_item(m, "_Add Empty Track",
               G_CALLBACK(mw_add_track_cb), win, 0, 0, ag);
+    menu_item(m, "Add _Instrument Track",
+              G_CALLBACK(mw_add_instrument_track_cb), win, 0, 0, ag);
     menu_item(m, "_Remove Focused Track",
               G_CALLBACK(mw_remove_track_cb), win, 0, 0, ag);
 

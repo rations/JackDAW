@@ -11,6 +11,8 @@
 #include <lv2/buf-size/buf-size.h>
 #include <lv2/parameters/parameters.h>
 #include <lv2/atom/atom.h>
+#include <lv2/atom/forge.h>
+#include <lv2/midi/midi.h>
 #include <lv2/worker/worker.h>
 #include <lv2/log/log.h>
 #include <lv2/instance-access/instance-access.h>
@@ -309,7 +311,12 @@ typedef struct {
         void    *buf[2];         /* sizeof(LV2_Atom_Sequence)+capacity, per inst */
     }      *atoms;
     guint   n_atoms;
-    LV2_URID urid_seq, urid_chunk;
+    LV2_URID urid_seq, urid_chunk, urid_midi;
+
+    /* MIDI delivery (instruments): forge events into the first atom INPUT port
+     * before run(). midi_in_atom = index into atoms[] (-1 if none). */
+    int               midi_in_atom;
+    LV2_Atom_Forge    forge;
 
     Lv2Param *params;
     guint     n_params;
@@ -419,6 +426,52 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         if (b->n_audio_out > 1) memcpy(R, b->outB, (size_t)n * sizeof(float));
         else                    memcpy(R, b->outA, (size_t)n * sizeof(float));
     }
+}
+
+/* Forge this block's MIDI into the instrument's MIDI input atom port, replacing
+ * the empty-sequence reset that lv2_reset_atoms wrote for that port. Mirrors
+ * jalv's process.c forge of MIDI into the input event buffer. */
+static void lv2_forge_midi(Lv2Backend *b, const PhMidiEvent *ev, int n_ev)
+{
+    if (b->midi_in_atom < 0) return;
+    struct Lv2AtomPort *ap = &b->atoms[b->midi_in_atom];
+    lv2_atom_forge_set_buffer(&b->forge, (uint8_t *)ap->buf[0],
+                              sizeof(LV2_Atom_Sequence) + ap->capacity);
+    LV2_Atom_Forge_Frame frame;
+    lv2_atom_forge_sequence_head(&b->forge, &frame, 0);
+    for (int i = 0; i < n_ev; i++) {
+        lv2_atom_forge_frame_time(&b->forge, ev[i].time);
+        lv2_atom_forge_atom(&b->forge, ev[i].size, b->urid_midi);
+        lv2_atom_forge_write(&b->forge, ev[i].data, ev[i].size);
+    }
+    lv2_atom_forge_pop(&b->forge, &frame);
+}
+
+/* Instrument render: forge MIDI, feed silent audio inputs, run, copy outputs.
+ * (Synths usually have 0 audio inputs, which lv2_process would skip.) */
+static void lv2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                             int n_ev, float *L, float *R, int n)
+{
+    Lv2Backend *b = pi->backend;
+    if (n > b->max_block) n = b->max_block;
+
+    lv2_reset_atoms(b, 0);
+    lv2_forge_midi(b, ev, n_ev);
+
+    for (int i = 0; i < b->n_audio_in; i++)
+        lilv_instance_connect_port(b->inst[0], b->ain[i], b->dummy_in); /* silence */
+    if (b->n_audio_out > 0) lilv_instance_connect_port(b->inst[0], b->aout[0], b->outA);
+    if (b->n_audio_out > 1) lilv_instance_connect_port(b->inst[0], b->aout[1], b->outB);
+    for (int i = 2; i < b->n_audio_out; i++)
+        lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
+
+    lilv_instance_run(b->inst[0], n);
+    worker_apply_responses(&b->workers[0]);
+
+    if (b->n_audio_out > 0) memcpy(L, b->outA, (size_t)n * sizeof(float));
+    else                    memset(L, 0, (size_t)n * sizeof(float));
+    if (b->n_audio_out > 1) memcpy(R, b->outB, (size_t)n * sizeof(float));
+    else                    memcpy(R, L, (size_t)n * sizeof(float));
 }
 
 static void lv2_destroy_gui(PluginInstance *pi);   /* fwd (suil section below) */
@@ -705,6 +758,7 @@ static void lv2_destroy_gui(PluginInstance *pi) { (void)pi; }
 
 static const PhOps lv2_ops = {
     .process     = lv2_process,
+    .process_midi = lv2_process_midi,
     .destroy     = lv2_destroy,
     .make_gui    = lv2_make_gui,
     .destroy_gui = lv2_destroy_gui,
@@ -818,6 +872,12 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
     b->atoms      = (struct Lv2AtomPort *)g_array_free(atomg, FALSE);
     b->urid_seq   = urid_map_cb(NULL, LV2_ATOM__Sequence);
     b->urid_chunk = urid_map_cb(NULL, LV2_ATOM__Chunk);
+    b->urid_midi  = urid_map_cb(NULL, LV2_MIDI__MidiEvent);
+    lv2_atom_forge_init(&b->forge, &urid_map);
+    /* The instrument's MIDI sink = the first atom INPUT port. */
+    b->midi_in_atom = -1;
+    for (guint a = 0; a < b->n_atoms; a++)
+        if (b->atoms[a].is_input) { b->midi_in_atom = (int)a; break; }
 
     b->dual_mono = (b->n_audio_in == 1 && b->n_audio_out == 1);
     b->n_inst    = b->dual_mono ? 2 : 1;

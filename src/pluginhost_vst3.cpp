@@ -10,6 +10,8 @@
 #include "public.sdk/source/vst/hosting/hostclasses.h"
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
+#include "public.sdk/source/vst/hosting/eventlist.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -137,6 +139,7 @@ struct Vst3Backend {
     HostProcessData                data;
     ProcessContext                 ctx;
     ParameterChanges               in_params;
+    EventList                      in_events{256};   /* MIDI for instruments */
     int                            max_block = 0;
     std::vector<ParamID>           param_ids;
     HostComponentHandler           handler;            /* set on the controller */
@@ -228,6 +231,69 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
     b->data.inputParameterChanges = &b->in_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
+
+    if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
+        memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * n);
+        int oc = b->data.outputs[0].numChannels;
+        memcpy(R, b->data.outputs[0].channelBuffers32[oc > 1 ? 1 : 0],
+               sizeof(float) * n);
+    }
+}
+
+/* Deliver this block's MIDI as VST3 note events then render (instruments).
+ * Audio inputs are fed silence; the processContext carries transport/tempo. */
+static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                              int n_ev, float *L, float *R, int n)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (n > b->max_block || !b->processor) return;
+
+    b->in_events.clear();
+    for (int i = 0; i < n_ev; i++) {
+        const guint8 *m = ev[i].data;
+        uint8 status = m[0] & 0xF0, ch = m[0] & 0x0F;
+        Event e{};
+        e.busIndex     = 0;
+        e.sampleOffset = (int32)ev[i].time;
+        e.flags        = Event::kIsLive;
+        if (status == 0x90 && m[2] > 0) {
+            e.type = Event::kNoteOnEvent;
+            e.noteOn.channel  = ch;  e.noteOn.pitch = m[1];
+            e.noteOn.velocity = m[2] / 127.0f;  e.noteOn.noteId = -1;
+        } else if (status == 0x80 || (status == 0x90 && m[2] == 0)) {
+            e.type = Event::kNoteOffEvent;
+            e.noteOff.channel  = ch;  e.noteOff.pitch = m[1];
+            e.noteOff.velocity = (status == 0x80 ? m[2] / 127.0f : 0.0f);
+            e.noteOff.noteId   = -1;
+        } else {
+            continue;   /* CC/other: not handled in v1 */
+        }
+        b->in_events.addEvent(e);
+    }
+    b->data.inputEvents = &b->in_events;
+
+    double bpm, sr; gint64 frame; gboolean playing;
+    ph_get_transport(&bpm, &sr, &frame, &playing);
+    b->ctx.state = ProcessContext::kTempoValid | ProcessContext::kProjectTimeMusicValid;
+    if (playing) b->ctx.state |= ProcessContext::kPlaying;
+    b->ctx.sampleRate         = sr;
+    b->ctx.tempo              = bpm;
+    b->ctx.projectTimeSamples = (TSamples)frame;
+    double fpb = (bpm > 0.0) ? sr * 60.0 / bpm : 0.0;
+    b->ctx.projectTimeMusic   = (fpb > 0.0) ? (double)frame / fpb : 0.0;
+
+    b->data.numSamples = n;
+    if (b->data.inputs && b->data.inputs[0].channelBuffers32)   /* silence in */
+        for (int ch = 0; ch < b->data.inputs[0].numChannels; ch++)
+            memset(b->data.inputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
+    if (b->data.outputs && b->data.outputs[0].channelBuffers32)
+        for (int ch = 0; ch < b->data.outputs[0].numChannels; ch++)
+            memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
+
+    b->data.inputParameterChanges = &b->in_params;
+    b->processor->process(b->data);
+    b->in_params.clearQueue();
+    b->data.inputEvents = nullptr;        /* reset for the effect (audio) path */
 
     if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
         memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * n);
@@ -388,7 +454,8 @@ static void vst3_destroy_gui(PluginInstance *pi)
 }
 
 static const PhOps vst3_ops = {
-    vst3_process, vst3_destroy, vst3_make_gui, vst3_destroy_gui,
+    vst3_process, vst3_process_midi, vst3_destroy,
+    vst3_make_gui, vst3_destroy_gui,
     vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
     vst3_param_range
 };
@@ -467,6 +534,17 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
             if (b->component->getBusInfo(kAudio, bd, i, bi) == kResultOk &&
                 (bi.flags & BusInfo::kDefaultActive))
                 b->component->activateBus(kAudio, bd, i, true);
+        }
+    }
+    /* Instruments receive notes on an event INPUT bus, also inactive by default.
+     * Activate every default-active event input bus so MIDI reaches the synth. */
+    {
+        int32 nb = b->component->getBusCount(kEvent, kInput);
+        for (int32 i = 0; i < nb; i++) {
+            BusInfo bi;
+            if (b->component->getBusInfo(kEvent, kInput, i, bi) == kResultOk &&
+                (bi.flags & BusInfo::kDefaultActive))
+                b->component->activateBus(kEvent, kInput, i, true);
         }
     }
 

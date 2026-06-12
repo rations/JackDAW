@@ -619,8 +619,8 @@ src/mainwindow.o: src/mainwindow.c src/config.h src/mainwindow.h \
  /usr/include/gtk-3.0/gtk/deprecated/gtkvscrollbar.h \
  /usr/include/gtk-3.0/gtk/deprecated/gtkvseparator.h \
  /usr/include/gtk-3.0/gtk/gtk-autocleanups.h src/project.h src/track.h \
- src/audio_clip.h src/clipregion.h src/timeline.h src/jackdaw-engine.h \
- src/mixer.h src/main.h src/um.h
+ src/audio_clip.h src/clipregion.h src/midiclip.h src/timeline.h \
+ src/jackdaw-engine.h src/mixer.h src/main.h src/um.h
 src/config.h:
 src/mainwindow.h:
 /usr/include/gtk-3.0/gtk/gtk.h:
@@ -1295,6 +1295,7 @@ src/project.h:
 src/track.h:
 src/audio_clip.h:
 src/clipregion.h:
+src/midiclip.h:
 src/timeline.h:
 src/jackdaw-engine.h:
 src/mixer.h:

@@ -2,6 +2,7 @@
 #include <config.h>
 
 #include <string.h>
+#include <stdlib.h>   /* qsort */
 #include <math.h>
 #include <pthread.h>
 #include <time.h>
@@ -650,6 +651,87 @@ static void recorder_stop(void)
  * JACK process callback — RT thread, no malloc/free/mutex/file I/O
  * ----------------------------------------------------------------------- */
 
+/* ---- Instrument-track MIDI scheduling (RT) ----
+ * Per-slot active-note bookkeeping so a stop/seek can release sounding notes
+ * (no stuck notes), and a flush request set from the main thread. */
+#define ENG_MIDI_MAX_EV 1024
+static guint8        eng_active_notes[JACKDAW_MAX_TRACKS][16][128];
+static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS];   /* 1 = all-notes-off */
+
+static int eng_midi_cmp(const void *a, const void *b)
+{
+    const PhMidiEvent *ea = a, *eb = b;
+    if (ea->time < eb->time) return -1;
+    if (ea->time > eb->time) return  1;
+    return 0;
+}
+
+/* Build this block's MIDI events for an instrument track: stop/seek flush
+ * note-offs, then sequenced events from the immutable snapshot (while playing),
+ * then live JACK MIDI input (while armed). Tracks sounding notes per slot. */
+static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start,
+                                      jack_nframes_t nframes, gboolean playing,
+                                      gboolean armed, PhMidiEvent *mev, int cap)
+{
+    int nev = 0;
+
+    if (g_atomic_int_compare_and_exchange(&eng_midi_flush[slot], 1, 0)) {
+        for (int ch = 0; ch < 16; ch++)
+            for (int p = 0; p < 128; p++)
+                if (eng_active_notes[slot][ch][p] && nev < cap) {
+                    mev[nev].time = 0; mev[nev].size = 3;
+                    mev[nev].data[0] = (guint8)(0x80 | ch);
+                    mev[nev].data[1] = (guint8)p; mev[nev].data[2] = 0;
+                    nev++;
+                    eng_active_notes[slot][ch][p] = 0;
+                }
+    }
+
+    if (playing) {
+        MidiEventSnapshot *ms = g_atomic_pointer_get(&t->rt_midi);
+        if (ms && ms->n) {
+            off_t end = blk_start + nframes;
+            guint lo = 0, hi = ms->n;             /* lower_bound(blk_start) */
+            while (lo < hi) {
+                guint mid = (lo + hi) / 2;
+                if (ms->ev[mid].frame < blk_start) lo = mid + 1; else hi = mid;
+            }
+            for (guint e = lo; e < ms->n && ms->ev[e].frame < end && nev < cap; e++) {
+                MidiSnapEvent *se = &ms->ev[e];
+                mev[nev].time = (guint32)(se->frame - blk_start);
+                mev[nev].size = 3;
+                mev[nev].data[0] = se->s; mev[nev].data[1] = se->d1; mev[nev].data[2] = se->d2;
+                int ch = se->s & 0x0F, p = se->d1 & 0x7F;
+                if ((se->s & 0xF0) == 0x90 && se->d2 > 0) eng_active_notes[slot][ch][p] = 1;
+                else if ((se->s & 0xF0) == 0x80)          eng_active_notes[slot][ch][p] = 0;
+                nev++;
+            }
+        }
+    }
+
+    if (armed && t->midi_in_idx >= 0 &&
+        (guint)t->midi_in_idx < engine.midi_in_count && engine.midi_in[t->midi_in_idx]) {
+        void *mbuf = jack_port_get_buffer(engine.midi_in[t->midi_in_idx], nframes);
+        uint32_t mc = jack_midi_get_event_count(mbuf);
+        for (uint32_t m = 0; m < mc && nev < cap; m++) {
+            jack_midi_event_t ev;
+            if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1) continue;
+            mev[nev].time = ev.time;
+            mev[nev].size = (guint8)(ev.size > 3 ? 3 : ev.size);
+            mev[nev].data[0] = ev.buffer[0];
+            mev[nev].data[1] = ev.size > 1 ? ev.buffer[1] : 0;
+            mev[nev].data[2] = ev.size > 2 ? ev.buffer[2] : 0;
+            int st = ev.buffer[0] & 0xF0, ch = ev.buffer[0] & 0x0F, p = mev[nev].data[1] & 0x7F;
+            if (st == 0x90 && mev[nev].data[2] > 0) eng_active_notes[slot][ch][p] = 1;
+            else if (st == 0x80)                    eng_active_notes[slot][ch][p] = 0;
+            nev++;
+        }
+    }
+
+    if (nev > 1) qsort(mev, nev, sizeof(PhMidiEvent), eng_midi_cmp);
+    return nev;
+}
+
 static int engine_process(jack_nframes_t nframes, void *arg)
 {
     (void)arg;
@@ -667,6 +749,17 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     if (flags & ENGINE_PLAYING)
         engine.play_pos += nframes;
+
+    /* Block start frame + transport for plugins that query host time (VST2
+     * audioMasterGetTime, VST3 processContext). play_pos was just advanced. */
+    off_t blk_start = (flags & ENGINE_PLAYING) ? engine.play_pos - (off_t)nframes
+                                               : engine.play_pos;
+    {
+        double bpm = (engine.project && engine.project->bpm > 0.0)
+                         ? engine.project->bpm : 120.0;
+        pluginhost_set_transport(bpm, (double)engine.sample_rate,
+                                 (gint64)blk_start, (flags & ENGINE_PLAYING) != 0);
+    }
 
     /* First pass: check for any soloed track */
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
@@ -689,28 +782,35 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
         if (skip) continue;
 
-        /* Drain playback ringbuffers */
+        gboolean instr = jackdaw_track_is_instrument(t);
         size_t want = nframes * sizeof(float);
-        size_t got_L = 0, got_R = 0;
 
-        if (t->play_buf_L && (flags & ENGINE_PLAYING))
-            got_L = jack_ringbuffer_read(t->play_buf_L,
-                                         (char *)engine.tmp_L, want);
-        if (t->play_buf_R && (flags & ENGINE_PLAYING))
-            got_R = jack_ringbuffer_read(t->play_buf_R,
-                                         (char *)engine.tmp_R, want);
-
-        /* Zero-pad if ringbuffer ran dry */
-        if (got_L < want)
-            memset((char *)engine.tmp_L + got_L, 0, want - got_L);
-        if (got_R < want)
-            memset((char *)engine.tmp_R + got_R, 0, want - got_R);
+        if (instr) {
+            /* Instrument track: the signal is generated by the instrument from
+             * MIDI, so start from silence (no playback ringbuffer). */
+            memset(engine.tmp_L, 0, want);
+            memset(engine.tmp_R, 0, want);
+        } else {
+            /* Drain playback ringbuffers */
+            size_t got_L = 0, got_R = 0;
+            if (t->play_buf_L && (flags & ENGINE_PLAYING))
+                got_L = jack_ringbuffer_read(t->play_buf_L,
+                                             (char *)engine.tmp_L, want);
+            if (t->play_buf_R && (flags & ENGINE_PLAYING))
+                got_R = jack_ringbuffer_read(t->play_buf_R,
+                                             (char *)engine.tmp_R, want);
+            /* Zero-pad if ringbuffer ran dry */
+            if (got_L < want)
+                memset((char *)engine.tmp_L + got_L, 0, want - got_L);
+            if (got_R < want)
+                memset((char *)engine.tmp_R + got_R, 0, want - got_R);
+        }
 
         /* Live input monitoring: when armed, the input is summed into the
          * track signal (so it is heard through the FX chain), and the dry input
          * is captured to rec_buf when recording. */
         float *live_in = NULL;
-        if ((tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
+        if (!instr && (tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
             (guint)t->audio_in_idx < engine.audio_in_count &&
             engine.audio_in[(guint)t->audio_in_idx]) {
             live_in = jack_port_get_buffer(
@@ -740,7 +840,23 @@ static int engine_process(jack_nframes_t nframes, void *arg)
          * immutable snapshot published by the main thread; pluginhost_process
          * is RT-safe and skips bypassed effects. */
         JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
-        if (chain) {
+        if (instr) {
+            /* Instrument track: fx[0] is the instrument — feed it this block's
+             * MIDI (sequenced + live + flush) to render audio; fx[1..] are audio
+             * effects applied after it. With no instrument loaded, stays silent. */
+            PhMidiEvent mev[ENG_MIDI_MAX_EV];
+            int nev = eng_gather_instrument_midi((int)i, t, blk_start, nframes,
+                                                 (flags & ENGINE_PLAYING) != 0,
+                                                 (tflags & TRACK_ARMED) != 0,
+                                                 mev, ENG_MIDI_MAX_EV);
+            if (chain && chain->n > 0) {
+                pluginhost_process_midi((PluginInstance *)chain->fx[0], mev, nev,
+                                        engine.tmp_L, engine.tmp_R, (int)nframes);
+                for (int fi = 1; fi < chain->n; fi++)
+                    pluginhost_process((PluginInstance *)chain->fx[fi],
+                                       engine.tmp_L, engine.tmp_R, (int)nframes);
+            }
+        } else if (chain) {
             for (int fi = 0; fi < chain->n; fi++)
                 pluginhost_process((PluginInstance *)chain->fx[fi],
                                    engine.tmp_L, engine.tmp_R, (int)nframes);
@@ -1469,6 +1585,10 @@ void jackdaw_engine_start_playback(void)
 void jackdaw_engine_stop_playback(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_PLAYING);
+    /* Release any notes sounding on instrument tracks (no stuck notes on stop
+     * or seek — jackdaw_engine_locate() also calls through here). */
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++)
+        g_atomic_int_set(&eng_midi_flush[i], 1);
 }
 
 void jackdaw_engine_start_recording(void)

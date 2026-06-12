@@ -1,8 +1,15 @@
 #include <config.h>
 #include <math.h>
+#include <string.h>
 
 #include "project.h"
 #include "settings.h"
+#include "track.h"
+#include "audio_clip.h"
+#include "clipregion.h"
+#include "midiclip.h"
+#include "pluginhost.h"
+#include "jackdaw-engine.h"
 
 G_DEFINE_TYPE(JackDawProject, jackdaw_project, G_TYPE_OBJECT)
 
@@ -244,4 +251,266 @@ off_t jackdaw_project_snap_frame(JackDawProject *p, off_t frame,
     gdouble n = (gdouble)frame / fpb;
     off_t snapped = (off_t)(floor(n + 0.5) * fpb);
     return snapped < 0 ? 0 : snapped;
+}
+
+/* ============================ Save / Load ===============================
+ * One GKeyFile (.jdaw). Boolean convention: TRUE = failure, FALSE = success.
+ * All values read back are validated/clamped per CLAUDE.md before use.
+ */
+
+/* GKeyFile getters with defaults (g_key_file_get_* errors out on a missing key). */
+static gint kf_int(GKeyFile *kf, const char *g, const char *k, gint def)
+{ return g_key_file_has_key(kf, g, k, NULL) ? g_key_file_get_integer(kf, g, k, NULL) : def; }
+static gint64 kf_i64(GKeyFile *kf, const char *g, const char *k, gint64 def)
+{ return g_key_file_has_key(kf, g, k, NULL) ? g_key_file_get_int64(kf, g, k, NULL) : def; }
+static gdouble kf_dbl(GKeyFile *kf, const char *g, const char *k, gdouble def)
+{ return g_key_file_has_key(kf, g, k, NULL) ? g_key_file_get_double(kf, g, k, NULL) : def; }
+static gboolean kf_bool(GKeyFile *kf, const char *g, const char *k, gboolean def)
+{ return g_key_file_has_key(kf, g, k, NULL) ? g_key_file_get_boolean(kf, g, k, NULL) : def; }
+
+static gboolean cat_is_instrument(const char *c)
+{ return c && (strstr(c, "Instrument") || strstr(c, "Synth")); }
+
+gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TRUE);
+    if (!path) return TRUE;
+
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_set_double (kf, "project", "bpm", p->bpm);
+    g_key_file_set_integer(kf, "project", "beats_per_bar", (gint)p->beats_per_bar);
+    g_key_file_set_integer(kf, "project", "beat_unit", (gint)p->beat_unit);
+    g_key_file_set_double (kf, "project", "master_volume", p->master_volume);
+    g_key_file_set_boolean(kf, "project", "grid", p->grid_enabled);
+    g_key_file_set_boolean(kf, "project", "snap", p->snap_enabled);
+    g_key_file_set_boolean(kf, "project", "metronome", p->metronome_enabled);
+    g_key_file_set_integer(kf, "project", "ruler", (gint)p->ruler_mode);
+    g_key_file_set_integer(kf, "project", "track_count", (gint)p->tracks->len);
+
+    for (guint ti = 0; ti < p->tracks->len; ti++) {
+        JackDawTrack *t = JACKDAW_TRACK(g_ptr_array_index(p->tracks, ti));
+        char grp[32]; g_snprintf(grp, sizeof grp, "track%u", ti);
+
+        g_key_file_set_string (kf, grp, "name", jackdaw_track_get_name(t));
+        g_key_file_set_integer(kf, grp, "kind", (gint)jackdaw_track_get_kind(t));
+        g_key_file_set_double (kf, grp, "volume", jackdaw_track_get_volume(t));
+        g_key_file_set_double (kf, grp, "pan", jackdaw_track_get_pan(t));
+        gint flags = (jackdaw_track_is_armed(t)  ? 1 : 0) |
+                     (jackdaw_track_is_muted(t)  ? 2 : 0) |
+                     (jackdaw_track_is_soloed(t) ? 4 : 0);
+        g_key_file_set_integer(kf, grp, "flags", flags);
+        g_key_file_set_integer(kf, grp, "audio_in", t->audio_in_idx);
+        g_key_file_set_integer(kf, grp, "midi_in",  t->midi_in_idx);
+
+        GPtrArray *regs = jackdaw_track_get_regions(t);
+        g_key_file_set_integer(kf, grp, "region_count", regs ? (gint)regs->len : 0);
+        for (guint ri = 0; regs && ri < regs->len; ri++) {
+            ClipRegion *r = g_ptr_array_index(regs, ri);
+            char rg[48]; g_snprintf(rg, sizeof rg, "track%u.region%u", ti, ri);
+            g_key_file_set_string(kf, rg, "path",
+                (r->clip && r->clip->path) ? r->clip->path : "");
+            g_key_file_set_int64 (kf, rg, "file_in", r->file_in);
+            g_key_file_set_int64 (kf, rg, "length",  r->length);
+            g_key_file_set_int64 (kf, rg, "tl_pos",  r->tl_pos);
+            g_key_file_set_double(kf, rg, "gain",    r->gain);
+        }
+
+        GPtrArray *mr = jackdaw_track_get_midi_regions(t);
+        g_key_file_set_integer(kf, grp, "midi_region_count", mr ? (gint)mr->len : 0);
+        for (guint mi = 0; mr && mi < mr->len; mi++) {
+            MidiRegion *r = g_ptr_array_index(mr, mi);
+            char mg[48]; g_snprintf(mg, sizeof mg, "track%u.midi%u", ti, mi);
+            g_key_file_set_int64  (kf, mg, "tl_pos", r->tl_pos);
+            g_key_file_set_integer(kf, mg, "clip_in", (gint)r->clip_in);
+            g_key_file_set_integer(kf, mg, "length",  (gint)r->length);
+            g_key_file_set_integer(kf, mg, "clip_length",
+                                   (gint)(r->clip ? r->clip->length : r->length));
+            guint nc = r->clip ? midi_clip_note_count(r->clip) : 0;
+            GArray *vals = g_array_new(FALSE, FALSE, sizeof(gint));
+            for (guint ni = 0; ni < nc; ni++) {
+                MidiNote *n = midi_clip_note(r->clip, ni);
+                gint v;
+                v = (gint)n->start;    g_array_append_val(vals, v);
+                v = (gint)n->length;   g_array_append_val(vals, v);
+                v = (gint)n->pitch;    g_array_append_val(vals, v);
+                v = (gint)n->velocity; g_array_append_val(vals, v);
+                v = (gint)n->channel;  g_array_append_val(vals, v);
+            }
+            g_key_file_set_integer_list(kf, mg, "notes", (gint *)vals->data, vals->len);
+            g_array_free(vals, TRUE);
+        }
+
+        guint fc = jackdaw_track_fx_count(t);
+        g_key_file_set_integer(kf, grp, "fx_count", (gint)fc);
+        for (guint fi = 0; fi < fc; fi++) {
+            PluginInstance *inst = jackdaw_track_fx_get(t, fi);
+            const char *key = pluginhost_key(inst), *cat = pluginhost_category(inst);
+            char fg[48]; g_snprintf(fg, sizeof fg, "track%u.fx%u", ti, fi);
+            g_key_file_set_integer(kf, fg, "format", (gint)pluginhost_format(inst));
+            g_key_file_set_string (kf, fg, "key", key ? key : "");
+            g_key_file_set_string (kf, fg, "name", pluginhost_name(inst));
+            g_key_file_set_string (kf, fg, "category", cat ? cat : "");
+            g_key_file_set_boolean(kf, fg, "active", pluginhost_is_active(inst));
+            g_key_file_set_double (kf, fg, "mix", pluginhost_get_mix(inst));
+            guint pc = pluginhost_param_count(inst);
+            if (pc > 0 && pc < 4096) {
+                gdouble *pv = g_new(gdouble, pc);
+                for (guint pi = 0; pi < pc; pi++) pv[pi] = pluginhost_param_get(inst, pi);
+                g_key_file_set_double_list(kf, fg, "params", pv, pc);
+                g_free(pv);
+            }
+        }
+    }
+
+    gboolean ok = g_key_file_save_to_file(kf, path, NULL);
+    g_key_file_free(kf);
+    if (ok) jackdaw_project_set_file(p, path);
+    return ok ? FALSE : TRUE;
+}
+
+gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TRUE);
+    if (!path) return TRUE;
+
+    GKeyFile *kf = g_key_file_new();
+    if (!g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        g_key_file_free(kf);
+        return TRUE;
+    }
+
+    /* Clear the current session (engine slots + project tracks). */
+    guint cur = p->tracks->len;
+    while (cur-- > 0) {
+        JackDawTrack *t = jackdaw_project_get_track(p, 0);
+        jackdaw_engine_remove_track(t);
+        jackdaw_project_remove_track(p, t);
+    }
+
+    p->bpm           = CLAMP(kf_dbl(kf, "project", "bpm", 120.0), 20.0, 999.0);
+    p->beats_per_bar = CLAMP(kf_int(kf, "project", "beats_per_bar", 4), 1, 32);
+    p->beat_unit     = CLAMP(kf_int(kf, "project", "beat_unit", 4), 1, 32);
+    p->master_volume = CLAMP(kf_dbl(kf, "project", "master_volume", 1.0), 0.0, 2.0);
+    p->grid_enabled      = kf_bool(kf, "project", "grid", FALSE);
+    p->snap_enabled      = kf_bool(kf, "project", "snap", FALSE);
+    p->metronome_enabled = kf_bool(kf, "project", "metronome", FALSE);
+    p->ruler_mode    = kf_int(kf, "project", "ruler", JACKDAW_RULER_TIME) ?
+                       JACKDAW_RULER_BARS : JACKDAW_RULER_TIME;
+
+    double fpb = jackdaw_project_frames_per_beat(p, jackdaw_engine_get_sample_rate());
+
+    gint tc = CLAMP(kf_int(kf, "project", "track_count", 0), 0, JACKDAW_MAX_TRACKS);
+    for (gint ti = 0; ti < tc; ti++) {
+        char grp[32]; g_snprintf(grp, sizeof grp, "track%d", ti);
+        if (!g_key_file_has_group(kf, grp)) continue;
+
+        gchar *nm = g_key_file_has_key(kf, grp, "name", NULL)
+                        ? g_key_file_get_string(kf, grp, "name", NULL) : g_strdup("Track");
+        JackDawTrack *t = jackdaw_track_new(nm, NULL);
+        g_free(nm);
+
+        jackdaw_track_set_kind(t, kf_int(kf, grp, "kind", 0) ?
+                               JACKDAW_TRACK_INSTRUMENT : JACKDAW_TRACK_AUDIO);
+        jackdaw_track_set_volume(t, (gfloat)kf_dbl(kf, grp, "volume", 1.0));
+        jackdaw_track_set_pan   (t, (gfloat)kf_dbl(kf, grp, "pan", 0.0));
+        gint flags = kf_int(kf, grp, "flags", 0);
+        jackdaw_track_set_armed (t, (flags & 1) != 0);
+        jackdaw_track_set_muted (t, (flags & 2) != 0);
+        jackdaw_track_set_soloed(t, (flags & 4) != 0);
+        t->audio_in_idx = MAX(kf_int(kf, grp, "audio_in", -1), -1);
+        t->midi_in_idx  = MAX(kf_int(kf, grp, "midi_in",  -1), -1);
+
+        if (jackdaw_engine_add_track(t)) { g_object_unref(t); continue; }
+        jackdaw_project_add_track(p, t);   /* project takes its own ref */
+        g_object_unref(t);                 /* drop our creation ref; project owns it */
+
+        /* audio regions */
+        gint rc = CLAMP(kf_int(kf, grp, "region_count", 0), 0, 100000);
+        GPtrArray *regs = jackdaw_track_get_regions(t);
+        for (gint ri = 0; ri < rc; ri++) {
+            char rg[48]; g_snprintf(rg, sizeof rg, "track%d.region%d", ti, ri);
+            if (!g_key_file_has_group(kf, rg)) continue;
+            gchar *rp = g_key_file_get_string(kf, rg, "path", NULL);
+            if (rp && rp[0] == '/' && !strstr(rp, "..") && strlen(rp) < 4096) {
+                AudioClip *clip = audio_clip_new(rp, NULL);
+                if (clip) {
+                    ClipRegion *r = clip_region_new(clip,
+                        kf_i64(kf, rg, "file_in", 0),
+                        kf_i64(kf, rg, "length", clip->info.frames),
+                        kf_i64(kf, rg, "tl_pos", 0));
+                    r->gain = (gfloat)kf_dbl(kf, rg, "gain", 1.0);
+                    g_ptr_array_add(regs, r);
+                    audio_clip_free(clip);   /* region holds its own ref */
+                }
+            }
+            g_free(rp);
+        }
+        jackdaw_track_commit_regions(t);
+
+        /* midi regions */
+        gint mc = CLAMP(kf_int(kf, grp, "midi_region_count", 0), 0, 100000);
+        GPtrArray *mr = jackdaw_track_get_midi_regions(t);
+        for (gint mi = 0; mi < mc; mi++) {
+            char mg[48]; g_snprintf(mg, sizeof mg, "track%d.midi%d", ti, mi);
+            if (!g_key_file_has_group(kf, mg)) continue;
+            guint32 clip_len = (guint32)MAX(kf_int(kf, mg, "clip_length", JACKDAW_PPQ * 16), 1);
+            MidiClip *c = midi_clip_new(clip_len);
+            gsize nn = 0;
+            gint *notes = g_key_file_get_integer_list(kf, mg, "notes", &nn, NULL);
+            for (gsize k = 0; notes && k + 5 <= nn; k += 5) {
+                MidiNote n;
+                n.start    = (guint32)MAX(notes[k], 0);
+                n.length   = (guint32)MAX(notes[k + 1], 1);
+                n.pitch    = (guint8)CLAMP(notes[k + 2], 0, 127);
+                n.velocity = (guint8)CLAMP(notes[k + 3], 0, 127);
+                n.channel  = (guint8)CLAMP(notes[k + 4], 0, 15);
+                midi_clip_add_note(c, n);
+            }
+            g_free(notes);
+            MidiRegion *r = midi_region_new(c,
+                (guint32)MAX(kf_int(kf, mg, "clip_in", 0), 0),
+                (guint32)MAX(kf_int(kf, mg, "length", (gint)clip_len), 1),
+                kf_i64(kf, mg, "tl_pos", 0));
+            midi_clip_free(c);               /* region holds its own ref */
+            g_ptr_array_add(mr, r);
+        }
+        jackdaw_track_commit_midi(t, fpb);
+
+        /* fx chain (incl. the instrument at index 0) */
+        gint fc = CLAMP(kf_int(kf, grp, "fx_count", 0), 0, 1024);
+        for (gint fi = 0; fi < fc; fi++) {
+            char fg[48]; g_snprintf(fg, sizeof fg, "track%d.fx%d", ti, fi);
+            if (!g_key_file_has_group(kf, fg)) continue;
+            gchar *key = g_key_file_get_string(kf, fg, "key", NULL);
+            gchar *fnm = g_key_file_get_string(kf, fg, "name", NULL);
+            gchar *cat = g_key_file_get_string(kf, fg, "category", NULL);
+            gint   fmt = CLAMP(kf_int(kf, fg, "format", 0), 0, PH_NFORMATS - 1);
+            if (key && key[0]) {
+                PluginInfo info;
+                info.format        = (PluginFormat)fmt;
+                info.key           = key;
+                info.name          = fnm ? fnm : (char *)"fx";
+                info.category      = cat ? cat : (char *)"";
+                info.is_instrument = cat_is_instrument(cat);
+                PluginInstance *inst = pluginhost_instantiate(&info);
+                if (inst) {
+                    pluginhost_set_active(inst, kf_bool(kf, fg, "active", TRUE));
+                    pluginhost_set_mix(inst, (float)kf_dbl(kf, fg, "mix", 1.0));
+                    gsize pn = 0;
+                    gdouble *pv = g_key_file_get_double_list(kf, fg, "params", &pn, NULL);
+                    guint pc = pluginhost_param_count(inst);
+                    for (gsize pi = 0; pv && pi < pn && pi < pc; pi++)
+                        pluginhost_param_set(inst, (guint)pi, (float)pv[pi]);
+                    g_free(pv);
+                    jackdaw_track_fx_add(t, inst);
+                }
+            }
+            g_free(key); g_free(fnm); g_free(cat);
+        }
+    }
+
+    g_key_file_free(kf);
+    jackdaw_project_set_file(p, path);
+    jackdaw_project_emit_timing_changed(p);
+    return FALSE;
 }
