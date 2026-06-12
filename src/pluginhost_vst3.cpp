@@ -25,6 +25,8 @@
  * included above, so those macros never reach SDK code. */
 #include <gdk/gdkx.h>
 #include <glib-unix.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -151,31 +153,32 @@ tresult PLUGIN_API HostComponentHandler::performEdit(ParamID id, ParamValue valu
     return kResultOk;
 }
 
-/* ---- Scan ---- */
+/* ---- Scan ----
+ * The main process only ENUMERATES .vst3 files and routes each through
+ * ph_scan_cached() (pluginhost.c), which describes it out-of-process via
+ * `jackdaw --scan-plugin VST3 <path>` and caches the result. Loading VST3 code
+ * in-process would drag Wine/yabridge (and its fontconfig) into the main process
+ * and crash native plugin UIs, so it only ever happens in the throwaway scanner
+ * (ph_vst3_describe, below) or at instantiate time. */
 
-static const char *vst3_module_so(const char *bundle, std::string &store)
-{
-    /* Accept either a bare .so or a .vst3 bundle directory. Module::create
-     * understands both, so just return the given path. */
-    store = bundle;
-    return store.c_str();
-}
-
-static void vst3_scan_file(const char *path, GList **catalog)
+/* Load+describe one .vst3 — runs only in the out-of-process scanner. */
+extern "C" void ph_vst3_describe(const char *path, GList **catalog)
 {
     if (!ph_path_is_safe(path)) return;
-    std::string err, p;
-    auto mod = VST3::Hosting::Module::create(vst3_module_so(path, p), err);
+    std::string err;
+    auto mod = VST3::Hosting::Module::create(path, err);
     if (!mod) return;
     auto factory = mod->getFactory();
     for (auto &ci : factory.classInfos()) {
         if (ci.category() != kVstAudioEffectClass) continue;
-        /* key = "path\nClassName" (class resolved again at instantiate) */
-        gchar *key = g_strdup_printf("%s\n%s", path, ci.name().c_str());
-        const char *cat = ci.subCategoriesString().empty()
-                          ? "VST3" : ci.subCategoriesString().c_str();
+        /* name()/subCategoriesString() return std::string BY VALUE — keep them in
+         * locals so their c_str() stays valid across the ph_info_new call. */
+        std::string name = ci.name();
+        std::string subcat = ci.subCategoriesString();
+        gchar *key = g_strdup_printf("%s\n%s", path, name.c_str());
         *catalog = g_list_prepend(*catalog,
-            ph_info_new(PH_VST3, key, ci.name().c_str(), cat));
+            ph_info_new(PH_VST3, key, name.c_str(),
+                        subcat.empty() ? "VST3" : subcat.c_str()));
         g_free(key);
     }
 }
@@ -188,11 +191,10 @@ static void vst3_scan_dir(const char *dir, GList **catalog, int depth)
     const char *e;
     while ((e = g_dir_read_name(d))) {
         gchar *full = g_build_filename(dir, e, NULL);
-        if (g_str_has_suffix(e, ".vst3")) {
-            vst3_scan_file(full, catalog);
-        } else if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+        if (g_str_has_suffix(e, ".vst3"))
+            ph_scan_cached(PH_VST3, full, catalog);
+        else if (g_file_test(full, G_FILE_TEST_IS_DIR))
             vst3_scan_dir(full, catalog, depth + 1);
-        }
         g_free(full);
     }
     g_dir_close(d);

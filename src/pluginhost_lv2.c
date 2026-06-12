@@ -40,16 +40,18 @@
 /* ---- Shared LilvWorld + cached nodes ---- */
 
 static LilvWorld *world;
-static LilvNode  *n_audio, *n_control, *n_input, *n_output;
+static LilvNode  *n_audio, *n_control, *n_input, *n_output, *n_atom_port, *n_cv;
 
 static void lv2_world_init(void)
 {
     if (world) return;
     world = lilv_world_new();
-    n_audio   = lilv_new_uri(world, LILV_URI_AUDIO_PORT);
-    n_control = lilv_new_uri(world, LILV_URI_CONTROL_PORT);
-    n_input   = lilv_new_uri(world, LILV_URI_INPUT_PORT);
-    n_output  = lilv_new_uri(world, LILV_URI_OUTPUT_PORT);
+    n_audio     = lilv_new_uri(world, LILV_URI_AUDIO_PORT);
+    n_control   = lilv_new_uri(world, LILV_URI_CONTROL_PORT);
+    n_input     = lilv_new_uri(world, LILV_URI_INPUT_PORT);
+    n_output    = lilv_new_uri(world, LILV_URI_OUTPUT_PORT);
+    n_atom_port = lilv_new_uri(world, LV2_ATOM__AtomPort);
+    n_cv        = lilv_new_uri(world, LV2_CORE__CVPort);
 }
 
 /* Build the LV2_PATH lilv should search: the user's env (or the standard
@@ -292,9 +294,22 @@ typedef struct {
     char   *uri, *ui_uri, *ui_type;    /* cached UI metadata */
 
     float  *outA, *outB;         /* scratch out buffers (max_block) */
-    float  *dummy_in, *dummy_out;/* scratch for surplus audio ports */
-    void   *misc;                /* zeroed buffer for atom/event/CV/other ports */
+    float  *dummy_in, *dummy_out;/* scratch for surplus audio + CV ports */
+    void   *misc;                /* zeroed buffer for any leftover port type */
     int     max_block;
+
+    /* Atom ports (MIDI/patch). Each needs its OWN buffer per instance, set up as
+     * an LV2_Atom_Sequence and RESET before every run() — exactly as jalv does in
+     * lv2_evbuf_reset. Sharing one un-initialised buffer (as before) let plugins
+     * like gxtuner forge MIDI into a zero-capacity buffer -> heap corruption. */
+    struct Lv2AtomPort {
+        guint    index;
+        gboolean is_input;
+        uint32_t capacity;       /* bytes the plugin may write (output ports) */
+        void    *buf[2];         /* sizeof(LV2_Atom_Sequence)+capacity, per inst */
+    }      *atoms;
+    guint   n_atoms;
+    LV2_URID urid_seq, urid_chunk;
 
     Lv2Param *params;
     guint     n_params;
@@ -345,6 +360,26 @@ void ph_lv2_scan(GList **catalog, const GList *extra)
 
 /* ---- Ops ---- */
 
+/* Re-arm this instance's atom ports before run(): input ports become an empty
+ * but valid LV2_Atom_Sequence; output ports advertise their full capacity as an
+ * atom:Chunk. Matches jalv's lv2_evbuf_reset — without it a plugin writing MIDI
+ * (e.g. gxtuner) forges into a buffer of unknown/zero capacity and corrupts the
+ * heap. RT-safe: only touches the two header fields. */
+static inline void lv2_reset_atoms(Lv2Backend *b, int k)
+{
+    for (guint a = 0; a < b->n_atoms; a++) {
+        LV2_Atom_Sequence *seq = (LV2_Atom_Sequence *)b->atoms[a].buf[k];
+        if (!seq) continue;
+        if (b->atoms[a].is_input) {
+            seq->atom.size = sizeof(LV2_Atom_Sequence_Body);
+            seq->atom.type = b->urid_seq;
+        } else {
+            seq->atom.size = b->atoms[a].capacity;
+            seq->atom.type = b->urid_chunk;
+        }
+    }
+}
+
 static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
 {
     Lv2Backend *b = pi->backend;
@@ -356,6 +391,8 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         lilv_instance_connect_port(b->inst[0], b->aout[0], b->outA);
         lilv_instance_connect_port(b->inst[1], b->ain[0],  R);
         lilv_instance_connect_port(b->inst[1], b->aout[0], b->outB);
+        lv2_reset_atoms(b, 0);
+        lv2_reset_atoms(b, 1);
         lilv_instance_run(b->inst[0], n);
         lilv_instance_run(b->inst[1], n);
         worker_apply_responses(&b->workers[0]);
@@ -375,6 +412,7 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         for (int i = 2; i < b->n_audio_out; i++)
             lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
 
+        lv2_reset_atoms(b, 0);
         lilv_instance_run(b->inst[0], n);
         worker_apply_responses(&b->workers[0]);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
@@ -405,6 +443,8 @@ static void lv2_destroy(PluginInstance *pi)
     g_free(b->outB);
     g_free(b->dummy_in); g_free(b->dummy_out);
     g_free(b->misc);
+    for (guint a = 0; a < b->n_atoms; a++) { g_free(b->atoms[a].buf[0]); g_free(b->atoms[a].buf[1]); }
+    g_free(b->atoms);
     g_free(b->uri); g_free(b->ui_uri); g_free(b->ui_type);
     g_free(b);
 }
@@ -725,6 +765,10 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
     lilv_plugin_get_port_ranges_float(p, mins, maxs, defs);
 
     GArray *params = g_array_new(FALSE, FALSE, sizeof(Lv2Param));
+    /* Collect atom ports so each can get its own properly-sized, reset-per-run
+     * LV2_Atom_Sequence buffer (jalv model). Capacity is generous for MIDI. */
+    const uint32_t atom_cap = (uint32_t)MAX((gsize)max_block * sizeof(float), (gsize)8192);
+    GArray *atomg = g_array_new(FALSE, FALSE, sizeof(struct Lv2AtomPort));
 
     for (guint i = 0; i < b->n_ports; i++) {
         const LilvPort *port = lilv_plugin_get_port_by_index(p, i);
@@ -736,6 +780,11 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
         if (is_audio) {
             if (is_in)  b->ain [b->n_audio_in++ ] = (int)i;
             if (is_out) b->aout[b->n_audio_out++] = (int)i;
+        } else if (lilv_port_is_a(p, port, n_atom_port)) {
+            struct Lv2AtomPort ap;
+            memset(&ap, 0, sizeof ap);
+            ap.index = i; ap.is_input = is_in; ap.capacity = atom_cap;
+            g_array_append_val(atomg, ap);
         } else if (is_ctl) {
             float d = defs[i];
             if (d != d) d = 0.0f;   /* NaN guard */
@@ -759,6 +808,11 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
 
     b->n_params = params->len;
     b->params   = (Lv2Param *)g_array_free(params, FALSE);
+
+    b->n_atoms    = atomg->len;
+    b->atoms      = (struct Lv2AtomPort *)g_array_free(atomg, FALSE);
+    b->urid_seq   = urid_map_cb(NULL, LV2_ATOM__Sequence);
+    b->urid_chunk = urid_map_cb(NULL, LV2_ATOM__Chunk);
 
     b->dual_mono = (b->n_audio_in == 1 && b->n_audio_out == 1);
     b->n_inst    = b->dual_mono ? 2 : 1;
@@ -812,6 +866,8 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
         b->inst[k] = lilv_plugin_instantiate(p, sr, b->features[k]);
         if (!b->inst[k]) {
             for (int j = 0; j < k; j++) { worker_destroy(&b->workers[j]); lilv_instance_free(b->inst[j]); }
+            for (guint a = 0; a < b->n_atoms; a++) { g_free(b->atoms[a].buf[0]); g_free(b->atoms[a].buf[1]); }
+            g_free(b->atoms);
             for (guint q = 0; q < b->n_params; q++) g_free(b->params[q].name);
             g_free(b->params); g_free(b->ctl);
             g_free(b->ain); g_free(b->aout); g_free(b->ctl_in); g_free(b->ctl_out);
@@ -820,16 +876,29 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
             g_free(b);
             return NULL;
         }
-        /* Connect EVERY port up front. Control ports → their own slot in the
-         * value store (so output controls — meters/tuner — can be read and fed
-         * to the UI). Audio ports are (re)connected per process call, but bind
-         * them to scratch now so an unused one is never NULL. Any other port
-         * type (atom/event/CV) → the zeroed misc buffer. */
+        /* This instance's atom buffers (own buffer per port, so dual-mono
+         * instances never share — and never the old single misc buffer). */
+        for (guint a = 0; a < b->n_atoms; a++)
+            b->atoms[a].buf[k] =
+                g_malloc0(sizeof(LV2_Atom_Sequence) + b->atoms[a].capacity);
+        lv2_reset_atoms(b, k);
+
+        /* Connect EVERY port up front. Control → its slot in the value store;
+         * audio/CV → scratch (audio is re-bound per process call); atom → its own
+         * sequence buffer; anything else → the zeroed misc buffer. */
         for (guint i = 0; i < b->n_ports; i++) {
             const LilvPort *port = lilv_plugin_get_port_by_index(p, i);
             if (lilv_port_is_a(p, port, n_control)) {
                 lilv_instance_connect_port(b->inst[k], i, &b->ctl[i]);
             } else if (lilv_port_is_a(p, port, n_audio)) {
+                lilv_instance_connect_port(b->inst[k], i,
+                    lilv_port_is_a(p, port, n_input) ? b->dummy_in : b->dummy_out);
+            } else if (lilv_port_is_a(p, port, n_atom_port)) {
+                void *buf = b->misc;
+                for (guint a = 0; a < b->n_atoms; a++)
+                    if (b->atoms[a].index == i) { buf = b->atoms[a].buf[k]; break; }
+                lilv_instance_connect_port(b->inst[k], i, buf);
+            } else if (lilv_port_is_a(p, port, n_cv)) {
                 lilv_instance_connect_port(b->inst[k], i,
                     lilv_port_is_a(p, port, n_input) ? b->dummy_in : b->dummy_out);
             } else {

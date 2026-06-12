@@ -2,6 +2,8 @@
 #include <config.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #include "pluginhost.h"
 #include "pluginhost_internal.h"
@@ -93,16 +95,205 @@ PluginInstance *ph_instance_alloc(PluginFormat fmt, const char *name,
 
 /* ---- Catalog ---- */
 
+/* ============================================================================
+ * Out-of-process scanning + on-disk cache (Reaper-style).
+ *
+ * dlopen-format backends never load plugin code to list it; they route each
+ * file through ph_scan_cached(), which on a miss spawns THIS binary as
+ * `jackdaw --scan-plugin <FMT> <path>` to load+describe it in a throwaway
+ * process — so Wine/yabridge (and its fontconfig) never enters the main process.
+ * Results persist in ~/.jackdaw/plugincache keyed by path+mtime; only new or
+ * changed plugins are re-scanned. LV2 is .ttl-only (lilv) so it scans in-process.
+ * ==========================================================================*/
+
+static void ph_esc(GString *s, const char *v)
+{
+    for (; v && *v; v++) {
+        if      (*v == '\\') g_string_append(s, "\\\\");
+        else if (*v == '\n') g_string_append(s, "\\n");
+        else if (*v == '\t') g_string_append(s, "\\t");
+        else                 g_string_append_c(s, *v);
+    }
+}
+static char *ph_unesc(const char *v)
+{
+    GString *s = g_string_new("");
+    for (; v && *v; v++) {
+        if (*v == '\\' && v[1]) { v++;
+            g_string_append_c(s, *v == 'n' ? '\n' : *v == 't' ? '\t' : *v);
+        } else g_string_append_c(s, *v);
+    }
+    return g_string_free(s, FALSE);
+}
+
+typedef struct { gint64 mtime; GPtrArray *classes; gboolean seen; } PhCacheEnt;
+static GHashTable *ph_cache;          /* path -> PhCacheEnt, valid only mid-scan */
+static gboolean    ph_cache_dirty;
+static void (*ph_progress_cb)(const char *, void *);
+static void  *ph_progress_u;
+
+void pluginhost_set_scan_progress(void (*cb)(const char *, void *), void *u)
+{ ph_progress_cb = cb; ph_progress_u = u; }
+
+static void ph_cache_ent_free(gpointer p)
+{ PhCacheEnt *e = p; if (e->classes) g_ptr_array_free(e->classes, TRUE); g_free(e); }
+
+static char *ph_cache_path(void)
+{ return g_build_filename(g_get_home_dir(), ".jackdaw", "plugincache", NULL); }
+
+static void ph_cache_load(void)
+{
+    ph_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, ph_cache_ent_free);
+    ph_cache_dirty = FALSE;
+    char *file = ph_cache_path(), *data = NULL; gsize len = 0;
+    if (g_file_get_contents(file, &data, &len, NULL)) {
+        gchar **rows = g_strsplit(data, "\n", -1);
+        for (int i = 0; rows[i]; i++) {
+            if (!rows[i][0]) continue;
+            gchar **f = g_strsplit(rows[i], "\t", 5);   /* epath mtime ekey ename ecat */
+            if (f[0] && f[1] && f[2] && f[3] && f[4]) {
+                char *path = ph_unesc(f[0]);
+                PhCacheEnt *e = g_hash_table_lookup(ph_cache, path);
+                if (!e) { e = g_new0(PhCacheEnt, 1);
+                          e->mtime = g_ascii_strtoll(f[1], NULL, 10);
+                          e->classes = g_ptr_array_new_with_free_func(g_free);
+                          g_hash_table_insert(ph_cache, path, e); }
+                else g_free(path);
+                if (f[2][0])   /* empty ekey marks "scanned, no classes" */
+                    g_ptr_array_add(e->classes,
+                                    g_strdup_printf("%s\t%s\t%s", f[2], f[3], f[4]));
+            }
+            g_strfreev(f);
+        }
+        g_strfreev(rows); g_free(data);
+    }
+    g_free(file);
+}
+
+static void ph_cache_save(void)
+{
+    GString *s = g_string_new("");
+    GHashTableIter it; gpointer k, v;
+    g_hash_table_iter_init(&it, ph_cache);
+    while (g_hash_table_iter_next(&it, &k, &v)) {
+        PhCacheEnt *e = v; if (!e->seen) continue;   /* drop deleted plugins */
+        GString *ep = g_string_new(""); ph_esc(ep, (const char *)k);
+        if (e->classes->len == 0)
+            g_string_append_printf(s, "%s\t%lld\t\t\t\n", ep->str, (long long)e->mtime);
+        for (guint i = 0; i < e->classes->len; i++)
+            g_string_append_printf(s, "%s\t%lld\t%s\n", ep->str, (long long)e->mtime,
+                                   (const char *)g_ptr_array_index(e->classes, i));
+        g_string_free(ep, TRUE);
+    }
+    char *file = ph_cache_path();
+    g_file_set_contents(file, s->str, s->len, NULL);
+    g_free(file); g_string_free(s, TRUE);
+}
+
+static void ph_emit_class(PluginFormat fmt, const char *line, GList **catalog)
+{
+    gchar **f = g_strsplit(line, "\t", 3);          /* ekey ename ecat */
+    if (f[0] && f[0][0] && f[1] && f[2]) {
+        char *key = ph_unesc(f[0]), *name = ph_unesc(f[1]), *cat = ph_unesc(f[2]);
+        *catalog = g_list_prepend(*catalog, ph_info_new(fmt, key, name, cat));
+        g_free(key); g_free(name); g_free(cat);
+    }
+    g_strfreev(f);
+}
+
+void ph_scan_cached(PluginFormat fmt, const char *path, GList **catalog)
+{
+    if (!ph_cache) return;
+    struct stat st;
+    gint64 mtime = (stat(path, &st) == 0) ? (gint64)st.st_mtime : 0;
+    PhCacheEnt *e = g_hash_table_lookup(ph_cache, path);
+
+    if (!e || e->mtime != mtime) {                  /* miss -> scan out of process */
+        if (ph_progress_cb) ph_progress_cb(path, ph_progress_u);
+        char *self = NULL;
+        char exe[4096];
+        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+        if (n > 0) { exe[n] = 0; self = exe; }
+        if (!self) return;
+        char *argv[] = { self, (char *)"--scan-plugin",
+                         (char *)pluginhost_format_name(fmt), (char *)path, NULL };
+        char *sout = NULL; gint status = 0;
+        gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDERR_TO_DEV_NULL,
+                                   NULL, NULL, &sout, NULL, &status, NULL);
+        if (!ok) { g_free(sout); return; }
+
+        if (!e) { e = g_new0(PhCacheEnt, 1);
+                  e->classes = g_ptr_array_new_with_free_func(g_free);
+                  g_hash_table_insert(ph_cache, g_strdup(path), e); }
+        else g_ptr_array_set_size(e->classes, 0);
+        e->mtime = mtime;
+        if (sout) {
+            gchar **rows = g_strsplit(sout, "\n", -1);
+            for (int i = 0; rows[i]; i++)
+                if (rows[i][0]) g_ptr_array_add(e->classes, g_strdup(rows[i]));
+            g_strfreev(rows); g_free(sout);
+        }
+        ph_cache_dirty = TRUE;
+    }
+    e->seen = TRUE;
+    for (guint i = 0; i < e->classes->len; i++)
+        ph_emit_class(fmt, (const char *)g_ptr_array_index(e->classes, i), catalog);
+}
+
+int pluginhost_scan_helper_main(int argc, char **argv)
+{
+    if (argc < 4) return 2;
+    int proto_fd = dup(STDOUT_FILENO);    /* metadata channel */
+    dup2(STDERR_FILENO, STDOUT_FILENO);   /* plugin spew -> stderr */
+    FILE *out = fdopen(proto_fd, "w");
+    if (!out) return 2;
+
+    PluginFormat fmt = (PluginFormat)-1;
+    for (int i = 0; i < PH_NFORMATS; i++)
+        if (!g_strcmp0(argv[2], ph_fmt_names[i])) fmt = (PluginFormat)i;
+    const char *path = argv[3];
+
+    GList *list = NULL;
+    switch (fmt) {
+#ifdef HAVE_VST2
+        case PH_VST2:   ph_vst2_describe(path, &list);   break;
+#endif
+#ifdef HAVE_VST3
+        case PH_VST3:   ph_vst3_describe(path, &list);   break;
+#endif
+#ifdef HAVE_CLAP
+        case PH_CLAP:   ph_clap_describe(path, &list);   break;
+#endif
+#ifdef HAVE_LADSPA
+        case PH_LADSPA: ph_ladspa_describe(path, &list); break;
+#endif
+        default: break;
+    }
+    for (GList *l = list; l; l = l->next) {
+        PluginInfo *pi = l->data;
+        GString *s = g_string_new("");
+        ph_esc(s, pi->key);  g_string_append_c(s, '\t');
+        ph_esc(s, pi->name); g_string_append_c(s, '\t');
+        ph_esc(s, pi->category);
+        fprintf(out, "%s\n", s->str);
+        g_string_free(s, TRUE);
+    }
+    g_list_free_full(list, ph_info_free);
+    fflush(out);
+    return 0;
+}
+
 static void ph_do_scan(void)
 {
     g_list_free_full(ph_cat, ph_info_free);
     ph_cat = NULL;
+    ph_cache_load();
 
 #ifdef HAVE_LV2
-    ph_lv2_scan(&ph_cat, ph_paths[PH_LV2]);
+    ph_lv2_scan(&ph_cat, ph_paths[PH_LV2]);     /* in-process: lilv reads .ttl */
 #endif
 #ifdef HAVE_VST2
-    ph_vst2_scan(&ph_cat, ph_paths[PH_VST2]);
+    ph_vst2_scan(&ph_cat, ph_paths[PH_VST2]);   /* enumerate -> ph_scan_cached */
 #endif
 #ifdef HAVE_VST3
     ph_vst3_scan(&ph_cat, ph_paths[PH_VST3]);
@@ -113,6 +304,9 @@ static void ph_do_scan(void)
 #ifdef HAVE_LADSPA
     ph_ladspa_scan(&ph_cat, ph_paths[PH_LADSPA]);
 #endif
+
+    ph_cache_save();
+    g_hash_table_destroy(ph_cache); ph_cache = NULL;
 
     /* De-duplicate by (format,key): overlapping search paths (e.g. a dir that is
      * symlinked under two names) must not list the same plugin twice. */

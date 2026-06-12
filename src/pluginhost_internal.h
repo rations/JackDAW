@@ -42,12 +42,29 @@ struct PluginInstance {
 PluginInstance *ph_instance_alloc(PluginFormat fmt, const char *name,
                                   double sr, int max_block);
 
-/* Append PluginInfo* entries to *catalog. extra = GList of char* dirs. */
+/* Append PluginInfo* entries to *catalog. extra = GList of char* dirs.
+ * For the dlopen formats (vst2/vst3/clap/ladspa) these only ENUMERATE files and
+ * route each through ph_scan_cached() — they never load plugin code in-process.
+ * LV2 reads .ttl text via lilv (no code load) so it scans fully in-process. */
 void ph_lv2_scan   (GList **catalog, const GList *extra);
 void ph_vst2_scan  (GList **catalog, const GList *extra);
 void ph_vst3_scan  (GList **catalog, const GList *extra);
 void ph_clap_scan  (GList **catalog, const GList *extra);
 void ph_ladspa_scan(GList **catalog, const GList *extra);
+
+/* Per-file describe: LOAD one plugin file and append its PluginInfo* classes to
+ * *out. Runs ONLY in the out-of-process scanner (jackdaw --scan-plugin), never
+ * in the main process, so Wine/yabridge code stays isolated. */
+void ph_vst2_describe  (const char *path, GList **out);
+void ph_vst3_describe  (const char *path, GList **out);
+void ph_clap_describe  (const char *path, GList **out);
+void ph_ladspa_describe(const char *path, GList **out);
+
+/* Shared out-of-process scan + on-disk cache (in pluginhost.c). A dlopen
+ * backend's directory walk calls this per plugin file: on a cache miss (by
+ * path+mtime) it spawns `jackdaw --scan-plugin <fmt> <path>`, reads the
+ * metadata, caches it, and appends PluginInfo* to *catalog. */
+void ph_scan_cached(PluginFormat fmt, const char *path, GList **catalog);
 
 /* One-time native-UI toolkit init. No-op now that UIs are out-of-process. */
 void ph_lv2_ui_init(int *argc, char ***argv);

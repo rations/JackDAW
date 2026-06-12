@@ -71,7 +71,8 @@ static const char *clap_category(const clap_plugin_descriptor_t *d)
     return "CLAP";
 }
 
-static void clap_scan_file(const char *path, GList **catalog)
+/* Load+describe one .clap — runs only in the out-of-process scanner. */
+void ph_clap_describe(const char *path, GList **catalog)
 {
     if (!ph_path_is_safe(path)) return;
     void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
@@ -111,7 +112,7 @@ static void clap_scan_dir(const char *dir, GList **catalog, int depth)
         if (g_file_test(full, G_FILE_TEST_IS_DIR))
             clap_scan_dir(full, catalog, depth + 1);
         else if (g_str_has_suffix(e, ".clap"))
-            clap_scan_file(full, catalog);
+            ph_scan_cached(PH_CLAP, full, catalog);
         g_free(full);
     }
     g_dir_close(d);

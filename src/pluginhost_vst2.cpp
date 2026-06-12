@@ -55,6 +55,20 @@ static AEffect *vst2_load(const char *path, void **dl_out)
 
 /* ---- Scan ---- */
 
+/* Load+describe one VST2 .so — runs only in the out-of-process scanner. */
+extern "C" void ph_vst2_describe(const char *path, GList **catalog)
+{
+    void *dl = NULL;
+    AEffect *eff = vst2_load(path, &dl);
+    if (!eff) return;
+    char nm[128] = {0};
+    eff->dispatcher(eff, EFF_GET_EFFECT_NAME, 0, 0, nm, 0.0f);
+    if (!nm[0]) { gchar *b = g_path_get_basename(path);
+                  g_strlcpy(nm, b, sizeof(nm)); g_free(b); }
+    *catalog = g_list_prepend(*catalog, ph_info_new(PH_VST2, path, nm, "VST2"));
+    if (dl) dlclose(dl);
+}
+
 static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
 {
     if (depth > 6) return;
@@ -63,20 +77,10 @@ static void vst2_scan_dir(const char *dir, GList **catalog, int depth)
     const char *e;
     while ((e = g_dir_read_name(d))) {
         gchar *full = g_build_filename(dir, e, NULL);
-        if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+        if (g_file_test(full, G_FILE_TEST_IS_DIR))
             vst2_scan_dir(full, catalog, depth + 1);
-        } else if (g_str_has_suffix(e, ".so")) {
-            void *dl = NULL;
-            AEffect *eff = vst2_load(full, &dl);
-            if (eff) {
-                char nm[128] = {0};
-                eff->dispatcher(eff, EFF_GET_EFFECT_NAME, 0, 0, nm, 0.0f);
-                if (!nm[0]) g_strlcpy(nm, e, sizeof(nm));
-                *catalog = g_list_prepend(*catalog,
-                    ph_info_new(PH_VST2, full, nm, "VST2"));
-                if (dl) dlclose(dl);
-            }
-        }
+        else if (g_str_has_suffix(e, ".so") || g_str_has_suffix(e, ".dll"))
+            ph_scan_cached(PH_VST2, full, catalog);
         g_free(full);
     }
     g_dir_close(d);

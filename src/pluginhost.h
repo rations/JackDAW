@@ -42,6 +42,16 @@ void          pluginhost_shutdown(void);
 const GList  *pluginhost_catalog(void);
 void          pluginhost_rescan(void);
 
+/* Optional progress callback, fired with each plugin path as it is scanned
+ * out-of-process (used to drive a scan-progress dialog). */
+void          pluginhost_set_scan_progress(void (*cb)(const char *plugin,
+                                                      void *user), void *user);
+
+/* `jackdaw --scan-plugin <FMT> <path>`: load+describe one plugin in this
+ * throwaway process and print its metadata. Call at the very top of main()
+ * (before GTK/locale init); exit with the returned code if argv matches. */
+int           pluginhost_scan_helper_main(int argc, char **argv);
+
 /* Extra user search directories (persisted by the caller via settings). */
 void          pluginhost_add_search_path(PluginFormat fmt, const char *dir);
 void          pluginhost_remove_search_path(PluginFormat fmt, const char *dir);

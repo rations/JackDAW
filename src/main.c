@@ -236,6 +236,13 @@ guint find_timescale_points(guint32 samplerate,
 
 int main(int argc, char **argv)
 {
+    /* Out-of-process plugin scanner: `jackdaw --scan-plugin <FMT> <path>` loads
+     * one plugin in this throwaway process and prints its metadata, then exits —
+     * before any GTK/JACK/locale init. Keeps Wine/yabridge code out of the main
+     * process during scanning. */
+    if (argc >= 4 && !strcmp(argv[1], "--scan-plugin"))
+        return pluginhost_scan_helper_main(argc, argv);
+
     setlocale(LC_ALL, "");
     setlocale(LC_NUMERIC, "POSIX");
 

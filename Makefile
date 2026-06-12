@@ -66,12 +66,20 @@ PKG_LIBS   := $(shell pkg-config --libs   $(PKGS_REQ) $(PKGS_OPT))
 WARN   := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 COMMON := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) $(PKG_CFLAGS) $(OPT_DEFS)
 
+# make ASAN=1  -> build with AddressSanitizer to pinpoint memory corruption.
+ifeq ($(ASAN),1)
+COMMON += -fsanitize=address -fno-omit-frame-pointer -O1
+endif
+
 CFLAGS   := $(COMMON) -std=gnu99
 CXXFLAGS := $(COMMON) -std=c++17 $(VST3_INC)
 
 LDFLAGS := \
     $(PKG_LIBS) \
     -lm -lpthread -ldl -lstdc++
+ifeq ($(ASAN),1)
+LDFLAGS += -fsanitize=address
+endif
 
 # ---------------------------------------------------------------------------
 # Sources

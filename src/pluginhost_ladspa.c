@@ -66,6 +66,28 @@ static void lad_hint(const LADSPA_PortRangeHint *hint, double sr,
 
 /* ---- Scan ---- */
 
+/* Load+describe one LADSPA .so — runs only in the out-of-process scanner. */
+void ph_ladspa_describe(const char *path, GList **catalog)
+{
+    if (!ph_path_is_safe(path)) return;
+    void *dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    if (!dl) return;
+    LADSPA_Descriptor_Function df =
+        (LADSPA_Descriptor_Function)dlsym(dl, "ladspa_descriptor");
+    if (df) {
+        for (unsigned long i = 0; ; i++) {
+            const LADSPA_Descriptor *de = df(i);
+            if (!de) break;
+            gchar *key = g_strdup_printf("%s\n%lu", path, i);
+            *catalog = g_list_prepend(*catalog,
+                ph_info_new(PH_LADSPA, key,
+                            de->Name ? de->Name : de->Label, "LADSPA"));
+            g_free(key);
+        }
+    }
+    dlclose(dl);
+}
+
 static void lad_scan_dir(const char *dir, GList **catalog, int depth)
 {
     if (depth > 5) return;
@@ -74,30 +96,10 @@ static void lad_scan_dir(const char *dir, GList **catalog, int depth)
     const char *e;
     while ((e = g_dir_read_name(d))) {
         gchar *full = g_build_filename(dir, e, NULL);
-        if (g_file_test(full, G_FILE_TEST_IS_DIR)) {
+        if (g_file_test(full, G_FILE_TEST_IS_DIR))
             lad_scan_dir(full, catalog, depth + 1);
-        } else if (g_str_has_suffix(e, ".so")) {
-            if (ph_path_is_safe(full)) {
-                void *dl = dlopen(full, RTLD_NOW | RTLD_LOCAL);
-                if (dl) {
-                    LADSPA_Descriptor_Function df =
-                        (LADSPA_Descriptor_Function)dlsym(dl, "ladspa_descriptor");
-                    if (df) {
-                        for (unsigned long i = 0; ; i++) {
-                            const LADSPA_Descriptor *de = df(i);
-                            if (!de) break;
-                            gchar *key = g_strdup_printf("%s\n%lu", full, i);
-                            *catalog = g_list_prepend(*catalog,
-                                ph_info_new(PH_LADSPA, key,
-                                            de->Name ? de->Name : de->Label,
-                                            "LADSPA"));
-                            g_free(key);
-                        }
-                    }
-                    dlclose(dl);
-                }
-            }
-        }
+        else if (g_str_has_suffix(e, ".so"))
+            ph_scan_cached(PH_LADSPA, full, catalog);
         g_free(full);
     }
     g_dir_close(d);
