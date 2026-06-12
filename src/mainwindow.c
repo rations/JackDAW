@@ -166,7 +166,7 @@ static void mw_add_instrument_track_cb(GtkMenuItem *item, gpointer data)
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
 
     win->track_counter++;
-    gchar *name = g_strdup_printf("Instrument %u", win->track_counter);
+    gchar *name = g_strdup_printf("MIDI %u", win->track_counter);
     JackDawTrack *t = jackdaw_track_new(name, NULL);
     g_free(name);
     jackdaw_track_set_kind(t, JACKDAW_TRACK_INSTRUMENT);
@@ -549,7 +549,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     m = make_submenu_item(menubar, "_Track");
     menu_item(m, "_Add Empty Track",
               G_CALLBACK(mw_add_track_cb), win, 0, 0, ag);
-    menu_item(m, "Add _Instrument Track",
+    menu_item(m, "Add _MIDI Track",
               G_CALLBACK(mw_add_instrument_track_cb), win, 0, 0, ag);
     menu_item(m, "_Remove Focused Track",
               G_CALLBACK(mw_remove_track_cb), win, 0, 0, ag);

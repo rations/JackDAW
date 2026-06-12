@@ -658,6 +658,13 @@ static void recorder_stop(void)
 static guint8        eng_active_notes[JACKDAW_MAX_TRACKS][16][128];
 static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS];   /* 1 = all-notes-off */
 
+/* One recorded MIDI event: absolute timeline frame + up to 3 bytes. Written by
+ * the RT thread to t->midi_rec_buf, drained on the main thread when recording
+ * stops (midi_finalize_idle) and turned into clip notes. */
+typedef struct { gint64 frame; guint8 size; guint8 data[3]; } MidiRecEvent;
+/* Transport frame at the last stop — closes notes still held when recording ends. */
+static volatile off_t eng_midi_rec_cut;
+
 static int eng_midi_cmp(const void *a, const void *b)
 {
     const PhMidiEvent *ea = a, *eb = b;
@@ -903,24 +910,30 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                                       nframes * sizeof(float));
         }
 
-        /* Record MIDI */
-        if ((tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
+        /* Record MIDI: capture each event with its ABSOLUTE timeline frame so
+         * the main thread can place it into a clip on stop. Instrument tracks
+         * only; the same JACK port also feeds the live monitor above. */
+        if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
             t->midi_in_idx >= 0 &&
             (guint)t->midi_in_idx < engine.midi_in_count &&
-            t->midi_rec_buf) {
+            engine.midi_in[t->midi_in_idx] && t->midi_rec_buf) {
             void *mbuf = jack_port_get_buffer(
                 engine.midi_in[t->midi_in_idx], nframes);
             uint32_t mc = jack_midi_get_event_count(mbuf);
-            uint32_t m;
-            for (m = 0; m < mc; m++) {
+            for (uint32_t m = 0; m < mc; m++) {
                 jack_midi_event_t ev;
-                if (jack_midi_event_get(&ev, mbuf, m) != 0) continue;
-                jack_ringbuffer_write(t->midi_rec_buf,
-                                      (const char *)&ev.size,
-                                      sizeof(ev.size));
-                jack_ringbuffer_write(t->midi_rec_buf,
-                                      (const char *)ev.buffer,
-                                      ev.size);
+                if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1)
+                    continue;
+                if (!(ev.buffer[0] & 0x80)) continue;  /* status byte only */
+                MidiRecEvent r;
+                r.frame   = (gint64)(blk_start + (off_t)ev.time);
+                r.size    = (guint8)(ev.size > 3 ? 3 : ev.size);
+                r.data[0] = ev.buffer[0];
+                r.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
+                r.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
+                if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
+                    jack_ringbuffer_write(t->midi_rec_buf,
+                                          (const char *)&r, sizeof r);
             }
         }
     }
@@ -1604,6 +1617,18 @@ void jackdaw_engine_start_recording(void)
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
         if (!(g_atomic_int_get(&t->state_flags) & TRACK_ARMED)) continue;
+
+        /* Record start frame for every armed track (audio + instrument). */
+        t->rec_start_frame = (off_t)engine.play_pos;
+
+        /* Instrument tracks capture live MIDI into a clip — clear the capture
+         * ringbuffer now (RECORDING isn't set until the end of this function,
+         * so the RT thread is not yet writing to it). No WAV file. */
+        if (jackdaw_track_is_instrument(t)) {
+            if (t->midi_rec_buf) jack_ringbuffer_reset(t->midi_rec_buf);
+            continue;
+        }
+
         if (t->audio_in_idx < 0) continue;
         if (recorder_slots[i].sf) continue; /* already open */
 
@@ -1638,9 +1663,6 @@ void jackdaw_engine_start_recording(void)
         t->rec_peak_count = 0;
         t->rec_peak_block = engine.client ? jack_get_buffer_size(engine.client) : 1024;
 
-        /* Record where playback started so wave views can show the live region */
-        t->rec_start_frame = (off_t)engine.play_pos;
-
         /* Capture latency of the input port, for alignment compensation. */
         t->rec_latency = 0;
         if ((guint)t->audio_in_idx < engine.audio_in_count &&
@@ -1660,6 +1682,90 @@ void jackdaw_engine_start_recording(void)
     g_atomic_int_or(&engine.transport_flags, ENGINE_RECORDING | ENGINE_PLAYING);
 }
 
+/* Drain each instrument track's captured MIDI into a new clip + region on the
+ * timeline. Runs on the MAIN thread (g_idle) after RECORDING is cleared, so the
+ * RT thread is no longer writing the capture ringbuffer (single reader/writer). */
+static gboolean midi_finalize_idle(gpointer data)
+{
+    (void)data;
+    double bpm = (engine.project && engine.project->bpm > 0.0)
+                     ? engine.project->bpm : 120.0;
+    double fpb = (double)engine.sample_rate * 60.0 / bpm;
+    double f_per_tick = (fpb > 0.0) ? fpb / (double)JACKDAW_PPQ : 1.0;
+    guint  bpb = (engine.project && engine.project->beats_per_bar)
+                     ? engine.project->beats_per_bar : 4;
+    off_t  cut = eng_midi_rec_cut;
+
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        JackDawTrack *t = engine.slots[i];
+        if (!t || !jackdaw_track_is_instrument(t) || !t->midi_rec_buf) continue;
+        if (jack_ringbuffer_read_space(t->midi_rec_buf) < sizeof(MidiRecEvent))
+            continue;
+
+        off_t  origin = t->rec_start_frame;
+        gint64 on_frame[16][128];
+        guint8 on_vel[16][128];
+        for (int ch = 0; ch < 16; ch++)
+            for (int p = 0; p < 128; p++) on_frame[ch][p] = -1;
+
+        MidiClip *c = midi_clip_new(0);
+        guint32   max_end    = 0;
+        gint64    last_frame = origin;
+
+        MidiRecEvent r;
+        while (jack_ringbuffer_read_space(t->midi_rec_buf) >= sizeof r) {
+            jack_ringbuffer_read(t->midi_rec_buf, (char *)&r, sizeof r);
+            if (r.frame > last_frame) last_frame = r.frame;
+            int st = r.data[0] & 0xF0, ch = r.data[0] & 0x0F, p = r.data[1] & 0x7F;
+            if (st == 0x90 && r.data[2] > 0) {
+                on_frame[ch][p] = r.frame;
+                on_vel[ch][p]   = r.data[2];
+            } else if (st == 0x80 || (st == 0x90 && r.data[2] == 0)) {
+                if (on_frame[ch][p] < 0) continue;
+                gint64 sf = on_frame[ch][p] - origin; if (sf < 0) sf = 0;
+                gint64 ef = r.frame - origin;          if (ef < sf) ef = sf;
+                MidiNote n = { (guint32)((double)sf / f_per_tick),
+                               (guint32)((double)(ef - sf) / f_per_tick),
+                               (guint8)p, on_vel[ch][p], (guint8)ch };
+                if (n.length < 1) n.length = 1;
+                midi_clip_add_note(c, n);
+                if (n.start + n.length > max_end) max_end = n.start + n.length;
+                on_frame[ch][p] = -1;
+            }
+        }
+
+        /* Close notes still held at the stop point (no note-off was captured). */
+        off_t close_frame = (cut > last_frame) ? cut : last_frame;
+        for (int ch = 0; ch < 16; ch++)
+            for (int p = 0; p < 128; p++) {
+                if (on_frame[ch][p] < 0) continue;
+                gint64 sf = on_frame[ch][p] - origin;       if (sf < 0) sf = 0;
+                gint64 ef = (gint64)close_frame - origin;   if (ef < sf) ef = sf;
+                MidiNote n = { (guint32)((double)sf / f_per_tick),
+                               (guint32)((double)(ef - sf) / f_per_tick),
+                               (guint8)p, on_vel[ch][p], (guint8)ch };
+                if (n.length < 1) n.length = 1;
+                midi_clip_add_note(c, n);
+                if (n.start + n.length > max_end) max_end = n.start + n.length;
+            }
+
+        if (midi_clip_note_count(c) == 0) { midi_clip_free(c); continue; }
+
+        /* Region length = whole bars covering the notes (>= 1 bar). */
+        guint32 bar_ticks = (guint32)JACKDAW_PPQ * bpb;
+        guint32 len = bar_ticks
+            ? ((max_end + bar_ticks - 1) / bar_ticks) * bar_ticks : max_end;
+        if (len == 0) len = bar_ticks ? bar_ticks : 1;
+        c->length = len;
+
+        MidiRegion *reg = midi_region_new(c, 0, len, origin);
+        midi_clip_free(c);   /* region holds the ref */
+        g_ptr_array_add(jackdaw_track_get_midi_regions(t), reg);
+        jackdaw_track_commit_midi(t, fpb);  /* publishes RT snapshot + redraws */
+    }
+    return G_SOURCE_REMOVE;
+}
+
 void jackdaw_engine_stop_recording(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_RECORDING);
@@ -1676,6 +1782,11 @@ void jackdaw_engine_stop_recording(void)
         recorder_slots[i].expected_frames = exp > 0 ? exp : 0;
         g_atomic_int_set(&recorder_slots[i].finalize_req, 1);
     }
+
+    /* Convert any captured MIDI into clips on the main thread (RT has stopped
+     * writing the capture buffer now that RECORDING is cleared). */
+    eng_midi_rec_cut = cut;
+    g_idle_add(midi_finalize_idle, NULL);
 }
 
 void jackdaw_engine_locate(off_t sample)

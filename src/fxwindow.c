@@ -34,8 +34,11 @@ static PluginInfo *fx_browse_for_plugin(GtkWindow *parent)
                                              g_free, NULL);
     for (const GList *l = cat; l; l = l->next) {
         PluginInfo *pi = l->data;
+        /* Display instruments as "MIDI" (user-facing term); the internal
+         * category string ("Instrument|…") still drives type detection. */
+        const char *catdisp = pi->is_instrument ? "MIDI" : pi->category;
         gchar *grp = g_strdup_printf("%s \302\267 %s",
-            pluginhost_format_name(pi->format), pi->category);
+            pluginhost_format_name(pi->format), catdisp);
         GtkTreeIter *parent = g_hash_table_lookup(cats, grp);
         if (!parent) {
             parent = g_new0(GtkTreeIter, 1);
