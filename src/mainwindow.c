@@ -5,6 +5,7 @@
 #include "mainwindow.h"
 #include "jackdaw-engine.h"
 #include "audio_clip.h"
+#include "clipregion.h"
 #include "mixer.h"
 #include "main.h"
 #include "um.h"
@@ -312,8 +313,64 @@ static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     jackdaw_engine_locate(0);
     jackdaw_timeline_set_cursor(win->timeline, 0);
+    gtk_adjustment_set_value(win->timeline->time_adj, 0.0);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->play_button),   FALSE);
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->record_button), FALSE);
+}
+
+static void mw_locate_next_boundary_cb(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    off_t cursor = (off_t)gtk_adjustment_get_value(win->timeline->cursor_adj);
+    off_t next = G_MAXINT64;
+    guint n = jackdaw_project_track_count(win->project);
+    for (guint i = 0; i < n; i++) {
+        JackDawTrack *t = jackdaw_project_get_track(win->project, i);
+        GPtrArray *regions = jackdaw_track_get_regions(t);
+        for (guint j = 0; j < regions->len; j++) {
+            ClipRegion *r = g_ptr_array_index(regions, j);
+            if (r->tl_pos > cursor && r->tl_pos < next)
+                next = r->tl_pos;
+            off_t end = clip_region_end(r);
+            if (end > cursor && end < next)
+                next = end;
+        }
+    }
+    if (next != G_MAXINT64) {
+        jackdaw_engine_locate(next);
+        jackdaw_timeline_set_cursor(win->timeline, next);
+    }
+}
+
+static off_t mw_one_frame(void)
+{
+    /* One frame at 25 fps (the standard audio production frame size).
+     * Falls back to 1920 (48000/25) when JACK is not connected. */
+    jack_nframes_t sr = jackdaw_engine_is_running()
+                        ? jackdaw_engine_get_sample_rate() : 48000u;
+    return (off_t)(sr / 25);
+}
+
+static void mw_step_back_cb(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    off_t pos = (off_t)gtk_adjustment_get_value(win->timeline->cursor_adj);
+    off_t step = mw_one_frame();
+    pos = (pos > step) ? pos - step : 0;
+    jackdaw_engine_locate(pos);
+    jackdaw_timeline_set_cursor(win->timeline, pos);
+}
+
+static void mw_step_forward_cb(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    off_t pos = (off_t)gtk_adjustment_get_value(win->timeline->cursor_adj);
+    pos += mw_one_frame();
+    jackdaw_engine_locate(pos);
+    jackdaw_timeline_set_cursor(win->timeline, pos);
 }
 
 /* ---- Edit menu — undo/redo (Phase 4+ when editing is added) ---- */
@@ -502,7 +559,9 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "button.transport-play {"
             "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
             "button.transport-rec  {"
-            "  background-image:none; background-color:#c0392b; color:#ffffff; }",
+            "  background-image:none; background-color:#c0392b; color:#ffffff; }"
+            "label.transport-time  {"
+            "  font-size:22px; font-weight:bold; font-family:monospace; }",
             -1, NULL);
         gtk_style_context_add_provider_for_screen(
             gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
@@ -591,9 +650,32 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                        FALSE, FALSE, 0);
 
     GtkWidget *btn_start = gtk_button_new_with_label("|◀");
+    gtk_widget_set_tooltip_text(btn_start, "Return to start");
     g_signal_connect(btn_start, "clicked",
                      G_CALLBACK(mw_locate_start_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_start, FALSE, FALSE, 0);
+
+    GtkWidget *btn_step_back = gtk_button_new_with_label("|<<");
+    gtk_widget_set_tooltip_text(btn_step_back, "Step back one frame (25fps)");
+    g_signal_connect(btn_step_back, "clicked",
+                     G_CALLBACK(mw_step_back_cb), win);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_step_back, FALSE, FALSE, 0);
+
+    GtkWidget *btn_step_fwd = gtk_button_new_with_label(">>|");
+    gtk_widget_set_tooltip_text(btn_step_fwd, "Step forward one frame (25fps)");
+    g_signal_connect(btn_step_fwd, "clicked",
+                     G_CALLBACK(mw_step_forward_cb), win);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_step_fwd, FALSE, FALSE, 0);
+
+    GtkWidget *btn_next = gtk_button_new_with_label("▶|");
+    gtk_widget_set_tooltip_text(btn_next, "Jump to next clip boundary");
+    g_signal_connect(btn_next, "clicked",
+                     G_CALLBACK(mw_locate_next_boundary_cb), win);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_next, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(toolbar),
+                       gtk_separator_new(GTK_ORIENTATION_VERTICAL),
+                       FALSE, FALSE, 2);
 
     win->play_button = gtk_toggle_button_new_with_label("▶");
     g_signal_connect(win->play_button, "toggled",
@@ -615,7 +697,9 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(toolbar), win->record_button, FALSE, FALSE, 0);
 
     win->time_label = gtk_label_new("00:00.0");
-    gtk_widget_set_size_request(win->time_label, 90, -1);
+    gtk_style_context_add_class(gtk_widget_get_style_context(win->time_label),
+                                "transport-time");
+    gtk_widget_set_size_request(win->time_label, 160, -1);
     gtk_box_pack_start(GTK_BOX(toolbar), win->time_label, FALSE, FALSE, 8);
 
     /* ---- Function toolbar (DAW tools) ---- */
