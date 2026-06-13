@@ -128,11 +128,17 @@ static gboolean vu_timer_cb(gpointer data)
     gfloat pk_L = 0.0f, pk_R = 0.0f;
     jackdaw_track_get_peaks(strip->track, &pk_L, &pk_R);
 
-    /* RT applies the decay-hold; just mirror it. */
     strip->vu_peak_L = pk_L;
     strip->vu_peak_R = pk_R;
-
     gtk_widget_queue_draw(strip->vu_meter);
+
+    /* Keep Fx button blue whenever the track has at least one effect loaded. */
+    GtkStyleContext *fx_ctx = gtk_widget_get_style_context(strip->btn_fx);
+    if (jackdaw_track_fx_count(strip->track) > 0)
+        gtk_style_context_add_class(fx_ctx, "ts-fx-active");
+    else
+        gtk_style_context_remove_class(fx_ctx, "ts-fx-active");
+
     return G_SOURCE_CONTINUE;
 }
 
@@ -350,6 +356,7 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->btn_mute        = NULL;
     strip->btn_solo        = NULL;
     strip->btn_mono        = NULL;
+    strip->btn_fx          = NULL;
     strip->vol_knob        = NULL;
     strip->pan_knob        = NULL;
     strip->input_combo     = NULL;
@@ -430,16 +437,24 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     GtkWidget *vol_lbl = gtk_label_new("V");
     GtkWidget *pan_lbl = gtk_label_new("P");
 
-    GtkWidget *btn_fx = gtk_button_new_with_label("Fx");
-    gtk_widget_set_size_request(btn_fx, 24, 20);
-    gtk_widget_set_tooltip_text(btn_fx, "Open the effects window for this track");
-    g_signal_connect(btn_fx, "clicked", G_CALLBACK(on_fx_clicked), strip);
+    gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_arm),
+                                "ts-arm");
+    gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_mute),
+                                "ts-mute");
+    gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_solo),
+                                "ts-solo");
+
+    strip->btn_fx = gtk_button_new_with_label("Fx");
+    gtk_widget_set_size_request(strip->btn_fx, 24, 20);
+    gtk_widget_set_tooltip_text(strip->btn_fx, "Open the effects window for this track");
+    gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_fx), "ts-fx");
+    g_signal_connect(strip->btn_fx, "clicked", G_CALLBACK(on_fx_clicked), strip);
 
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_arm,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mute, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_solo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mono, FALSE, FALSE, 1);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), btn_fx,          FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_fx,   FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->vol_knob, FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,         FALSE, FALSE, 2);

@@ -47,6 +47,7 @@ struct _JackDawTrackStrip {
     GtkWidget    *btn_mute;
     GtkWidget    *btn_solo;
     GtkWidget    *btn_mono;      /* mono/stereo record toggle */
+    GtkWidget    *btn_fx;        /* FX window toggle */
 
     GtkWidget    *vol_knob;      /* GtkDrawingArea; KnobData via g_object_set_data */
     GtkWidget    *pan_knob;

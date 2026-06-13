@@ -591,7 +591,16 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "button.transport-rec  {"
             "  background-image:none; background-color:#c0392b; color:#ffffff; }"
             "label.transport-time  {"
-            "  font-size:22px; font-weight:bold; font-family:monospace; }",
+            "  font-size:22px; font-weight:bold; font-family:monospace; }"
+            /* Track strip button active colours */
+            "button.ts-arm:checked  {"
+            "  background-image:none; background-color:#c0392b; color:#ffffff; }"
+            "button.ts-mute:checked {"
+            "  background-image:none; background-color:#e67e22; color:#ffffff; }"
+            "button.ts-solo:checked {"
+            "  background-image:none; background-color:#ffe000; color:#101010; }"
+            "button.ts-fx.ts-fx-active {"
+            "  background-image:none; background-color:#2980b9; color:#ffffff; }",
             -1, NULL);
         gtk_style_context_add_provider_for_screen(
             gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),

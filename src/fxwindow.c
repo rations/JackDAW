@@ -458,6 +458,9 @@ static gboolean fxwin_delete(GtkWidget *w, GdkEvent *e, gpointer data)
     if (fw->fit_id) { g_source_remove(fw->fit_id); fw->fit_id = 0; }
     /* Free all editors (suil instances + timers) BEFORE destroying the window. */
     fxwin_release_all(fw);
+    /* Store index+1 so 0 means "never saved" and index 0 is distinguishable. */
+    g_object_set_data(G_OBJECT(fw->track), "fx-last-index",
+                      GUINT_TO_POINTER(fw->sel_index + 1));
     g_object_set_data(G_OBJECT(fw->track), "fx-window", NULL);
     gtk_widget_destroy(fw->window);
     g_free(fw);
@@ -542,5 +545,18 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     g_object_set_data(G_OBJECT(track), "fx-window", fw);
 
     fxwin_rebuild_list(fw);
+
+    /* Select the last-used effect (or the first on initial open). */
+    guint n = jackdaw_track_fx_count(track);
+    if (n > 0) {
+        guint stored = GPOINTER_TO_UINT(
+            g_object_get_data(G_OBJECT(track), "fx-last-index"));
+        guint sel = (stored > 0) ? MIN(stored - 1, n - 1) : 0;
+        GtkListBoxRow *row =
+            gtk_list_box_get_row_at_index(GTK_LIST_BOX(fw->list_box), (gint)sel);
+        if (row)
+            gtk_list_box_select_row(GTK_LIST_BOX(fw->list_box), row);
+    }
+
     gtk_widget_show_all(fw->window);
 }
