@@ -443,6 +443,8 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
                                 "ts-mute");
     gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_solo),
                                 "ts-solo");
+    gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_mono),
+                                "ts-mono");
 
     strip->btn_fx = gtk_button_new_with_label("Fx");
     gtk_widget_set_size_request(strip->btn_fx, 24, 20);

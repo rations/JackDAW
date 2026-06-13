@@ -585,6 +585,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "  color:#101010; }"
             "spinbutton, spinbutton entry { color:#101010; }"
             "label { color:#101010; }"
+            "tooltip label { color:#ffffff; }"
             /* Transport state colours override the generic button rules. */
             "button.transport-play {"
             "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
@@ -592,6 +593,10 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "  background-image:none; background-color:#c0392b; color:#ffffff; }"
             "label.transport-time  {"
             "  font-size:22px; font-weight:bold; font-family:monospace; }"
+            /* Track strip buttons — compact size */
+            "button.ts-arm, button.ts-mute, button.ts-solo,"
+            "button.ts-mono, button.ts-fx {"
+            "  padding:1px 3px; min-height:0; min-width:0; font-size:10px; }"
             /* Track strip button active colours */
             "button.ts-arm:checked  {"
             "  background-image:none; background-color:#c0392b; color:#ffffff; }"
