@@ -1692,8 +1692,6 @@ static gboolean midi_finalize_idle(gpointer data)
                      ? engine.project->bpm : 120.0;
     double fpb = (double)engine.sample_rate * 60.0 / bpm;
     double f_per_tick = (fpb > 0.0) ? fpb / (double)JACKDAW_PPQ : 1.0;
-    guint  bpb = (engine.project && engine.project->beats_per_bar)
-                     ? engine.project->beats_per_bar : 4;
     off_t  cut = eng_midi_rec_cut;
 
     for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
@@ -1722,10 +1720,9 @@ static gboolean midi_finalize_idle(gpointer data)
                 on_vel[ch][p]   = r.data[2];
             } else if (st == 0x80 || (st == 0x90 && r.data[2] == 0)) {
                 if (on_frame[ch][p] < 0) continue;
-                gint64 sf = on_frame[ch][p] - origin; if (sf < 0) sf = 0;
-                gint64 ef = r.frame - origin;          if (ef < sf) ef = sf;
-                MidiNote n = { (guint32)((double)sf / f_per_tick),
-                               (guint32)((double)(ef - sf) / f_per_tick),
+                gint64 dur = r.frame - on_frame[ch][p]; if (dur < 0) dur = 0;
+                MidiNote n = { (guint32)((double)on_frame[ch][p] / f_per_tick),
+                               (guint32)((double)dur / f_per_tick),
                                (guint8)p, on_vel[ch][p], (guint8)ch };
                 if (n.length < 1) n.length = 1;
                 midi_clip_add_note(c, n);
@@ -1751,16 +1748,11 @@ static gboolean midi_finalize_idle(gpointer data)
 
         if (midi_clip_note_count(c) == 0) { midi_clip_free(c); continue; }
 
-        /* Region length = whole bars covering the notes (>= 1 bar). */
-        guint32 bar_ticks = (guint32)JACKDAW_PPQ * bpb;
-        guint32 len = bar_ticks
-            ? ((max_end + bar_ticks - 1) / bar_ticks) * bar_ticks : max_end;
-        if (len == 0) len = bar_ticks ? bar_ticks : 1;
-        c->length = len;
-
-        MidiRegion *reg = midi_region_new(c, 0, len, origin);
-        midi_clip_free(c);   /* region holds the ref */
-        g_ptr_array_add(jackdaw_track_get_midi_regions(t), reg);
+        /* Merge recorded notes into the track's single clip. */
+        MidiClip *dst = jackdaw_track_get_midi_clip(t);
+        for (guint ni = 0; ni < midi_clip_note_count(c); ni++)
+            midi_clip_add_note(dst, *midi_clip_note(c, ni));
+        midi_clip_free(c);
         jackdaw_track_commit_midi(t, fpb);  /* publishes RT snapshot + redraws */
     }
     return G_SOURCE_REMOVE;

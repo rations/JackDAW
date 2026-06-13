@@ -81,7 +81,7 @@ typedef struct {
     MidiSnapEvent *ev;   /* contiguous, sorted by frame ascending */
 } MidiEventSnapshot;
 
-MidiEventSnapshot *midi_event_snapshot_new (GPtrArray *regions,
+MidiEventSnapshot *midi_event_snapshot_new (MidiClip *clip,
                                             double frames_per_beat);
 void               midi_event_snapshot_free(MidiEventSnapshot *s);
 

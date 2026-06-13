@@ -19,9 +19,9 @@
 #include "jackdaw-engine.h"
 #include "main.h"
 
-#define KEY_W        56     /* keyboard width (px) */
+#define KEY_W        42     /* keyboard width (px) */
 #define VEL_H       110     /* velocity lane height (px) */
-#define DEFAULT_KEYH  10    /* px per semitone row */
+#define DEFAULT_KEYH   8    /* px per semitone row */
 #define EDGE_PX        6    /* grab zone for note-resize (px) */
 #define DEFAULT_VEL  100
 #define RULER_H       18    /* time ruler height (px) */
@@ -29,8 +29,7 @@
 
 typedef struct {
     JackDawTrack   *track;
-    MidiRegion     *region;
-    MidiClip       *clip;       /* borrowed (= region->clip) */
+    MidiClip       *clip;       /* track->midi_clip; absolute tick positions */
     JackDawProject *project;
 
     GtkWidget      *window;
@@ -291,12 +290,6 @@ static gboolean ruler_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     cairo_stroke(cr);
 
     guint bpb = (mw->project && mw->project->beats_per_bar) ? mw->project->beats_per_bar : 4;
-    guint32 sr = jackdaw_engine_get_sample_rate();
-    double fpb = (sr > 0) ? jackdaw_project_frames_per_beat(mw->project, sr) : 0.0;
-    /* beat index (0-based) where the region starts in the project timeline */
-    long region_beat_off = (fpb > 1.0 && mw->region)
-        ? (long)floor((double)mw->region->tl_pos / fpb) : 0L;
-
     double tick0 = gtk_adjustment_get_value(mw->h_adj);
     long beat0 = (long)(tick0 / JACKDAW_PPQ);
     cairo_set_font_size(cr, 10.0);
@@ -305,9 +298,8 @@ static gboolean ruler_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         double x = tick_to_x(mw, (double)beat * JACKDAW_PPQ);
         if (x > a.width) break;
         if (x < 0) continue;
-        long abs_beat = region_beat_off + beat;
-        if (abs_beat % (long)bpb == 0) {
-            long bar_num = abs_beat / (long)bpb + 1;
+        if (beat % (long)bpb == 0) {
+            long bar_num = beat / (long)bpb + 1;
             cairo_set_source_rgba(cr, 0.65, 0.65, 0.78, 0.9);
             cairo_move_to(cr, floor(x) + 0.5, 0);
             cairo_line_to(cr, floor(x) + 0.5, a.height - 1);
@@ -676,17 +668,12 @@ static gboolean transport_update(gpointer data)
 
     /* --- Update playhead position --- */
     off_t pos = jackdaw_engine_get_play_pos();
-    if (mw->region) {
+    {
         guint32 sr = jackdaw_engine_get_sample_rate();
         double  fpb = (sr > 0) ? jackdaw_project_frames_per_beat(mw->project, sr) : 0.0;
-        if (fpb > 1.0) {
-            off_t rel = pos - mw->region->tl_pos;
-            mw->play_tick = (rel >= 0)
-                ? (double)rel / fpb * (double)JACKDAW_PPQ
-                : -1.0;
-        } else {
-            mw->play_tick = -1.0;
-        }
+        mw->play_tick = (fpb > 1.0)
+            ? (double)pos / fpb * (double)JACKDAW_PPQ
+            : -1.0;
     }
 
     /* --- Auto-scroll: keep playhead visible while playing --- */
@@ -738,6 +725,15 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
     return FALSE;
 }
 
+/* ---- snap toggle ---- */
+
+static void mw_snap_btn_toggled(GtkToggleButton *b, gpointer data)
+{
+    MidiWindow *mw = data;
+    jackdaw_project_set_snap_enabled(mw->project,
+                                     gtk_toggle_button_get_active(b));
+}
+
 /* ---- window lifecycle ---- */
 
 static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
@@ -751,24 +747,21 @@ static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
     return TRUE;
 }
 
-void jackdaw_midi_window_open(JackDawTrack *track, MidiRegion *region,
-                             JackDawProject *project)
+void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(track));
-    if (!region || !region->clip) return;
 
     MidiWindow *mw = g_object_get_data(G_OBJECT(track), "midi-window");
-    if (mw) {                                   /* retarget existing window */
-        mw->region = region; mw->clip = region->clip;
+    if (mw) {
         gtk_window_present(GTK_WINDOW(mw->window));
         redraw_all(mw);
         return;
     }
 
     mw = g_new0(MidiWindow, 1);
-    mw->track = track; mw->region = region; mw->clip = region->clip;
+    mw->track = track; mw->clip = jackdaw_track_get_midi_clip(track);
     mw->project = project;
-    mw->tpx = 4.0; mw->key_h = DEFAULT_KEYH;
+    mw->tpx = 20.0; mw->key_h = DEFAULT_KEYH;
     mw->drag_note = -1; mw->ctx_note_idx = -1;
     mw->play_tick = -1.0; mw->prev_play_pos = -1;
 
@@ -780,7 +773,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, MidiRegion *region,
     g_signal_connect(mw->window, "delete-event",    G_CALLBACK(mw_delete),    mw);
     g_signal_connect(mw->window, "key-press-event", G_CALLBACK(mw_key_press), mw);
 
-    mw->h_adj = gtk_adjustment_new(0, 0, (gdouble)mw->clip->length + JACKDAW_PPQ * 16,
+    mw->h_adj = gtk_adjustment_new(0, 0, (gdouble)(JACKDAW_PPQ * 4 * 1000),
                                    JACKDAW_PPQ / 4, JACKDAW_PPQ, 0);
     mw->v_adj = gtk_adjustment_new(48, 0, 128, 1, 12, 0);
 
@@ -831,6 +824,13 @@ void jackdaw_midi_window_open(JackDawTrack *track, MidiRegion *region,
                                 "transport-time");
     gtk_widget_set_size_request(mw->time_label, 160, -1);
     gtk_box_pack_start(GTK_BOX(tb), mw->time_label, FALSE, FALSE, 8);
+
+    GtkWidget *btn_snap = gtk_toggle_button_new_with_label("Snap");
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(btn_snap),
+                                 mw->project && mw->project->snap_enabled);
+    gtk_widget_set_tooltip_text(btn_snap, "Snap notes to grid");
+    g_signal_connect(btn_snap, "toggled", G_CALLBACK(mw_snap_btn_toggled), mw);
+    gtk_box_pack_end(GTK_BOX(tb), btn_snap, FALSE, FALSE, 4);
 
     gtk_box_pack_start(GTK_BOX(vbox), tb, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vbox),

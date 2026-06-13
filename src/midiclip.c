@@ -94,49 +94,31 @@ static int snap_ev_cmp(const void *a, const void *b)
     return (int)(ea->s & 0xF0) - (int)(eb->s & 0xF0);
 }
 
-MidiEventSnapshot *midi_event_snapshot_new(GPtrArray *regions,
+MidiEventSnapshot *midi_event_snapshot_new(MidiClip *clip,
                                            double frames_per_beat)
 {
     MidiEventSnapshot *s = g_new0(MidiEventSnapshot, 1);
-    if (!regions || regions->len == 0 || frames_per_beat <= 0.0) {
+    if (!clip || !clip->notes || clip->notes->len == 0 || frames_per_beat <= 0.0) {
         s->n = 0; s->ev = NULL;
         return s;
     }
 
     GArray *out = g_array_new(FALSE, FALSE, sizeof(MidiSnapEvent));
 
-    for (guint ri = 0; ri < regions->len; ri++) {
-        MidiRegion *r = g_ptr_array_index(regions, ri);
-        if (!r || !r->clip) continue;
-        guint32 win_lo = r->clip_in;
-        guint32 win_hi = r->clip_in + r->length;   /* exclusive */
-
-        for (guint ni = 0; ni < r->clip->notes->len; ni++) {
-            MidiNote *nt = &g_array_index(r->clip->notes, MidiNote, ni);
-            if (nt->velocity == 0) continue;
-            /* Note must start inside the region's window. */
-            if (nt->start < win_lo || nt->start >= win_hi) continue;
-
-            guint32 rel_on  = nt->start - win_lo;
-            guint32 end_tick = nt->start + nt->length;
-            if (end_tick > win_hi) end_tick = win_hi;      /* clamp to window */
-            guint32 rel_off = end_tick - win_lo;
-            if (rel_off <= rel_on) rel_off = rel_on + 1;   /* min length 1 tick */
-
-            guint8 ch = nt->channel & 0x0F;
-            MidiSnapEvent on  = {
-                r->tl_pos + ticks_to_frames(rel_on, frames_per_beat),
-                (guint8)(0x90 | ch), nt->pitch, nt->velocity };
-            MidiSnapEvent off = {
-                r->tl_pos + ticks_to_frames(rel_off, frames_per_beat),
-                (guint8)(0x80 | ch), nt->pitch, 0 };
-            g_array_append_val(out, on);
-            g_array_append_val(out, off);
-        }
+    for (guint ni = 0; ni < clip->notes->len; ni++) {
+        MidiNote *nt = &g_array_index(clip->notes, MidiNote, ni);
+        if (nt->velocity == 0) continue;
+        guint8 ch = nt->channel & 0x0F;
+        MidiSnapEvent on  = { ticks_to_frames(nt->start, frames_per_beat),
+                              (guint8)(0x90 | ch), nt->pitch, nt->velocity };
+        MidiSnapEvent off = { ticks_to_frames(nt->start + nt->length, frames_per_beat),
+                              (guint8)(0x80 | ch), nt->pitch, 0 };
+        g_array_append_val(out, on);
+        g_array_append_val(out, off);
     }
 
     s->n  = out->len;
-    s->ev = (MidiSnapEvent *)g_array_free(out, FALSE);   /* keep the buffer */
+    s->ev = (MidiSnapEvent *)g_array_free(out, FALSE);
     if (s->n > 1)
         qsort(s->ev, s->n, sizeof(MidiSnapEvent), snap_ev_cmp);
     return s;

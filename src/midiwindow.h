@@ -8,10 +8,8 @@
 
 G_BEGIN_DECLS
 
-/* Open (or present) the piano-roll editor for `region` on `track`. Singleton
- * per track: a second call retargets the existing window to `region`. */
-void jackdaw_midi_window_open(JackDawTrack *track, MidiRegion *region,
-                             JackDawProject *project);
+/* Open (or present) the piano-roll editor for `track`. Singleton per track. */
+void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project);
 
 G_END_DECLS
 

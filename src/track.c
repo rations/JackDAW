@@ -37,7 +37,7 @@ static void jackdaw_track_finalize(GObject *obj)
             midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
         g_ptr_array_free(t->retire_midi, TRUE);
     }
-    if (t->midi_regions) g_ptr_array_free(t->midi_regions, TRUE);
+    if (t->midi_clip) midi_clip_free(t->midi_clip);
 
     /* Tear down FX: drop the live chain, then free every instance/chain. */
     JackDawFxChain *live = t->rt_chain;
@@ -91,7 +91,7 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->name          = NULL;
     t->slot          = G_MAXUINT;
     t->kind          = JACKDAW_TRACK_AUDIO;
-    t->midi_regions  = midi_region_list_new();
+    t->midi_clip     = midi_clip_new(JACKDAW_PPQ * 4 * 1000);
     t->rt_midi       = NULL;
     t->retire_midi   = g_ptr_array_new();
     t->regions       = clip_region_list_new();
@@ -231,10 +231,10 @@ gboolean jackdaw_track_is_instrument(JackDawTrack *t)
     return t->kind == JACKDAW_TRACK_INSTRUMENT;
 }
 
-GPtrArray *jackdaw_track_get_midi_regions(JackDawTrack *t)
+MidiClip *jackdaw_track_get_midi_clip(JackDawTrack *t)
 {
     g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
-    return t->midi_regions;
+    return t->midi_clip;
 }
 
 /* Publish a fresh MIDI event snapshot for the RT thread. Mirrors
@@ -248,7 +248,7 @@ void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat)
         midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
     g_ptr_array_set_size(t->retire_midi, 0);
 
-    MidiEventSnapshot *ns = midi_event_snapshot_new(t->midi_regions,
+    MidiEventSnapshot *ns = midi_event_snapshot_new(t->midi_clip,
                                                     frames_per_beat);
     MidiEventSnapshot *old = t->rt_midi;
     g_atomic_pointer_set(&t->rt_midi, ns);

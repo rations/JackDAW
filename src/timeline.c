@@ -237,40 +237,26 @@ static void wave_view_draw_grid(JackDawWaveView *wv, cairo_t *cr,
     }
 }
 
-/* Draw MIDI regions (instrument tracks) as boxes of mini note-rects. */
+/* Draw MIDI notes (instrument tracks) as mini note-rects across the timeline. */
 static void wave_view_draw_midi(JackDawWaveView *wv, cairo_t *cr,
                                 int w, int h, gdouble start, gdouble spp)
 {
-    GPtrArray *regs = jackdaw_track_get_midi_regions(wv->track);
-    if (!regs || spp <= 0.0 || !wv->project) return;
+    MidiClip *clip = jackdaw_track_get_midi_clip(wv->track);
+    if (!clip || spp <= 0.0 || !wv->project) return;
     double fpb = jackdaw_project_frames_per_beat(wv->project,
                                                  jackdaw_engine_get_sample_rate());
     if (fpb <= 0.0) return;
     double f_per_tick = fpb / (double)JACKDAW_PPQ;
 
-    for (guint ri = 0; ri < regs->len; ri++) {
-        MidiRegion *r = g_ptr_array_index(regs, ri);
-        if (!r->clip) continue;
-        off_t  r_end = r->tl_pos + (off_t)(r->length * f_per_tick);
-        double rx0   = (r->tl_pos - start) / spp;
-        double rx1   = (r_end - start) / spp;
-        if (rx1 < 0 || rx0 > w) continue;
-
-        cairo_set_source_rgba(cr, 0.20, 0.30, 0.45, 0.55);
-        cairo_rectangle(cr, rx0, 0, rx1 - rx0, h); cairo_fill(cr);
-        cairo_set_source_rgba(cr, 0.5, 0.7, 1.0, 0.7);
-        cairo_rectangle(cr, rx0 + 0.5, 0.5, rx1 - rx0, h - 1); cairo_stroke(cr);
-
-        guint nc = midi_clip_note_count(r->clip);
-        cairo_set_source_rgb(cr, 0.80, 0.92, 1.0);
-        for (guint i = 0; i < nc; i++) {
-            MidiNote *n = midi_clip_note(r->clip, i);
-            if (n->start < r->clip_in || n->start >= r->clip_in + r->length) continue;
-            double nx = (r->tl_pos + (n->start - r->clip_in) * f_per_tick - start) / spp;
-            double nw = (n->length * f_per_tick) / spp; if (nw < 1) nw = 1;
-            double ny = h - ((n->pitch / 127.0) * (h - 2)) - 1;
-            cairo_rectangle(cr, nx, ny, nw, 2); cairo_fill(cr);
-        }
+    guint nc = midi_clip_note_count(clip);
+    cairo_set_source_rgb(cr, 0.80, 0.92, 1.0);
+    for (guint i = 0; i < nc; i++) {
+        MidiNote *n = midi_clip_note(clip, i);
+        double nx = ((double)n->start * f_per_tick - start) / spp;
+        double nw = ((double)n->length * f_per_tick) / spp; if (nw < 1) nw = 1;
+        double ny = h - ((n->pitch / 127.0) * (h - 2)) - 1;
+        if (nx + nw < 0 || nx > w) continue;
+        cairo_rectangle(cr, nx, ny, nw, 2); cairo_fill(cr);
     }
 }
 
@@ -895,6 +881,14 @@ static void menu_delete_region_cb(GtkMenuItem *item, gpointer data)
     jackdaw_timeline_redraw_all(tl);
 }
 
+static void menu_open_midi_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    if (!tl->menu_track || !jackdaw_track_is_instrument(tl->menu_track)) return;
+    jackdaw_midi_window_open(tl->menu_track, tl->project);
+}
+
 static void menu_gain_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -946,38 +940,16 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
         g_signal_connect(mi, "activate", items[i].cb, tl);
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     }
+
+    if (tl->menu_track && jackdaw_track_is_instrument(tl->menu_track)) {
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+        GtkWidget *mi = gtk_menu_item_new_with_label("Open MIDI Editor");
+        g_signal_connect(mi, "activate", G_CALLBACK(menu_open_midi_cb), tl);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    }
+
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
-}
-
-/* Open the piano roll for the MIDI region under `frame`, creating an empty
- * 4-bar region (snapped to a bar) if there isn't one there. */
-static void timeline_open_midi_at(JackDawTimeline *tl, JackDawTrack *t, off_t frame)
-{
-    double fpb = jackdaw_project_frames_per_beat(tl->project,
-                                                 jackdaw_engine_get_sample_rate());
-    double f_per_tick = (fpb > 0.0) ? fpb / (double)JACKDAW_PPQ : 1.0;
-    GPtrArray *regs = jackdaw_track_get_midi_regions(t);
-
-    MidiRegion *hit = NULL;
-    for (guint i = 0; i < regs->len; i++) {
-        MidiRegion *r = g_ptr_array_index(regs, i);
-        off_t end = r->tl_pos + (off_t)(r->length * f_per_tick);
-        if (frame >= r->tl_pos && frame < end) { hit = r; break; }
-    }
-    if (!hit) {
-        guint bpb = (tl->project && tl->project->beats_per_bar)
-                        ? tl->project->beats_per_bar : 4;
-        guint32 len_ticks = (guint32)JACKDAW_PPQ * bpb * 4;     /* 4 bars */
-        off_t f_per_bar = (off_t)(f_per_tick * (double)JACKDAW_PPQ * bpb);
-        off_t pos = (f_per_bar > 0) ? (frame / f_per_bar) * f_per_bar : frame;
-        MidiClip *c = midi_clip_new(len_ticks);
-        hit = midi_region_new(c, 0, len_ticks, pos);
-        midi_clip_free(c);                     /* region holds the ref */
-        g_ptr_array_add(regs, hit);
-        jackdaw_track_commit_midi(t, fpb);
-    }
-    jackdaw_midi_window_open(t, hit, tl->project);
 }
 
 /* Button press on a WaveView — focus, selection anchor, or context menu */
@@ -990,10 +962,13 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
     off_t sample = timeline_x_to_sample(tl, event->x);
     timeline_set_focused(tl, wv->track);
 
-    /* Double-click on an instrument track opens/creates a MIDI clip. */
+    /* Double-click on an instrument track opens the MIDI window. */
     if (event->type == GDK_2BUTTON_PRESS && wv->track &&
         jackdaw_track_is_instrument(wv->track)) {
-        timeline_open_midi_at(tl, wv->track, sample);
+        tl->sel_active = FALSE;
+        tl->selecting  = FALSE;
+        jackdaw_midi_window_open(wv->track, tl->project);
+        jackdaw_timeline_redraw_all(tl);
         return TRUE;
     }
 

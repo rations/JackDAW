@@ -43,10 +43,10 @@ struct _JackDawTrack {
     guint      slot;          /* index in engine track slot array */
     JackDawTrackKind kind;    /* audio (default) or instrument */
 
-    /* MIDI sequence regions (instrument tracks; main-thread list). The RT
-     * callback reads the immutable rt_midi snapshot, published lock-free like
-     * rt_chain (atomic pointer + deferred retire). */
-    GPtrArray         *midi_regions;  /* GPtrArray of MidiRegion* */
+    /* MIDI clip (instrument tracks; main-thread). Notes stored at absolute tick
+     * positions (tick 0 = timeline frame 0). The RT callback reads the immutable
+     * rt_midi snapshot, published lock-free like rt_chain. */
+    MidiClip          *midi_clip;     /* single clip for the whole timeline */
     gpointer           rt_midi;       /* MidiEventSnapshot* (atomic) */
     GPtrArray         *retire_midi;   /* MidiEventSnapshot* awaiting free */
 
@@ -158,9 +158,9 @@ gboolean         jackdaw_track_is_instrument(JackDawTrack *t);
 
 /* Borrowed MIDI region list — edit in place (regions/notes), then call
  * jackdaw_track_commit_midi() to republish the RT event snapshot. */
-GPtrArray   *jackdaw_track_get_midi_regions(JackDawTrack *t);
+MidiClip    *jackdaw_track_get_midi_clip(JackDawTrack *t);
 
-/* Rebuild + publish the immutable RT MIDI event snapshot from midi_regions.
+/* Rebuild + publish the immutable RT MIDI event snapshot from midi_clip.
  * frames_per_beat = sample_rate * 60 / bpm (caller computes via the project).
  * Emits state-changed so timeline previews redraw. */
 void         jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat);

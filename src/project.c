@@ -315,20 +315,13 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
             g_key_file_set_double(kf, rg, "gain",    r->gain);
         }
 
-        GPtrArray *mr = jackdaw_track_get_midi_regions(t);
-        g_key_file_set_integer(kf, grp, "midi_region_count", mr ? (gint)mr->len : 0);
-        for (guint mi = 0; mr && mi < mr->len; mi++) {
-            MidiRegion *r = g_ptr_array_index(mr, mi);
-            char mg[48]; g_snprintf(mg, sizeof mg, "track%u.midi%u", ti, mi);
-            g_key_file_set_int64  (kf, mg, "tl_pos", r->tl_pos);
-            g_key_file_set_integer(kf, mg, "clip_in", (gint)r->clip_in);
-            g_key_file_set_integer(kf, mg, "length",  (gint)r->length);
-            g_key_file_set_integer(kf, mg, "clip_length",
-                                   (gint)(r->clip ? r->clip->length : r->length));
-            guint nc = r->clip ? midi_clip_note_count(r->clip) : 0;
+        MidiClip *mc = jackdaw_track_get_midi_clip(t);
+        guint nc = mc ? midi_clip_note_count(mc) : 0;
+        g_key_file_set_integer(kf, grp, "midi_note_count", (gint)nc);
+        if (nc > 0) {
             GArray *vals = g_array_new(FALSE, FALSE, sizeof(gint));
             for (guint ni = 0; ni < nc; ni++) {
-                MidiNote *n = midi_clip_note(r->clip, ni);
+                MidiNote *n = midi_clip_note(mc, ni);
                 gint v;
                 v = (gint)n->start;    g_array_append_val(vals, v);
                 v = (gint)n->length;   g_array_append_val(vals, v);
@@ -336,7 +329,8 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
                 v = (gint)n->velocity; g_array_append_val(vals, v);
                 v = (gint)n->channel;  g_array_append_val(vals, v);
             }
-            g_key_file_set_integer_list(kf, mg, "notes", (gint *)vals->data, vals->len);
+            g_key_file_set_integer_list(kf, grp, "midi_notes",
+                                        (gint *)vals->data, vals->len);
             g_array_free(vals, TRUE);
         }
 
@@ -447,16 +441,11 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
         }
         jackdaw_track_commit_regions(t);
 
-        /* midi regions */
-        gint mc = CLAMP(kf_int(kf, grp, "midi_region_count", 0), 0, 100000);
-        GPtrArray *mr = jackdaw_track_get_midi_regions(t);
-        for (gint mi = 0; mi < mc; mi++) {
-            char mg[48]; g_snprintf(mg, sizeof mg, "track%d.midi%d", ti, mi);
-            if (!g_key_file_has_group(kf, mg)) continue;
-            guint32 clip_len = (guint32)MAX(kf_int(kf, mg, "clip_length", JACKDAW_PPQ * 16), 1);
-            MidiClip *c = midi_clip_new(clip_len);
+        /* midi notes (flat list on track group) */
+        {
+            MidiClip *mc = jackdaw_track_get_midi_clip(t);
             gsize nn = 0;
-            gint *notes = g_key_file_get_integer_list(kf, mg, "notes", &nn, NULL);
+            gint *notes = g_key_file_get_integer_list(kf, grp, "midi_notes", &nn, NULL);
             for (gsize k = 0; notes && k + 5 <= nn; k += 5) {
                 MidiNote n;
                 n.start    = (guint32)MAX(notes[k], 0);
@@ -464,15 +453,9 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
                 n.pitch    = (guint8)CLAMP(notes[k + 2], 0, 127);
                 n.velocity = (guint8)CLAMP(notes[k + 3], 0, 127);
                 n.channel  = (guint8)CLAMP(notes[k + 4], 0, 15);
-                midi_clip_add_note(c, n);
+                midi_clip_add_note(mc, n);
             }
             g_free(notes);
-            MidiRegion *r = midi_region_new(c,
-                (guint32)MAX(kf_int(kf, mg, "clip_in", 0), 0),
-                (guint32)MAX(kf_int(kf, mg, "length", (gint)clip_len), 1),
-                kf_i64(kf, mg, "tl_pos", 0));
-            midi_clip_free(c);               /* region holds its own ref */
-            g_ptr_array_add(mr, r);
         }
         jackdaw_track_commit_midi(t, fpb);
 
