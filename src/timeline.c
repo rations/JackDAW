@@ -1052,7 +1052,7 @@ static gboolean timeline_wave_released(GtkWidget *widget,
     return FALSE;
 }
 
-/* Mouse-wheel on a WaveView: scroll (Ctrl = zoom) */
+/* Mouse-wheel on a WaveView: zoom (Ctrl = pan) */
 static gboolean timeline_wave_scroll(GtkWidget *widget,
                                       GdkEventScroll *event, gpointer data)
 {
@@ -1060,13 +1060,7 @@ static gboolean timeline_wave_scroll(GtkWidget *widget,
     (void)widget;
 
     if (event->state & GDK_CONTROL_MASK) {
-        if (event->direction == GDK_SCROLL_UP ||
-            (event->direction == GDK_SCROLL_SMOOTH && event->delta_y < 0))
-            jackdaw_timeline_zoom_in(tl);
-        else if (event->direction == GDK_SCROLL_DOWN ||
-                 (event->direction == GDK_SCROLL_SMOOTH && event->delta_y > 0))
-            jackdaw_timeline_zoom_out(tl);
-    } else {
+        /* Ctrl+scroll: pan left/right */
         gdouble spp  = gtk_adjustment_get_value(tl->zoom_adj);
         gdouble step = spp * 80.0;  /* 80 pixels worth of samples */
         gdouble val  = gtk_adjustment_get_value(tl->time_adj);
@@ -1078,6 +1072,14 @@ static gboolean timeline_wave_scroll(GtkWidget *widget,
             val += step;
         if (val < 0.0) val = 0.0;
         gtk_adjustment_set_value(tl->time_adj, val);
+    } else {
+        /* Plain scroll: zoom in/out */
+        if (event->direction == GDK_SCROLL_UP ||
+            (event->direction == GDK_SCROLL_SMOOTH && event->delta_y < 0))
+            jackdaw_timeline_zoom_in(tl);
+        else if (event->direction == GDK_SCROLL_DOWN ||
+                 (event->direction == GDK_SCROLL_SMOOTH && event->delta_y > 0))
+            jackdaw_timeline_zoom_out(tl);
     }
     return TRUE;
 }
