@@ -191,6 +191,36 @@ static void mw_remove_track_cb(GtkMenuItem *item, gpointer data)
     jackdaw_project_remove_track(win->project, t);
 }
 
+static gboolean mw_tracks_box_press_cb(GtkWidget *widget, GdkEventButton *ev,
+                                        gpointer data)
+{
+    (void)widget;
+    if (ev->button != 3) return FALSE;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+
+    GtkWidget *menu = gtk_menu_new();
+
+    GtkWidget *mi_add = gtk_menu_item_new_with_label("Add Track");
+    g_signal_connect(mi_add, "activate", G_CALLBACK(mw_add_track_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_add);
+
+    GtkWidget *mi_midi = gtk_menu_item_new_with_label("Add MIDI Track");
+    g_signal_connect(mi_midi, "activate",
+                     G_CALLBACK(mw_add_instrument_track_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_midi);
+
+    GtkWidget *mi_sep = gtk_separator_menu_item_new();
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_sep);
+
+    GtkWidget *mi_rem = gtk_menu_item_new_with_label("Remove Focused Track");
+    g_signal_connect(mi_rem, "activate", G_CALLBACK(mw_remove_track_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_rem);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE;
+}
+
 /* ---- Transport ---- */
 
 /* Toggle a CSS style class on a widget based on a boolean. */
@@ -682,7 +712,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                      G_CALLBACK(mw_transport_play_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), win->play_button, FALSE, FALSE, 0);
 
-    GtkWidget *btn_pause = gtk_button_new_with_label("⏸");
+    GtkWidget *btn_pause = gtk_button_new_with_label("||");
     g_signal_connect(btn_pause, "clicked", G_CALLBACK(mw_pause_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_pause, FALSE, FALSE, 0);
 
@@ -768,6 +798,13 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
 
     g_signal_connect(tl_widget, "position-changed",
                      G_CALLBACK(mw_on_position_changed), win);
+
+    /* tracks_scroll auto-wraps tracks_box in a GtkViewport; connect there
+       since GtkBox has no GdkWindow and never receives raw button events. */
+    GtkWidget *tl_viewport = gtk_bin_get_child(GTK_BIN(win->timeline->tracks_scroll));
+    gtk_widget_add_events(tl_viewport, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(tl_viewport, "button-press-event",
+                     G_CALLBACK(mw_tracks_box_press_cb), win);
 
     win->transport_timer = g_timeout_add(100, mw_transport_timer, win);
 
