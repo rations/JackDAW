@@ -137,6 +137,11 @@ struct _JackDawTimeline {
 
     guint             update_timer;   /* 50 ms GSource id */
     off_t             prev_play_pos;  /* detects playhead motion for auto-scroll */
+
+    /* Ruler drag-playhead state */
+    gboolean          ruler_drag_active;
+    gdouble           ruler_drag_last_x;  /* last pointer x within the ruler */
+    guint             ruler_drag_scroll;  /* GSource id for edge auto-scroll */
 };
 
 struct _JackDawTimelineClass {

@@ -1172,6 +1172,108 @@ static void on_project_timing_changed(JackDawProject *p, gpointer data)
     jackdaw_timeline_redraw_all(JACKDAW_TIMELINE(data));
 }
 
+/* ---- Ruler drag-playhead ---- */
+
+static gboolean ruler_edge_scroll(gpointer data)
+{
+    JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    if (!tl->ruler_drag_active) {
+        tl->ruler_drag_scroll = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(GTK_WIDGET(tl->ruler), &alloc);
+    gdouble w   = (gdouble)alloc.width;
+    gdouble x   = tl->ruler_drag_last_x;
+    gdouble spp = gtk_adjustment_get_value(tl->zoom_adj);
+
+    gdouble overshoot;
+    if (x < 0.0)    overshoot = x;        /* negative: past left edge */
+    else if (x > w) overshoot = x - w;    /* positive: past right edge */
+    else {
+        tl->ruler_drag_scroll = 0;
+        return G_SOURCE_REMOVE;
+    }
+
+    /* Scroll proportional to overshoot (pixels per 40 ms tick). */
+    gdouble scroll_px = CLAMP(overshoot * 0.4, -400.0, 400.0);
+    gdouble new_start = gtk_adjustment_get_value(tl->time_adj) + scroll_px * spp;
+    if (new_start < 0.0) new_start = 0.0;
+    gtk_adjustment_set_value(tl->time_adj, new_start);
+
+    /* Keep playhead pinned to the edge being crossed. */
+    gdouble edge_x = (x < 0.0) ? 0.0 : w;
+    off_t frame = (off_t)(gtk_adjustment_get_value(tl->time_adj) + edge_x * spp);
+    if (frame < 0) frame = 0;
+    timeline_set_playhead(tl, frame);
+
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean ruler_button_press_cb(GtkWidget *widget, GdkEventButton *ev,
+                                       gpointer data)
+{
+    (void)widget;
+    if (ev->button != 1) return FALSE;
+    JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+
+    gdouble spp   = gtk_adjustment_get_value(tl->zoom_adj);
+    gdouble start = gtk_adjustment_get_value(tl->time_adj);
+    off_t frame   = (off_t)(start + ev->x * spp);
+    if (frame < 0) frame = 0;
+
+    tl->ruler_drag_active = TRUE;
+    tl->ruler_drag_last_x = ev->x;
+    timeline_set_playhead(tl, frame);
+    return TRUE;
+}
+
+static gboolean ruler_motion_cb(GtkWidget *widget, GdkEventMotion *ev,
+                                  gpointer data)
+{
+    JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    if (!tl->ruler_drag_active) return FALSE;
+
+    tl->ruler_drag_last_x = ev->x;
+
+    GtkAllocation alloc;
+    gtk_widget_get_allocation(widget, &alloc);
+    gdouble w     = (gdouble)alloc.width;
+    gdouble spp   = gtk_adjustment_get_value(tl->zoom_adj);
+    gdouble start = gtk_adjustment_get_value(tl->time_adj);
+
+    if (ev->x >= 0.0 && ev->x <= w) {
+        /* Inside ruler: move playhead directly. */
+        off_t frame = (off_t)(start + ev->x * spp);
+        if (frame < 0) frame = 0;
+        timeline_set_playhead(tl, frame);
+
+        if (tl->ruler_drag_scroll) {
+            g_source_remove(tl->ruler_drag_scroll);
+            tl->ruler_drag_scroll = 0;
+        }
+    } else if (!tl->ruler_drag_scroll) {
+        /* Past an edge: start auto-scroll timer. */
+        tl->ruler_drag_scroll = g_timeout_add(40, ruler_edge_scroll, tl);
+    }
+    return TRUE;
+}
+
+static gboolean ruler_button_release_cb(GtkWidget *widget, GdkEventButton *ev,
+                                          gpointer data)
+{
+    (void)widget;
+    if (ev->button != 1) return FALSE;
+    JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    tl->ruler_drag_active = FALSE;
+    if (tl->ruler_drag_scroll) {
+        g_source_remove(tl->ruler_drag_scroll);
+        tl->ruler_drag_scroll = 0;
+    }
+    return TRUE;
+}
+
 static void jackdaw_timeline_finalize(GObject *obj)
 {
     JackDawTimeline *tl = JACKDAW_TIMELINE(obj);
@@ -1179,6 +1281,10 @@ static void jackdaw_timeline_finalize(GObject *obj)
     if (tl->update_timer) {
         g_source_remove(tl->update_timer);
         tl->update_timer = 0;
+    }
+    if (tl->ruler_drag_scroll) {
+        g_source_remove(tl->ruler_drag_scroll);
+        tl->ruler_drag_scroll = 0;
     }
     g_object_unref(tl->time_adj);
     g_object_unref(tl->zoom_adj);
@@ -1225,6 +1331,9 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->wave_views         = g_hash_table_new(g_direct_hash, g_direct_equal);
     tl->update_timer  = 0;
     tl->prev_play_pos = 0;
+    tl->ruler_drag_active = FALSE;
+    tl->ruler_drag_last_x = 0.0;
+    tl->ruler_drag_scroll = 0;
     tl->sel_active    = FALSE;
     tl->selecting     = FALSE;
     tl->sel_start     = 0;
@@ -1274,6 +1383,16 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
     tl->ruler = JACKDAW_TIME_RULER(
         jackdaw_time_ruler_new(tl->time_adj, tl->zoom_adj, tl->cursor_adj, sr));
     tl->ruler->project = project;
+
+    gtk_widget_add_events(GTK_WIDGET(tl->ruler),
+        GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+        GDK_BUTTON1_MOTION_MASK);
+    g_signal_connect(GTK_WIDGET(tl->ruler), "button-press-event",
+        G_CALLBACK(ruler_button_press_cb), tl);
+    g_signal_connect(GTK_WIDGET(tl->ruler), "motion-notify-event",
+        G_CALLBACK(ruler_motion_cb), tl);
+    g_signal_connect(GTK_WIDGET(tl->ruler), "button-release-event",
+        G_CALLBACK(ruler_button_release_cb), tl);
 
     gtk_box_pack_start(GTK_BOX(ruler_row), spacer,         FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ruler_row), GTK_WIDGET(tl->ruler), TRUE, TRUE, 0);
