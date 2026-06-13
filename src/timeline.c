@@ -353,7 +353,7 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
                     gfloat mx = out_max[x * ch + c] * gain;
                     if (mn > mx) continue;
 
-                    double half  = (double)(band_h / 2);
+                    double half  = (double)(band_h / 2) * 3.0;
                     double y_top = mid_y - mx * half;
                     double y_bot = mid_y - mn * half;
                     if (y_top < band_y0)          y_top = band_y0;
@@ -456,7 +456,7 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
                 int ix1 = (int)x1;
                 if (ix1 >= w) ix1 = w - 1;
 
-                double half = h * 0.5;
+                double half = h * 1.5;
                 double mid  = h * 0.5;
 
                 for (int x = ix0; x <= ix1; x++) {
