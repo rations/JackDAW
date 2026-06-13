@@ -604,6 +604,15 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
               G_CALLBACK(mw_quit_cb), win,
               GDK_KEY_q, GDK_CONTROL_MASK, ag);
 
+    /* Edit */
+    m = make_submenu_item(menubar, "_Edit");
+    menu_item(m, "_Undo",
+              G_CALLBACK(mw_undo_cb), win,
+              GDK_KEY_z, GDK_CONTROL_MASK, ag);
+    menu_item(m, "_Redo",
+              G_CALLBACK(mw_redo_cb), win,
+              GDK_KEY_y, GDK_CONTROL_MASK, ag);
+
     /* Track */
     m = make_submenu_item(menubar, "_Track");
     menu_item(m, "_Add Empty Track",
@@ -621,15 +630,6 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
               G_CALLBACK(mw_transport_stop_cb), win, 0, 0, ag);
     menu_item(m, "Locate to _Start  [Home]",
               G_CALLBACK(mw_locate_start_cb), win, 0, 0, ag);
-
-    /* Edit */
-    m = make_submenu_item(menubar, "_Edit");
-    menu_item(m, "_Undo",
-              G_CALLBACK(mw_undo_cb), win,
-              GDK_KEY_z, GDK_CONTROL_MASK, ag);
-    menu_item(m, "_Redo",
-              G_CALLBACK(mw_redo_cb), win,
-              GDK_KEY_y, GDK_CONTROL_MASK, ag);
 
     /* View */
     m = make_submenu_item(menubar, "_View");
