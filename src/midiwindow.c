@@ -1220,7 +1220,12 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->btn_play             = gtk_toggle_button_new_with_label("▶");
     mw->btn_pause            = gtk_button_new_with_label("||");
     mw->btn_stop             = gtk_button_new_with_label("■");
-    mw->btn_loop             = gtk_toggle_button_new_with_label("⟳");
+    mw->btn_loop             = gtk_toggle_button_new();
+    {
+        GtkWidget *loop_lbl = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(loop_lbl), "<span size='xx-large'>⟳</span>");
+        gtk_container_add(GTK_CONTAINER(mw->btn_loop), loop_lbl);
+    }
 
     gtk_widget_set_tooltip_text(btn_start,     "Return to start  [Home]");
     gtk_widget_set_tooltip_text(btn_step_back, "Step back one frame (25fps)");
@@ -1247,9 +1252,9 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(tb),
                        gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 2);
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_play,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tb), mw->btn_loop,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_pause, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_stop,  FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(tb), mw->btn_loop,  FALSE, FALSE, 0);
 
     mw->time_label = gtk_label_new("00:00.0");
     gtk_style_context_add_class(gtk_widget_get_style_context(mw->time_label),

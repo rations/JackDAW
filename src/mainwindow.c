@@ -636,7 +636,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "button.transport-rec  {"
             "  background-image:none; background-color:#c0392b; color:#ffffff; }"
             "button.transport-loop {"
-            "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
+            "  background-image:none; background-color:#8ce68c; color:#101010; }"
             "label.transport-time  {"
             "  font-size:22px; font-weight:bold; font-family:monospace; }"
             /* Track strip buttons — compact size */
@@ -792,6 +792,17 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                      G_CALLBACK(mw_transport_play_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), win->play_button, FALSE, FALSE, 0);
 
+    win->loop_button = gtk_toggle_button_new();
+    {
+        GtkWidget *loop_lbl = gtk_label_new(NULL);
+        gtk_label_set_markup(GTK_LABEL(loop_lbl), "<span size='xx-large'>⟳</span>");
+        gtk_container_add(GTK_CONTAINER(win->loop_button), loop_lbl);
+    }
+    gtk_widget_set_tooltip_text(win->loop_button, "Loop region");
+    g_signal_connect(win->loop_button, "toggled",
+                     G_CALLBACK(mw_transport_loop_cb), win);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->loop_button, FALSE, FALSE, 0);
+
     GtkWidget *btn_pause = gtk_button_new_with_label("||");
     g_signal_connect(btn_pause, "clicked", G_CALLBACK(mw_pause_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_pause, FALSE, FALSE, 0);
@@ -805,12 +816,6 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     g_signal_connect(win->record_button, "toggled",
                      G_CALLBACK(mw_transport_record_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), win->record_button, FALSE, FALSE, 0);
-
-    win->loop_button = gtk_toggle_button_new_with_label("⟳");
-    gtk_widget_set_tooltip_text(win->loop_button, "Loop region");
-    g_signal_connect(win->loop_button, "toggled",
-                     G_CALLBACK(mw_transport_loop_cb), win);
-    gtk_box_pack_start(GTK_BOX(toolbar), win->loop_button, FALSE, FALSE, 0);
 
     win->time_label = gtk_label_new("00:00.0");
     gtk_style_context_add_class(gtk_widget_get_style_context(win->time_label),
