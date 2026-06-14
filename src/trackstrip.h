@@ -61,6 +61,7 @@ struct _JackDawTrackStrip {
     guint         vu_timer;
 
     gboolean      suppress_update;
+    gboolean      self_update;   /* this strip is the source of a track change */
 };
 
 struct _JackDawTrackStripClass {

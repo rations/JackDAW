@@ -5,6 +5,7 @@
 #include "mixer.h"
 #include "knob.h"
 #include "track.h"
+#include "fxwindow.h"
 #include "jackdaw-engine.h"
 
 G_DEFINE_TYPE(JackDawMixer, jackdaw_mixer, GTK_TYPE_BOX)
@@ -19,8 +20,20 @@ typedef struct {
     GtkWidget    *pan;         /* knob (tracks only) */
     GtkWidget    *btn_mute;
     GtkWidget    *btn_solo;
-    gboolean      suppress;
+    GtkWidget    *btn_fx;
+    GtkWidget    *db_popup;    /* floating "+4.25dB" readout while dragging */
+    GtkWidget    *db_popup_lbl;
+    gboolean      suppress;    /* gate UI callbacks during programmatic set */
+    gboolean      self_update; /* this strip is the source of a track change */
 } MixerStrip;
+
+/* ---- Fader taper ----
+ * The fader spans -42 dB (bottom) .. +12 dB (top), linear in dB so the motion
+ * is smooth and the 6 dB tick marks are evenly spaced. 0 dB (unity) sits at
+ * 42/54 ≈ 0.78 of the travel. */
+#define FADER_DB_MIN   (-42.0)
+#define FADER_DB_MAX   ( 12.0)
+#define FADER_DB_SPAN  ( 54.0)   /* MAX - MIN */
 
 /* ---- VU meter (same look as the track strip meter) ---- */
 
@@ -66,15 +79,54 @@ static gboolean mix_vu_draw(GtkWidget *w, cairo_t *cr, gpointer data)
  * quarters — like a normal mixing-desk fader. */
 static double fader_pos_to_db(double p)
 {
-    if (p >= 0.75) return (p - 0.75) / 0.25 * 6.0;   /* 0 .. +6 dB */
-    return -60.0 * (1.0 - p / 0.75);                  /* -60 .. 0 dB */
+    return FADER_DB_MIN + CLAMP(p, 0.0, 1.0) * FADER_DB_SPAN;
 }
 
 static double fader_db_to_pos(double db)
 {
-    if (db >= 0.0)   return 0.75 + CLAMP(db, 0.0, 6.0) / 6.0 * 0.25;
-    if (db <= -60.0) return 0.0;
-    return 0.75 * (1.0 + db / 60.0);
+    return (CLAMP(db, FADER_DB_MIN, FADER_DB_MAX) - FADER_DB_MIN) / FADER_DB_SPAN;
+}
+
+/* ---- Floating dB read-out (shown beside the fader while dragging) ---- */
+
+static void mix_db_popup_show(MixerStrip *s, double db)
+{
+    if (!s->db_popup) {
+        s->db_popup = gtk_window_new(GTK_WINDOW_POPUP);
+        gtk_window_set_type_hint(GTK_WINDOW(s->db_popup),
+                                 GDK_WINDOW_TYPE_HINT_TOOLTIP);
+        gtk_window_set_resizable(GTK_WINDOW(s->db_popup), FALSE);
+        s->db_popup_lbl = gtk_label_new("");
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(s->db_popup_lbl), "mix-db-pop");
+        gtk_container_add(GTK_CONTAINER(s->db_popup), s->db_popup_lbl);
+        gtk_widget_show(s->db_popup_lbl);
+    }
+
+    char buf[32];
+    if (db <= FADER_DB_MIN + 0.01) g_snprintf(buf, sizeof buf, "-inf");
+    else                           g_snprintf(buf, sizeof buf, "%+.2fdB", db);
+    gtk_label_set_text(GTK_LABEL(s->db_popup_lbl), buf);
+
+    /* Position to the right of the fader, level with the current handle. */
+    GtkWidget  *top = gtk_widget_get_toplevel(s->fader);
+    GdkWindow  *tw  = top ? gtk_widget_get_window(top) : NULL;
+    if (tw) {
+        gint ox, oy, fx = 0, fy = 0;
+        gdk_window_get_origin(tw, &ox, &oy);
+        gtk_widget_translate_coordinates(s->fader, top, 0, 0, &fx, &fy);
+        GtkAllocation fa; gtk_widget_get_allocation(s->fader, &fa);
+        double pos = gtk_range_get_value(GTK_RANGE(s->fader)); /* 0..1, 1 = top */
+        gtk_window_move(GTK_WINDOW(s->db_popup),
+                        ox + fx + fa.width + 2,
+                        oy + fy + (gint)((1.0 - pos) * fa.height) - 9);
+    }
+    gtk_widget_show(s->db_popup);
+}
+
+static void mix_db_popup_hide(MixerStrip *s)
+{
+    if (s->db_popup) gtk_widget_hide(s->db_popup);
 }
 
 /* ---- Callbacks ---- */
@@ -84,32 +136,91 @@ static void mix_fader_changed(GtkRange *range, gpointer data)
     MixerStrip *s = data;
     if (s->suppress) return;
     double db  = fader_pos_to_db(gtk_range_get_value(range));
-    gfloat lin = (db <= -59.5) ? 0.0f : (gfloat)pow(10.0, db / 20.0);
+    gfloat lin = (gfloat)pow(10.0, db / 20.0);
+    s->self_update = TRUE;
     if (s->track)
         jackdaw_track_set_volume(s->track, lin);
     else
         jackdaw_project_set_master_volume(s->mixer->project, lin);
+    s->self_update = FALSE;
+    mix_db_popup_show(s, db);
+}
+
+static gboolean mix_fader_button(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w;
+    MixerStrip *s = data;
+    /* Double-click returns the fader to 0 dB (unity). */
+    if (e->type == GDK_2BUTTON_PRESS && e->button == 1) {
+        gtk_range_set_value(GTK_RANGE(s->fader), fader_db_to_pos(0.0));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static gboolean mix_fader_release(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w; (void)e;
+    mix_db_popup_hide((MixerStrip *)data);
+    return FALSE;
 }
 
 static void mix_pan_changed(double pan, gpointer data)
 {
     MixerStrip *s = data;
     if (s->suppress || !s->track) return;
+    s->self_update = TRUE;
     jackdaw_track_set_pan(s->track, (gfloat)pan);
+    s->self_update = FALSE;
 }
 
 static void mix_mute_toggled(GtkToggleButton *b, gpointer data)
 {
     MixerStrip *s = data;
     if (s->suppress || !s->track) return;
+    s->self_update = TRUE;
     jackdaw_track_set_muted(s->track, gtk_toggle_button_get_active(b));
+    s->self_update = FALSE;
 }
 
 static void mix_solo_toggled(GtkToggleButton *b, gpointer data)
 {
     MixerStrip *s = data;
     if (s->suppress || !s->track) return;
+    s->self_update = TRUE;
     jackdaw_track_set_soloed(s->track, gtk_toggle_button_get_active(b));
+    s->self_update = FALSE;
+}
+
+static void mix_fx_clicked(GtkButton *b, gpointer data)
+{
+    (void)b;
+    MixerStrip *s = data;
+    if (s->track) jackdaw_fx_window_open(s->track, s->mixer->project);
+}
+
+/* Reflect external track changes (e.g. from the track strip) onto this strip. */
+static void mix_track_state_changed(JackDawTrack *t, gpointer data)
+{
+    MixerStrip *s = g_object_get_data(G_OBJECT(data), "mixer-strip");
+    if (!s || s->self_update) return;
+    s->suppress = TRUE;
+    if (s->btn_mute)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_mute),
+                                     jackdaw_track_is_muted(t));
+    if (s->btn_solo)
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_solo),
+                                     jackdaw_track_is_soloed(t));
+    if (s->pan)
+        knob_set_value(s->pan, (double)jackdaw_track_get_pan(t));
+    s->suppress = FALSE;
+}
+
+static void mix_strip_destroy(GtkWidget *w, gpointer data)
+{
+    (void)w;
+    MixerStrip *s = data;
+    if (s->db_popup) { gtk_widget_destroy(s->db_popup); s->db_popup = NULL; }
 }
 
 /* ---- Strip construction ---- */
@@ -144,25 +255,33 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     GtkWidget *mid = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
 
     s->fader = gtk_scale_new_with_range(GTK_ORIENTATION_VERTICAL,
-                                        0.0, 1.0, 0.005);
+                                        0.0, 1.0, 0.001);   /* fine = smooth */
     gtk_range_set_inverted(GTK_RANGE(s->fader), TRUE);  /* up = louder */
     gtk_scale_set_draw_value(GTK_SCALE(s->fader), FALSE);
-    gtk_widget_set_size_request(s->fader, 34, 130);
-    /* Reference marks at 0 dB (~¾) and +6 dB (top). */
-    gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos(0.0),
-                       GTK_POS_LEFT, "0");
-    gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos(-12.0),
-                       GTK_POS_LEFT, "-12");
+    gtk_widget_set_size_request(s->fader, 34, 150);
+    gtk_style_context_add_class(gtk_widget_get_style_context(s->fader),
+                                "mix-fader");
+    /* Tick marks every 6 dB across the whole travel (+12 .. -42). */
+    for (int d = (int)FADER_DB_MAX; d >= (int)FADER_DB_MIN; d -= 6) {
+        char m[8]; g_snprintf(m, sizeof m, "%d", d);
+        gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos((double)d),
+                           GTK_POS_LEFT, m);
+    }
     {
         gfloat vol = track ? jackdaw_track_get_volume(track)
                            : jackdaw_project_get_master_volume(mixer->project);
-        double db  = (vol > 0.0001f) ? 20.0 * log10((double)vol) : -60.0;
+        double db  = (vol > 0.0001f) ? 20.0 * log10((double)vol) : FADER_DB_MIN;
         s->suppress = TRUE;
         gtk_range_set_value(GTK_RANGE(s->fader), fader_db_to_pos(db));
         s->suppress = FALSE;
     }
+    gtk_widget_add_events(s->fader, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK);
     g_signal_connect(s->fader, "value-changed",
                      G_CALLBACK(mix_fader_changed), s);
+    g_signal_connect(s->fader, "button-press-event",
+                     G_CALLBACK(mix_fader_button), s);
+    g_signal_connect(s->fader, "button-release-event",
+                     G_CALLBACK(mix_fader_release), s);
 
     s->vu = gtk_drawing_area_new();
     gtk_widget_set_size_request(s->vu, 18, 120);
@@ -172,13 +291,22 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     gtk_box_pack_start(GTK_BOX(mid), s->vu,    FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), mid, TRUE, TRUE, 0);
 
-    /* Mute / solo (tracks only) */
+    /* Mute / Solo / Fx (tracks only) — same look & padding as the track strip. */
     if (track) {
         GtkWidget *ms = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+        gtk_widget_set_halign(ms, GTK_ALIGN_CENTER);
         s->btn_mute = gtk_toggle_button_new_with_label("M");
         s->btn_solo = gtk_toggle_button_new_with_label("S");
-        gtk_widget_set_size_request(s->btn_mute, 26, 20);
-        gtk_widget_set_size_request(s->btn_solo, 26, 20);
+        s->btn_fx   = gtk_button_new_with_label("Fx");
+        gtk_widget_set_size_request(s->btn_mute, 20, 20);
+        gtk_widget_set_size_request(s->btn_solo, 20, 20);
+        gtk_widget_set_size_request(s->btn_fx,   24, 20);
+        gtk_widget_set_tooltip_text(s->btn_mute, "Mute");
+        gtk_widget_set_tooltip_text(s->btn_solo, "Solo");
+        gtk_widget_set_tooltip_text(s->btn_fx,   "Open the effects window for this track");
+        gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_mute), "ts-mute");
+        gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_solo), "ts-solo");
+        gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_fx),   "ts-fx");
         s->suppress = TRUE;
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_mute),
                                      jackdaw_track_is_muted(track));
@@ -189,10 +317,19 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
                          G_CALLBACK(mix_mute_toggled), s);
         g_signal_connect(s->btn_solo, "toggled",
                          G_CALLBACK(mix_solo_toggled), s);
-        gtk_box_pack_start(GTK_BOX(ms), s->btn_mute, TRUE, TRUE, 0);
-        gtk_box_pack_start(GTK_BOX(ms), s->btn_solo, TRUE, TRUE, 0);
+        g_signal_connect(s->btn_fx, "clicked",
+                         G_CALLBACK(mix_fx_clicked), s);
+        gtk_box_pack_start(GTK_BOX(ms), s->btn_mute, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(ms), s->btn_solo, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(ms), s->btn_fx,   FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(box), ms, FALSE, FALSE, 0);
+
+        /* Keep this strip in sync when the track is changed elsewhere. */
+        g_signal_connect_object(track, "state-changed",
+                                G_CALLBACK(mix_track_state_changed), box, 0);
     }
+
+    g_signal_connect(box, "destroy", G_CALLBACK(mix_strip_destroy), s);
 
     if (!track) mixer->master = s;
     return box;
@@ -225,6 +362,14 @@ static gboolean mixer_vu_tick(gpointer data)
         s->pk_L = l;
         s->pk_R = r;
         gtk_widget_queue_draw(s->vu);
+
+        if (s->btn_fx) {
+            GtkStyleContext *fx = gtk_widget_get_style_context(s->btn_fx);
+            if (jackdaw_track_fx_count(s->track) > 0)
+                gtk_style_context_add_class(fx, "ts-fx-active");
+            else
+                gtk_style_context_remove_class(fx, "ts-fx-active");
+        }
     }
     return G_SOURCE_CONTINUE;
 }

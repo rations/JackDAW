@@ -605,7 +605,15 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "button.ts-solo:checked {"
             "  background-image:none; background-color:#ffe000; color:#101010; }"
             "button.ts-fx.ts-fx-active {"
-            "  background-image:none; background-color:#2980b9; color:#ffffff; }",
+            "  background-image:none; background-color:#2980b9; color:#ffffff; }"
+            /* Mixer fader: small tick-mark labels (the 6 dB scale). */
+            "scale.mix-fader marks label { font-size:7px; color:#b0b0b0; }"
+            "scale.mix-fader marks indicator { color:#707078; }"
+            /* Floating real-time dB read-out shown beside the fader. */
+            "label.mix-db-pop {"
+            "  font-size:11px; font-family:monospace; color:#ffffff;"
+            "  background-color:#202024; padding:2px 5px;"
+            "  border:1px solid #4a90d9; border-radius:3px; }",
             -1, NULL);
         gtk_style_context_add_provider_for_screen(
             gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),

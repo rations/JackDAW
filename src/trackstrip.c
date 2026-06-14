@@ -24,7 +24,9 @@ static void on_pan_changed(double pan, gpointer data)
 {
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
+    strip->self_update = TRUE;
     jackdaw_track_set_pan(strip->track, (gfloat)pan);
+    strip->self_update = FALSE;
 }
 
 static void on_name_changed(GtkEntry *entry, gpointer data)
@@ -45,14 +47,35 @@ static void on_mute_toggled(GtkToggleButton *btn, gpointer data)
 {
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
+    strip->self_update = TRUE;
     jackdaw_track_set_muted(strip->track, gtk_toggle_button_get_active(btn));
+    strip->self_update = FALSE;
 }
 
 static void on_solo_toggled(GtkToggleButton *btn, gpointer data)
 {
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
+    strip->self_update = TRUE;
     jackdaw_track_set_soloed(strip->track, gtk_toggle_button_get_active(btn));
+    strip->self_update = FALSE;
+}
+
+/* Reflect external track changes (e.g. from the mixer) onto this strip's
+ * mute/solo buttons and pan knob. Volume is intentionally left alone — the
+ * track's volume dial is a separate control from the mixer fader. */
+static void on_track_state_changed(JackDawTrack *t, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->self_update) return;
+    strip->suppress_update = TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_mute),
+                                 jackdaw_track_is_muted(t));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_solo),
+                                 jackdaw_track_is_soloed(t));
+    if (strip->pan_knob)
+        knob_set_value(strip->pan_knob, (double)jackdaw_track_get_pan(t));
+    strip->suppress_update = FALSE;
 }
 
 static void on_mono_toggled(GtkToggleButton *btn, gpointer data)
@@ -366,6 +389,7 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->vu_peak_R       = 0.0f;
     strip->vu_timer        = 0;
     strip->suppress_update = FALSE;
+    strip->self_update     = FALSE;
 
     /* Horizontal: [controls | vu_meter] */
     gtk_orientable_set_orientation(GTK_ORIENTABLE(strip),
@@ -529,6 +553,9 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     /* Auto-disconnect when strip is finalized */
     g_signal_connect_object(project, "ports-changed",
                             G_CALLBACK(on_ports_changed), strip, 0);
+    /* Stay in sync with mute/solo/pan changes made elsewhere (e.g. the mixer) */
+    g_signal_connect_object(track, "state-changed",
+                            G_CALLBACK(on_track_state_changed), strip, 0);
 
     /* Initial combo population */
     jackdaw_track_strip_refresh_ports(strip);
