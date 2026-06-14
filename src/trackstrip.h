@@ -83,6 +83,10 @@ void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip);
  * just the track name. `content_h` is the row height (excluding resize handle). */
 void jackdaw_track_strip_set_height(JackDawTrackStrip *strip, gint content_h);
 
+/* The VU meter drawing area — a click-inert column the timeline uses as an
+ * always-available grip for drag-to-reorder. */
+GtkWidget *jackdaw_track_strip_get_vu_meter(JackDawTrackStrip *strip);
+
 G_END_DECLS
 
 #endif /* TRACKSTRIP_H_INCLUDED */

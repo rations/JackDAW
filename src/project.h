@@ -66,6 +66,12 @@ void          jackdaw_project_add_track   (JackDawProject *p, JackDawTrack *t);
 void          jackdaw_project_remove_track(JackDawProject *p, JackDawTrack *t);
 guint         jackdaw_project_track_count (JackDawProject *p);
 JackDawTrack *jackdaw_project_get_track   (JackDawProject *p, guint idx);
+/* Index of t in the track array, or -1 if not present. */
+gint          jackdaw_project_track_index (JackDawProject *p, JackDawTrack *t);
+/* Move the track at `from` to position `to`, shifting the others. The engine
+ * slot / JACK ports are unaffected (they follow track->slot, not array order);
+ * this only changes display + save order. */
+void          jackdaw_project_move_track  (JackDawProject *p, guint from, guint to);
 
 /* Master volume */
 void   jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);

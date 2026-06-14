@@ -1780,6 +1780,8 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     gtk_box_set_spacing(GTK_BOX(tl), 0);
 }
 
+static gboolean tracks_box_draw_after(GtkWidget *w, cairo_t *cr, gpointer data);
+
 GtkWidget *jackdaw_timeline_new(JackDawProject *project)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(project), NULL);
@@ -1834,6 +1836,9 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
 
     tl->tracks_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
     gtk_container_add(GTK_CONTAINER(tl->tracks_scroll), tl->tracks_box);
+    /* Drawn after children so the reorder insertion line sits on top. */
+    g_signal_connect_after(tl->tracks_box, "draw",
+                           G_CALLBACK(tracks_box_draw_after), tl);
 
     gtk_box_pack_start(GTK_BOX(tl), ruler_row,         FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tl), tl->tracks_scroll, TRUE,  TRUE,  0);
@@ -1857,6 +1862,207 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
     return GTK_WIDGET(tl);
 }
 
+/* ========================================================================
+ * Track drag-to-reorder
+ *
+ * Same mechanism as the FX list: each track strip is wrapped in an event box
+ * that acts as a drag source + drop target. Because the strip is crowded, the
+ * (click-inert) VU meter is registered as a second grip so there is always an
+ * obvious place to grab. The engine slot / JACK ports follow track->slot, not
+ * array order, so reordering is purely a display + save-order change.
+ * ======================================================================== */
+
+static const GtkTargetEntry TRACK_ROW_DND[] = {
+    { (gchar *)"JACKDAW_TRACK_ROW", GTK_TARGET_SAME_APP, 0 }
+};
+
+typedef struct {
+    JackDawTimeline *tl;
+    JackDawTrack    *track;
+    GtkWidget       *snap;   /* widget to render as the drag icon (the strip) */
+} TrackDnd;
+
+/* Render a realized widget (and its children) into a fresh surface — used as the
+ * drag icon so the pointer carries a ghost of the grabbed row. */
+static cairo_surface_t *jackdaw_widget_snapshot(GtkWidget *w)
+{
+    if (!w || !gtk_widget_get_realized(w)) return NULL;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    if (a.width <= 0 || a.height <= 0) return NULL;
+
+    GdkWindow *win = gtk_widget_get_window(w);
+    cairo_surface_t *s = win
+        ? gdk_window_create_similar_surface(win, CAIRO_CONTENT_COLOR_ALPHA,
+                                            a.width, a.height)
+        : cairo_image_surface_create(CAIRO_FORMAT_ARGB32, a.width, a.height);
+    cairo_t *cr = cairo_create(s);
+    gtk_widget_draw(w, cr);
+    /* Dim it a touch so it reads as a "ghost" being moved. DEST_IN scales the
+     * snapshot's alpha by the source alpha (× the paint alpha), so the source
+     * must stay opaque — only the 0.75 paint alpha should ghost it. */
+    cairo_set_source_rgba(cr, 0, 0, 0, 1.0);
+    cairo_set_operator(cr, CAIRO_OPERATOR_DEST_IN);
+    cairo_paint_with_alpha(cr, 0.75);
+    cairo_destroy(cr);
+    return s;
+}
+
+/* Outer box (direct child of tracks_box) for a given track, or NULL. */
+static GtkWidget *track_outer_for(JackDawTimeline *tl, JackDawTrack *t)
+{
+    GtkWidget *wv = g_hash_table_lookup(tl->wave_views, t);
+    if (!wv) return NULL;
+    GtkWidget *row = gtk_widget_get_parent(wv);
+    return row ? gtk_widget_get_parent(row) : NULL;
+}
+
+/* Is the pointer (in grip-widget coords) over the top half of the track row?
+ * Decides whether a drop lands above or below the hovered track. */
+static gboolean track_drop_above(JackDawTimeline *tl, JackDawTrack *t,
+                                 GtkWidget *grip, gint x, gint y)
+{
+    GtkWidget *outer = track_outer_for(tl, t);
+    if (!outer) return TRUE;
+    gint ox, oy;
+    gtk_widget_translate_coordinates(grip, outer, x, y, &ox, &oy);
+    GtkAllocation a;
+    gtk_widget_get_allocation(outer, &a);
+    return oy < a.height / 2;
+}
+
+/* Re-position every track's outer box to match the project's track order. The
+ * master row, when shown, stays pinned at child index 0. */
+static void timeline_sync_track_order(JackDawTimeline *tl)
+{
+    guint base = tl->master_row ? 1 : 0;
+    guint n    = jackdaw_project_track_count(tl->project);
+    for (guint i = 0; i < n; i++) {
+        JackDawTrack *t     = jackdaw_project_get_track(tl->project, i);
+        GtkWidget    *outer = track_outer_for(tl, t);
+        if (outer)
+            gtk_box_reorder_child(GTK_BOX(tl->tracks_box), outer,
+                                  (gint)(base + i));
+    }
+}
+
+static void track_drag_begin(GtkWidget *w, GdkDragContext *ctx, gpointer data)
+{
+    TrackDnd *td = data;
+    cairo_surface_t *s = jackdaw_widget_snapshot(td->snap ? td->snap : w);
+    if (s) { gtk_drag_set_icon_surface(ctx, s); cairo_surface_destroy(s); }
+}
+
+static gboolean track_drag_motion(GtkWidget *w, GdkDragContext *ctx,
+                                  gint x, gint y, guint time, gpointer data)
+{
+    TrackDnd  *td    = data;
+    GtkWidget *outer = track_outer_for(td->tl, td->track);
+    if (outer) {
+        gboolean above = track_drop_above(td->tl, td->track, w, x, y);
+        GtkAllocation a;
+        gtk_widget_get_allocation(outer, &a);
+        gint tx, ty;
+        gtk_widget_translate_coordinates(outer, td->tl->tracks_box,
+                                         0, above ? 0 : a.height, &tx, &ty);
+        td->tl->drop_y      = ty;
+        td->tl->drop_active = TRUE;
+        gtk_widget_queue_draw(td->tl->tracks_box);
+    }
+    gdk_drag_status(ctx, GDK_ACTION_MOVE, time);
+    return TRUE;
+}
+
+static void track_drag_leave(GtkWidget *w, GdkDragContext *ctx,
+                             guint time, gpointer data)
+{
+    (void)w; (void)ctx; (void)time;
+    TrackDnd *td = data;
+    if (td->tl->drop_active) {
+        td->tl->drop_active = FALSE;
+        gtk_widget_queue_draw(td->tl->tracks_box);
+    }
+}
+
+static void track_drag_data_get(GtkWidget *w, GdkDragContext *ctx,
+                                GtkSelectionData *sel, guint info,
+                                guint time, gpointer data)
+{
+    (void)w; (void)ctx; (void)info; (void)time;
+    TrackDnd *td  = data;
+    gint      idx = jackdaw_project_track_index(td->tl->project, td->track);
+    gtk_selection_data_set(sel, gtk_selection_data_get_target(sel),
+                           8, (const guchar *)&idx, sizeof idx);
+}
+
+static void track_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
+                                     gint x, gint y, GtkSelectionData *sel,
+                                     guint info, guint time, gpointer data)
+{
+    (void)info;
+    TrackDnd *td = data;
+    td->tl->drop_active = FALSE;
+    gtk_widget_queue_draw(td->tl->tracks_box);
+
+    gboolean ok = (gtk_selection_data_get_length(sel) == (gint)sizeof(gint));
+    if (ok) {
+        gint from = *(const gint *)gtk_selection_data_get_data(sel);
+        gint tgt  = jackdaw_project_track_index(td->tl->project, td->track);
+        guint n   = jackdaw_project_track_count(td->tl->project);
+        if (from >= 0 && tgt >= 0) {
+            /* Honour the insertion line: dropping on the top half lands before
+             * the hovered track, the bottom half after it. */
+            gboolean above = track_drop_above(td->tl, td->track, w, x, y);
+            gint ins   = above ? tgt : tgt + 1;          /* slot in [0, n] */
+            gint final = (from < ins) ? ins - 1 : ins;   /* index after move  */
+            final = CLAMP(final, 0, (gint)n - 1);
+            if (final != from) {
+                jackdaw_project_move_track(td->tl->project,
+                                           (guint)from, (guint)final);
+                timeline_sync_track_order(td->tl);
+            }
+        }
+    }
+    gtk_drag_finish(ctx, ok, FALSE, time);
+}
+
+/* Insertion line drawn across the whole track column during a reorder drag. */
+static gboolean tracks_box_draw_after(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    JackDawTimeline *tl = data;
+    if (!tl->drop_active) return FALSE;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    double yy = tl->drop_y + 0.5;
+    cairo_set_source_rgb(cr, 0.20, 0.55, 1.0);     /* accent blue */
+    cairo_set_line_width(cr, 2.0);
+    cairo_move_to(cr, 0,       yy);
+    cairo_line_to(cr, a.width, yy);
+    cairo_stroke(cr);
+    /* End caps so the line reads as an insertion marker. */
+    cairo_arc(cr, 3,           yy, 3, 0, 2 * G_PI);
+    cairo_arc(cr, a.width - 3, yy, 3, 0, 2 * G_PI);
+    cairo_fill(cr);
+    return FALSE;
+}
+
+/* Make `w` a drag grip (source + drop target) for the track described by td. */
+static void track_dnd_grip(GtkWidget *w, TrackDnd *td)
+{
+    if (!w) return;
+    gtk_drag_source_set(w, GDK_BUTTON1_MASK, TRACK_ROW_DND, 1, GDK_ACTION_MOVE);
+    /* No DEFAULT_HIGHLIGHT — we draw our own insertion line instead. */
+    gtk_drag_dest_set(w, GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_DROP,
+                      TRACK_ROW_DND, 1, GDK_ACTION_MOVE);
+    g_signal_connect(w, "drag-begin",  G_CALLBACK(track_drag_begin),  td);
+    g_signal_connect(w, "drag-motion", G_CALLBACK(track_drag_motion), td);
+    g_signal_connect(w, "drag-leave",  G_CALLBACK(track_drag_leave),  td);
+    g_signal_connect(w, "drag-data-get",
+                     G_CALLBACK(track_drag_data_get), td);
+    g_signal_connect(w, "drag-data-received",
+                     G_CALLBACK(track_drag_data_received), td);
+}
+
 void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
 {
     g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
@@ -1872,10 +2078,18 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     /* Track row: [TrackStrip 180px][waveview →] */
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
 
-    /* Track strip header (ARM/M/S, vol, pan, input selectors).
-     * Adding to header_size_group keeps it aligned with the ruler spacer. */
-    GtkWidget *strip = jackdaw_track_strip_new(track, tl->project);
-    gtk_size_group_add_widget(tl->header_size_group, strip);
+    /* Track strip header (ARM/M/S, vol, pan, input selectors). Wrapped in an
+     * event box so the strip background can be grabbed for drag-to-reorder (a
+     * drag source on the strip's child widgets would conflict with their own
+     * clicks; the event box's own window catches the gaps/labels). Adding the
+     * wrapper to header_size_group keeps it aligned with the ruler spacer. */
+    GtkWidget *strip  = jackdaw_track_strip_new(track, tl->project);
+    GtkWidget *strip_box = gtk_event_box_new();
+    gtk_container_add(GTK_CONTAINER(strip_box), strip);
+    gtk_size_group_add_widget(tl->header_size_group, strip_box);
+
+    TrackDnd *td = g_new0(TrackDnd, 1);
+    td->tl = tl; td->track = track; td->snap = strip_box;
 
     /* WaveView */
     GtkWidget *wv = jackdaw_wave_view_new(track, tl->time_adj, tl->zoom_adj,
@@ -1894,8 +2108,14 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     g_signal_connect(wv, "scroll-event",
                      G_CALLBACK(timeline_wave_scroll), tl);
 
-    gtk_box_pack_start(GTK_BOX(row), strip, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(row), wv,    TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(row), strip_box, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), wv,        TRUE,  TRUE,  0);
+
+    /* Drag-to-reorder grips: the strip background plus the VU meter (a wide,
+     * click-inert column that is always present as an obvious grab point). */
+    track_dnd_grip(strip_box, td);
+    track_dnd_grip(jackdaw_track_strip_get_vu_meter(JACKDAW_TRACK_STRIP(strip)),
+                   td);
 
     /* Resize handle: 5px drawing area the user drags to change track height */
     GtkWidget *handle = gtk_drawing_area_new();
@@ -1911,6 +2131,9 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     rd->strip        = strip;
     rd->wv           = wv;
     g_object_set_data_full(G_OBJECT(handle), "resize-data", rd, g_free);
+
+    /* td is shared by both reorder grips; free it once with the row. */
+    g_object_set_data_full(G_OBJECT(outer), "track-dnd", td, g_free);
 
     g_signal_connect(handle, "draw",
                      G_CALLBACK(resize_handle_draw),    NULL);

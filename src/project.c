@@ -138,6 +138,25 @@ JackDawTrack *jackdaw_project_get_track(JackDawProject *p, guint idx)
     return JACKDAW_TRACK(g_ptr_array_index(p->tracks, idx));
 }
 
+gint jackdaw_project_track_index(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), -1);
+    for (guint i = 0; i < p->tracks->len; i++)
+        if (g_ptr_array_index(p->tracks, i) == t) return (gint)i;
+    return -1;
+}
+
+void jackdaw_project_move_track(JackDawProject *p, guint from, guint to)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    if (from >= p->tracks->len || to >= p->tracks->len || from == to) return;
+    /* remove_index runs the array's free_func (g_object_unref), so take a ref to
+     * keep the track alive; the insert hands that ref to the array's slot. */
+    gpointer t = g_object_ref(g_ptr_array_index(p->tracks, from));
+    g_ptr_array_remove_index(p->tracks, from);
+    g_ptr_array_insert(p->tracks, (gint)to, t);
+}
+
 /* ---- Master volume ---- */
 
 void jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol)

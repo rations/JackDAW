@@ -170,6 +170,10 @@ struct _JackDawTimeline {
     gfloat            master_vu_R;
     gboolean          master_suppress;
     gboolean          master_sig_connected; /* state-changed hooked up once */
+
+    /* Drag-to-reorder insertion line (drawn across tracks_box during a drag) */
+    gboolean          drop_active;
+    gint              drop_y;          /* y in tracks_box coords */
 };
 
 struct _JackDawTimelineClass {

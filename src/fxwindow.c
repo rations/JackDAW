@@ -233,6 +233,8 @@ typedef struct {
     int             fit_ticks;   /* retries left to catch late-negotiating UIs */
     int             fit_stable;  /* consecutive ticks at an unchanged size */
     int             fit_w, fit_h;/* last natural size we resized to */
+    gboolean        drop_active; /* a reorder drag is hovering the list */
+    gint            drop_y;      /* insertion-line y in list_box coords */
 } FxWindow;
 
 static void fxwin_rebuild_list(FxWindow *fw);
@@ -363,6 +365,78 @@ static const GtkTargetEntry FX_ROW_DND[] = {
     { (gchar *)"JACKDAW_FX_ROW", GTK_TARGET_SAME_APP, 0 }
 };
 
+/* Render a realized widget into a surface for use as the drag icon. */
+static cairo_surface_t *fx_widget_snapshot(GtkWidget *w)
+{
+    if (!w || !gtk_widget_get_realized(w)) return NULL;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    if (a.width <= 0 || a.height <= 0) return NULL;
+
+    GdkWindow *win = gtk_widget_get_window(w);
+    cairo_surface_t *s = win
+        ? gdk_window_create_similar_surface(win, CAIRO_CONTENT_COLOR_ALPHA,
+                                            a.width, a.height)
+        : cairo_image_surface_create(CAIRO_FORMAT_ARGB32, a.width, a.height);
+    cairo_t *cr = cairo_create(s);
+    gtk_widget_draw(w, cr);
+    /* Ghost it: DEST_IN scales the snapshot alpha by the (opaque) source alpha
+     * times the paint alpha, so only the 0.75 dims it. */
+    cairo_set_source_rgba(cr, 0, 0, 0, 1.0);
+    cairo_set_operator(cr, CAIRO_OPERATOR_DEST_IN);
+    cairo_paint_with_alpha(cr, 0.75);
+    cairo_destroy(cr);
+    return s;
+}
+
+/* Pointer over the top half of its row → drop lands before it, else after. */
+static gboolean fxrow_drop_above(GtkWidget *w, gint y)
+{
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    return y < a.height / 2;
+}
+
+static void fxrow_drag_begin(GtkWidget *w, GdkDragContext *ctx, gpointer data)
+{
+    (void)data;
+    cairo_surface_t *s = fx_widget_snapshot(w);
+    if (s) { gtk_drag_set_icon_surface(ctx, s); cairo_surface_destroy(s); }
+}
+
+static gboolean fxrow_drag_motion(GtkWidget *w, GdkDragContext *ctx,
+                                  gint x, gint y, guint time, gpointer data)
+{
+    (void)x;
+    RowLink  *rl = data;
+    FxWindow *fw = rl->fw;
+    gboolean above = fxrow_drop_above(w, y);
+    gint tx, ty;
+    gtk_widget_translate_coordinates(w, fw->list_box, 0, 0, &tx, &ty);
+    if (!above) {
+        GtkAllocation a;
+        gtk_widget_get_allocation(w, &a);
+        ty += a.height;
+    }
+    fw->drop_y      = ty;
+    fw->drop_active = TRUE;
+    gtk_widget_queue_draw(fw->list_box);
+    gdk_drag_status(ctx, GDK_ACTION_MOVE, time);
+    return TRUE;
+}
+
+static void fxrow_drag_leave(GtkWidget *w, GdkDragContext *ctx,
+                             guint time, gpointer data)
+{
+    (void)w; (void)ctx; (void)time;
+    RowLink  *rl = data;
+    FxWindow *fw = rl->fw;
+    if (fw->drop_active) {
+        fw->drop_active = FALSE;
+        gtk_widget_queue_draw(fw->list_box);
+    }
+}
+
 static void fxrow_drag_data_get(GtkWidget *w, GdkDragContext *ctx,
                                 GtkSelectionData *sel, guint info,
                                 guint time, gpointer data)
@@ -378,23 +452,51 @@ static void fxrow_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
                                      gint x, gint y, GtkSelectionData *sel,
                                      guint info, guint time, gpointer data)
 {
-    (void)w; (void)x; (void)y; (void)info;
+    (void)x; (void)info;
     RowLink *rl = data;
     FxWindow *fw = rl->fw;
+    fw->drop_active = FALSE;
+    gtk_widget_queue_draw(fw->list_box);
+
     gboolean ok = (gtk_selection_data_get_length(sel) == (gint)sizeof(guint));
     if (ok) {
-        guint from = *(const guint *)gtk_selection_data_get_data(sel);
-        guint to   = rl->index;
-        if (from != to) {
-            jackdaw_track_fx_move(fw->track, from, to);
+        gint  from = (gint)*(const guint *)gtk_selection_data_get_data(sel);
+        gint  tgt  = (gint)rl->index;
+        guint n    = jackdaw_track_fx_count(fw->track);
+        /* Honour the insertion line: top half lands before, bottom half after. */
+        gboolean above = fxrow_drop_above(w, y);
+        gint ins   = above ? tgt : tgt + 1;          /* slot in [0, n]   */
+        gint final = (from < ins) ? ins - 1 : ins;   /* index after move */
+        final = CLAMP(final, 0, (gint)n - 1);
+        if (final != from) {
+            jackdaw_track_fx_move(fw->track, (guint)from, (guint)final);
             fxwin_rebuild_list(fw);
-            fxwin_show_gui(fw, to);
+            fxwin_show_gui(fw, (guint)final);
             GtkListBoxRow *r = gtk_list_box_get_row_at_index(
-                GTK_LIST_BOX(fw->list_box), (gint)to);
+                GTK_LIST_BOX(fw->list_box), final);
             if (r) gtk_list_box_select_row(GTK_LIST_BOX(fw->list_box), r);
         }
     }
     gtk_drag_finish(ctx, ok, FALSE, time);
+}
+
+/* Insertion line drawn across the effect list during a reorder drag. */
+static gboolean fxlist_draw_after(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    FxWindow *fw = data;
+    if (!fw->drop_active) return FALSE;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    double yy = fw->drop_y + 0.5;
+    cairo_set_source_rgb(cr, 0.20, 0.55, 1.0);
+    cairo_set_line_width(cr, 2.0);
+    cairo_move_to(cr, 0,       yy);
+    cairo_line_to(cr, a.width, yy);
+    cairo_stroke(cr);
+    cairo_arc(cr, 3,           yy, 3, 0, 2 * G_PI);
+    cairo_arc(cr, a.width - 3, yy, 3, 0, 2 * G_PI);
+    cairo_fill(cr);
+    return FALSE;
 }
 
 static void fxrow_enable_toggled(GtkToggleButton *b, gpointer data)
@@ -470,8 +572,15 @@ static void fxwin_rebuild_list(FxWindow *fw)
         gtk_container_add(GTK_CONTAINER(ebox), row);
         gtk_drag_source_set(ebox, GDK_BUTTON1_MASK,
                             FX_ROW_DND, 1, GDK_ACTION_MOVE);
-        gtk_drag_dest_set(ebox, GTK_DEST_DEFAULT_ALL,
+        /* No DEFAULT_HIGHLIGHT — we draw our own insertion line instead. */
+        gtk_drag_dest_set(ebox, GTK_DEST_DEFAULT_MOTION | GTK_DEST_DEFAULT_DROP,
                           FX_ROW_DND, 1, GDK_ACTION_MOVE);
+        g_signal_connect(ebox, "drag-begin",
+                         G_CALLBACK(fxrow_drag_begin), rl);
+        g_signal_connect(ebox, "drag-motion",
+                         G_CALLBACK(fxrow_drag_motion), rl);
+        g_signal_connect(ebox, "drag-leave",
+                         G_CALLBACK(fxrow_drag_leave), rl);
         g_signal_connect(ebox, "drag-data-get",
                          G_CALLBACK(fxrow_drag_data_get), rl);
         g_signal_connect(ebox, "drag-data-received",
@@ -560,6 +669,9 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     fw->list_box = gtk_list_box_new();
     g_signal_connect(fw->list_box, "row-selected",
                      G_CALLBACK(fxrow_selected), fw);
+    /* Drawn after children so the reorder insertion line sits on top. */
+    g_signal_connect_after(fw->list_box, "draw",
+                           G_CALLBACK(fxlist_draw_after), fw);
     gtk_container_add(GTK_CONTAINER(lscroll), fw->list_box);
     gtk_box_pack_start(GTK_BOX(left), lscroll, TRUE, TRUE, 0);
 

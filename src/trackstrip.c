@@ -595,3 +595,9 @@ void jackdaw_track_strip_set_height(JackDawTrackStrip *strip, gint content_h)
     if (strip->vu_meter)
         gtk_widget_set_visible(strip->vu_meter, show_ctrl);
 }
+
+GtkWidget *jackdaw_track_strip_get_vu_meter(JackDawTrackStrip *strip)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK_STRIP(strip), NULL);
+    return strip->vu_meter;
+}
