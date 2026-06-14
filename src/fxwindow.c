@@ -357,6 +357,46 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
 
 typedef struct { FxWindow *fw; guint index; } RowLink;
 
+/* Drag-and-drop reordering of the effect chain. Each row is both a drag source
+ * and a drop target; the payload is the source row's index. App-local only. */
+static const GtkTargetEntry FX_ROW_DND[] = {
+    { (gchar *)"JACKDAW_FX_ROW", GTK_TARGET_SAME_APP, 0 }
+};
+
+static void fxrow_drag_data_get(GtkWidget *w, GdkDragContext *ctx,
+                                GtkSelectionData *sel, guint info,
+                                guint time, gpointer data)
+{
+    (void)w; (void)ctx; (void)info; (void)time;
+    RowLink *rl = data;
+    guint idx = rl->index;
+    gtk_selection_data_set(sel, gtk_selection_data_get_target(sel),
+                           8, (const guchar *)&idx, sizeof idx);
+}
+
+static void fxrow_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
+                                     gint x, gint y, GtkSelectionData *sel,
+                                     guint info, guint time, gpointer data)
+{
+    (void)w; (void)x; (void)y; (void)info;
+    RowLink *rl = data;
+    FxWindow *fw = rl->fw;
+    gboolean ok = (gtk_selection_data_get_length(sel) == (gint)sizeof(guint));
+    if (ok) {
+        guint from = *(const guint *)gtk_selection_data_get_data(sel);
+        guint to   = rl->index;
+        if (from != to) {
+            jackdaw_track_fx_move(fw->track, from, to);
+            fxwin_rebuild_list(fw);
+            fxwin_show_gui(fw, to);
+            GtkListBoxRow *r = gtk_list_box_get_row_at_index(
+                GTK_LIST_BOX(fw->list_box), (gint)to);
+            if (r) gtk_list_box_select_row(GTK_LIST_BOX(fw->list_box), r);
+        }
+    }
+    gtk_drag_finish(ctx, ok, FALSE, time);
+}
+
 static void fxrow_enable_toggled(GtkToggleButton *b, gpointer data)
 {
     RowLink *rl = data;
@@ -419,7 +459,25 @@ static void fxwin_rebuild_list(FxWindow *fw)
         gtk_box_pack_start(GTK_BOX(row), en,   FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(row), name, TRUE,  TRUE,  0);
         gtk_box_pack_start(GTK_BOX(row), rm,   FALSE, FALSE, 0);
-        gtk_list_box_insert(GTK_LIST_BOX(fw->list_box), row, -1);
+
+        /* Wrap the row in an event box and make THAT the drag source/target.
+         * GtkListBox claims press gestures on its own rows for selection, so a
+         * drag source set on the GtkListBoxRow never sees the motion needed to
+         * start; an event box has its own input window and does. The check
+         * button and remove button keep their own clicks (separate windows);
+         * dragging the name (which has no window) starts on the event box. */
+        GtkWidget *ebox = gtk_event_box_new();
+        gtk_container_add(GTK_CONTAINER(ebox), row);
+        gtk_drag_source_set(ebox, GDK_BUTTON1_MASK,
+                            FX_ROW_DND, 1, GDK_ACTION_MOVE);
+        gtk_drag_dest_set(ebox, GTK_DEST_DEFAULT_ALL,
+                          FX_ROW_DND, 1, GDK_ACTION_MOVE);
+        g_signal_connect(ebox, "drag-data-get",
+                         G_CALLBACK(fxrow_drag_data_get), rl);
+        g_signal_connect(ebox, "drag-data-received",
+                         G_CALLBACK(fxrow_drag_data_received), rl);
+
+        gtk_list_box_insert(GTK_LIST_BOX(fw->list_box), ebox, -1);
     }
     gtk_widget_show_all(fw->list_box);
 }
