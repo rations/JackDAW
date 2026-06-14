@@ -89,8 +89,12 @@ static double fader_db_to_pos(double db)
 
 /* dB scale column drawn beside the fader. We draw the 6 dB labels ourselves
  * instead of using gtk_scale_add_mark(), because scale marks act as snap
- * "stop values" and make the fader drag in steps rather than smoothly. */
-#define FADER_SLIDER_HALF 8.0   /* approx half the slider knob (px) */
+ * "stop values" and make the fader drag in steps rather than smoothly.
+ *
+ * FADER_SLIDER_HALF is half the styled slider cap's height (see the mix-fader
+ * CSS); the trough margins equal it, so the slider centre travels from
+ * FADER_SLIDER_HALF..(height-FADER_SLIDER_HALF) and the labels line up. */
+#define FADER_SLIDER_HALF 7.0
 
 static gboolean mix_scale_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 {
@@ -99,23 +103,22 @@ static gboolean mix_scale_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     double usable = a.height - 2.0 * FADER_SLIDER_HALF;
     if (usable < 1.0) usable = a.height;
 
-    cairo_set_font_size(cr, 7.0);
+    cairo_set_font_size(cr, 14.0);
     for (int d = (int)FADER_DB_MAX; d >= (int)FADER_DB_MIN; d -= 6) {
         double pos = fader_db_to_pos((double)d);          /* 1 = top */
         double y   = FADER_SLIDER_HALF + (1.0 - pos) * usable;
         char m[8]; g_snprintf(m, sizeof m, "%d", d);
-        /* tick */
+        /* tick (right edge, next to the fader) */
         cairo_set_source_rgb(cr, 0.44, 0.44, 0.47);
         cairo_set_line_width(cr, 1.0);
         cairo_move_to(cr, a.width - 6.0, floor(y) + 0.5);
         cairo_line_to(cr, a.width - 1.0, floor(y) + 0.5);
         cairo_stroke(cr);
-        /* right-aligned label */
+        /* right-aligned label, vertically centred on the tick */
         cairo_text_extents_t ext; cairo_text_extents(cr, m, &ext);
-        cairo_set_source_rgb(cr, (d == 0) ? 0.85 : 0.69,
-                                 (d == 0) ? 0.85 : 0.69,
-                                 (d == 0) ? 0.90 : 0.69);
-        cairo_move_to(cr, a.width - 8.0 - ext.width, y + 2.5);
+        cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);   /* black */
+        cairo_move_to(cr, a.width - 9.0 - ext.width,
+                          y - (ext.height / 2.0 + ext.y_bearing));
         cairo_show_text(cr, m);
     }
     return FALSE;
@@ -266,7 +269,7 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     s->track = track;
 
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
-    gtk_widget_set_size_request(box, 64, -1);
+    gtk_widget_set_size_request(box, 80, -1);
     gtk_container_set_border_width(GTK_CONTAINER(box), 3);
     g_object_set_data_full(G_OBJECT(box), "mixer-strip", s, g_free);
 
@@ -320,7 +323,7 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
 
     /* dB scale labels (drawn, not GtkScale marks — see mix_scale_draw). */
     GtkWidget *scale_lbl = gtk_drawing_area_new();
-    gtk_widget_set_size_request(scale_lbl, 22, -1);
+    gtk_widget_set_size_request(scale_lbl, 34, -1);
     gtk_widget_set_vexpand(scale_lbl, TRUE);
     g_signal_connect(scale_lbl, "draw", G_CALLBACK(mix_scale_draw), NULL);
 

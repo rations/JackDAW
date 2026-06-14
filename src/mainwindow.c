@@ -606,9 +606,21 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "  background-image:none; background-color:#ffe000; color:#101010; }"
             "button.ts-fx.ts-fx-active {"
             "  background-image:none; background-color:#2980b9; color:#ffffff; }"
-            /* Mixer fader: small tick-mark labels (the 6 dB scale). */
-            "scale.mix-fader marks label { font-size:7px; color:#b0b0b0; }"
-            "scale.mix-fader marks indicator { color:#707078; }"
+            /* Mixer fader: flat horizontal cap (not the theme's round handle)
+             * so its centre is a clear reference that lines up with the dB
+             * labels. Trough margins = half the cap height so the cap centre
+             * reaches the full travel; keep this in sync with FADER_SLIDER_HALF
+             * (7px) in mixer.c. */
+            "scale.mix-fader { padding:0; }"
+            "scale.mix-fader trough {"
+            "  margin:7px 0; min-width:5px;"
+            "  background-image:none; background-color:#262629; }"
+            "scale.mix-fader highlight {"
+            "  background-image:none; background-color:#3a6ea5; }"
+            "scale.mix-fader slider {"
+            "  min-width:24px; min-height:12px; margin:-7px -10px;"
+            "  border-radius:2px; border:1px solid #2a2a2e;"
+            "  background-image:none; background-color:#d2d2d6; }"
             /* Floating real-time dB read-out shown beside the fader. */
             "label.mix-db-pop {"
             "  font-size:11px; font-family:monospace; color:#ffffff;"
