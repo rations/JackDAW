@@ -15,6 +15,7 @@
  */
 #define _GNU_SOURCE
 #include <math.h>
+#include <string.h>
 #include "midiwindow.h"
 #include "jackdaw-engine.h"
 #include "main.h"
@@ -48,6 +49,21 @@ typedef struct {
     guint32  orig_start, orig_len;
     guint8   orig_pitch;
     int      ctx_note_idx;      /* note saved when right-click menu opens */
+
+    /* selection (editor-only; parallel to clip->notes by index) */
+    gboolean *sel;              /* sel[i] = note i is selected */
+    guint     sel_cap;          /* allocated entries in sel */
+
+    /* group move: original start/pitch of every note, captured at press */
+    guint32  *grp_start;
+    guint8   *grp_pitch;
+    guint     grp_cap;
+
+    /* right-drag rubber-band selection box */
+    gboolean  sel_dragging;     /* right button held down on the roll */
+    gboolean  sel_moved;        /* pointer moved enough to be a box, not a menu */
+    double    sel_x0, sel_y0;   /* anchor (button-press point) */
+    double    sel_x1, sel_y1;   /* current pointer point */
 
     /* playhead */
     double   play_tick;         /* clip-relative tick of playhead; -1 = off / before region */
@@ -126,6 +142,77 @@ static int note_at(MidiWindow *mw, double x, double y, gboolean *on_edge)
     return -1;
 }
 
+/* ---- selection ---- */
+
+/* Grow the selection array to cover every note (new entries unselected). */
+static void sel_ensure(MidiWindow *mw)
+{
+    guint nc = midi_clip_note_count(mw->clip);
+    if (nc > mw->sel_cap) {
+        mw->sel = g_realloc(mw->sel, nc * sizeof(gboolean));
+        memset(mw->sel + mw->sel_cap, 0, (nc - mw->sel_cap) * sizeof(gboolean));
+        mw->sel_cap = nc;
+    }
+}
+static void sel_clear(MidiWindow *mw)
+{
+    if (mw->sel) memset(mw->sel, 0, mw->sel_cap * sizeof(gboolean));
+}
+static gboolean sel_is(MidiWindow *mw, guint i)
+{
+    return (i < mw->sel_cap) && mw->sel[i];
+}
+static guint sel_count(MidiWindow *mw)
+{
+    guint c = 0, nc = midi_clip_note_count(mw->clip);
+    for (guint i = 0; i < nc && i < mw->sel_cap; i++)
+        if (mw->sel[i]) c++;
+    return c;
+}
+static void sel_all(MidiWindow *mw)
+{
+    sel_ensure(mw);
+    guint nc = midi_clip_note_count(mw->clip);
+    for (guint i = 0; i < nc; i++) mw->sel[i] = TRUE;
+    gtk_widget_queue_draw(mw->roll);
+}
+
+/* Snapshot every note's start/pitch so a group drag can apply a uniform
+ * delta from the originals (avoids drift from re-reading moved notes). */
+static void grp_capture(MidiWindow *mw)
+{
+    guint nc = midi_clip_note_count(mw->clip);
+    if (nc > mw->grp_cap) {
+        mw->grp_start = g_realloc(mw->grp_start, nc * sizeof(guint32));
+        mw->grp_pitch = g_realloc(mw->grp_pitch, nc * sizeof(guint8));
+        mw->grp_cap = nc;
+    }
+    for (guint i = 0; i < nc; i++) {
+        MidiNote *n = midi_clip_note(mw->clip, i);
+        mw->grp_start[i] = n->start;
+        mw->grp_pitch[i] = n->pitch;
+    }
+}
+
+/* Recompute selection from the current rubber-band rectangle. */
+static void sel_update_box(MidiWindow *mw)
+{
+    sel_ensure(mw);
+    sel_clear(mw);
+    double x0 = MIN(mw->sel_x0, mw->sel_x1), x1 = MAX(mw->sel_x0, mw->sel_x1);
+    double y0 = MIN(mw->sel_y0, mw->sel_y1), y1 = MAX(mw->sel_y0, mw->sel_y1);
+    guint nc = midi_clip_note_count(mw->clip);
+    for (guint i = 0; i < nc; i++) {
+        MidiNote *n = midi_clip_note(mw->clip, i);
+        double nx = tick_to_x(mw, n->start);
+        double nw = (double)n->length / mw->tpx;
+        double ny = pitch_to_y(mw, n->pitch);
+        /* select if the note's rect intersects the box */
+        if (nx + nw >= x0 && nx <= x1 && ny + mw->key_h >= y0 && ny <= y1)
+            mw->sel[i] = TRUE;
+    }
+}
+
 /* ---- drawing ---- */
 
 static gboolean roll_draw(GtkWidget *w, cairo_t *cr, gpointer data)
@@ -188,6 +275,27 @@ static gboolean roll_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_fill(cr);
         cairo_set_source_rgba(cr, 0, 0, 0, 0.6);
         cairo_rectangle(cr, nx + 0.5, ny + 0.5, nw, mw->key_h - 1);
+        cairo_stroke(cr);
+        if (sel_is(mw, i)) {                 /* selected: bright outline */
+            cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+            cairo_set_line_width(cr, 2.0);
+            cairo_rectangle(cr, nx + 1.0, ny + 1.5, nw - 1, mw->key_h - 3);
+            cairo_stroke(cr);
+            cairo_set_line_width(cr, 1.0);
+        }
+    }
+
+    /* rubber-band selection box */
+    if (mw->sel_dragging && mw->sel_moved) {
+        double x0 = MIN(mw->sel_x0, mw->sel_x1), x1 = MAX(mw->sel_x0, mw->sel_x1);
+        double y0 = MIN(mw->sel_y0, mw->sel_y1), y1 = MAX(mw->sel_y0, mw->sel_y1);
+        cairo_set_source_rgba(cr, 0.45, 0.7, 1.0, 0.18);
+        cairo_rectangle(cr, x0, y0, x1 - x0, y1 - y0);
+        cairo_fill(cr);
+        cairo_set_source_rgba(cr, 0.55, 0.8, 1.0, 0.9);
+        cairo_set_line_width(cr, 1.0);
+        cairo_rectangle(cr, floor(x0) + 0.5, floor(y0) + 0.5,
+                        floor(x1 - x0), floor(y1 - y0));
         cairo_stroke(cr);
     }
 
@@ -332,12 +440,18 @@ static gboolean ruler_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 
 /* ---- quantize ---- */
 
-static void quantize_all(MidiWindow *mw)
+/* Snap note starts to the grid.  If any notes are selected, only those are
+ * quantized; otherwise every note is.  Always snaps (independent of the Snap
+ * toggle, which only governs live drag-editing). */
+static void quantize_notes(MidiWindow *mw)
 {
+    int step = JACKDAW_PPQ / 4;          /* 1/16-note grid */
     guint nc = midi_clip_note_count(mw->clip);
+    guint sc = sel_count(mw);
     for (guint i = 0; i < nc; i++) {
+        if (sc > 0 && !sel_is(mw, i)) continue;   /* selection-only when any selected */
         MidiNote *n = midi_clip_note(mw->clip, i);
-        n->start = snap_tick(mw, (double)n->start);
+        n->start = (guint32)(floor((double)n->start / step + 0.5) * step);
     }
     mw_commit(mw);
 }
@@ -348,6 +462,16 @@ static void mw_ctx_delete_note(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     MidiWindow *mw = data;
+    if (sel_count(mw) > 0) {              /* delete every highlighted note */
+        guint nc = midi_clip_note_count(mw->clip);
+        for (int i = (int)nc - 1; i >= 0; i--)   /* high→low keeps indices valid */
+            if (sel_is(mw, (guint)i))
+                midi_clip_remove_note(mw->clip, (guint)i);
+        sel_clear(mw);
+        mw->ctx_note_idx = -1;
+        mw_commit(mw);
+        return;
+    }
     if (mw->ctx_note_idx >= 0) {
         midi_clip_remove_note(mw->clip, (guint)mw->ctx_note_idx);
         mw->ctx_note_idx = -1;
@@ -358,7 +482,13 @@ static void mw_ctx_delete_note(GtkMenuItem *item, gpointer data)
 static void mw_ctx_quantize_all(GtkMenuItem *item, gpointer data)
 {
     (void)item;
-    quantize_all((MidiWindow *)data);
+    quantize_notes((MidiWindow *)data);
+}
+
+static void mw_ctx_select_all(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    sel_all((MidiWindow *)data);
 }
 
 static void roll_show_context_menu(MidiWindow *mw, GdkEventButton *ev, int note_idx)
@@ -367,14 +497,21 @@ static void roll_show_context_menu(MidiWindow *mw, GdkEventButton *ev, int note_
     GtkWidget *menu = gtk_menu_new();
     GtkWidget *mi;
 
-    mi = gtk_menu_item_new_with_label("Delete Note");
-    gtk_widget_set_sensitive(mi, note_idx >= 0);
+    guint sc = sel_count(mw);
+    mi = gtk_menu_item_new_with_label(sc > 0 ? "Delete Selected" : "Delete Note");
+    gtk_widget_set_sensitive(mi, note_idx >= 0 || sc > 0);
     g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_delete_note), mw);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
-    mi = gtk_menu_item_new_with_label("Quantize All  [Q]");
+    mi = gtk_menu_item_new_with_label("Select All");
+    g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_select_all), mw);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+    mi = gtk_menu_item_new_with_label(sel_count(mw) > 0
+                                      ? "Quantize Selected  [Q]"
+                                      : "Quantize All  [Q]");
     g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_quantize_all), mw);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
 
@@ -392,10 +529,31 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
     int idx = note_at(mw, e->x, e->y, &edge);
 
     if (e->button == 3) {
-        roll_show_context_menu(mw, e, idx);
+        /* Begin a potential rubber-band selection.  If the pointer never
+         * moves, the release handler pops up the context menu instead. */
+        mw->sel_dragging = TRUE;
+        mw->sel_moved    = FALSE;
+        mw->sel_x0 = mw->sel_x1 = e->x;
+        mw->sel_y0 = mw->sel_y1 = e->y;
+        mw->ctx_note_idx = idx;
         return TRUE;
     }
     if (e->button != 1) return FALSE;
+
+    /* With an active selection, a left action operates on the selection
+     * rather than creating notes. */
+    if (sel_count(mw) > 0) {
+        if (idx >= 0 && sel_is(mw, (guint)idx)) {   /* grab the group → move it */
+            grp_capture(mw);
+            mw->drag_mode = 4;
+            mw->drag_note = idx;
+            mw->press_x = e->x; mw->press_y = e->y;
+            return TRUE;
+        }
+        sel_clear(mw);                  /* clicked away: just deselect, place nothing */
+        gtk_widget_queue_draw(mw->roll);
+        return TRUE;
+    }
 
     if (idx < 0) {                        /* empty: add a note */
         MidiNote n;
@@ -420,6 +578,15 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
 static gboolean roll_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
 {
     MidiWindow *mw = data;
+    if (mw->sel_dragging) {                   /* right-drag rubber band */
+        mw->sel_x1 = e->x; mw->sel_y1 = e->y;
+        if (!mw->sel_moved &&
+            (fabs(e->x - mw->sel_x0) > 3.0 || fabs(e->y - mw->sel_y0) > 3.0))
+            mw->sel_moved = TRUE;
+        if (mw->sel_moved) sel_update_box(mw);
+        gtk_widget_queue_draw(mw->roll);
+        return TRUE;
+    }
     if (mw->drag_mode == 0 || mw->drag_note < 0) {
         gboolean edge = FALSE; note_at(mw, e->x, e->y, &edge);
         GdkWindow *gw = gtk_widget_get_window(w);
@@ -431,6 +598,24 @@ static gboolean roll_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
         }
         return FALSE;
     }
+    if (mw->drag_mode == 4) {                 /* move the whole selection */
+        double rawdt = (e->x - mw->press_x) * mw->tpx;
+        int step = snap_step(mw);
+        long dticks = (step > 1)
+            ? (long)(floor(rawdt / step + 0.5) * step) : (long)rawdt;
+        int dp = (int)floor((e->y - mw->press_y) / mw->key_h + 0.5);
+        guint nc = midi_clip_note_count(mw->clip);
+        for (guint i = 0; i < nc && i < mw->grp_cap; i++) {
+            if (!sel_is(mw, i)) continue;
+            MidiNote *gn = midi_clip_note(mw->clip, i);
+            long ns = (long)mw->grp_start[i] + dticks;
+            gn->start = (guint32)(ns < 0 ? 0 : ns);
+            gn->pitch = (guint8)CLAMP((int)mw->grp_pitch[i] - dp, 0, 127);
+        }
+        mw_commit(mw);
+        return TRUE;
+    }
+
     MidiNote *n = midi_clip_note(mw->clip, (guint)mw->drag_note);
     if (!n) { mw->drag_mode = 0; return FALSE; }
     double dt = (e->x - mw->press_x) * mw->tpx;
@@ -452,8 +637,18 @@ static gboolean roll_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
 
 static gboolean roll_release(GtkWidget *w, GdkEventButton *e, gpointer data)
 {
-    (void)w; (void)e;
+    (void)w;
     MidiWindow *mw = data;
+    if (e->button == 3 && mw->sel_dragging) {
+        mw->sel_dragging = FALSE;
+        if (mw->sel_moved) {                  /* it was a box drag: keep selection */
+            mw->sel_moved = FALSE;
+            gtk_widget_queue_draw(mw->roll);  /* drop the box outline, keep highlight */
+        } else {                              /* a plain click: open the menu */
+            roll_show_context_menu(mw, e, mw->ctx_note_idx);
+        }
+        return TRUE;
+    }
     mw->drag_mode = 0; mw->drag_note = -1;
     return FALSE;
 }
@@ -717,7 +912,15 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
         return TRUE;
     case GDK_KEY_q:
     case GDK_KEY_Q:
-        quantize_all(mw);
+        quantize_notes(mw);
+        return TRUE;
+    case GDK_KEY_a:
+    case GDK_KEY_A:
+        if (e->state & GDK_CONTROL_MASK) { sel_all(mw); return TRUE; }
+        break;
+    case GDK_KEY_Escape:
+        sel_clear(mw);
+        gtk_widget_queue_draw(mw->roll);
         return TRUE;
     default:
         break;
@@ -743,6 +946,9 @@ static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
     if (mw->update_timer) { g_source_remove(mw->update_timer); mw->update_timer = 0; }
     g_object_set_data(G_OBJECT(mw->track), "midi-window", NULL);
     gtk_widget_destroy(mw->window);
+    g_free(mw->sel);
+    g_free(mw->grp_start);
+    g_free(mw->grp_pitch);
     g_free(mw);
     return TRUE;
 }
