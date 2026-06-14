@@ -7,6 +7,7 @@
 #include "trackstrip.h"
 #include "jackdaw-engine.h"
 #include "midiwindow.h"
+#include "fxwindow.h"
 #include "main.h"
 
 /* ========================================================================
@@ -1060,10 +1061,14 @@ static gboolean timeline_wave_scroll(GtkWidget *widget,
 }
 
 /* 50 ms timer: update playhead and auto-scroll to follow it */
+static void master_vu_tick(JackDawTimeline *tl);   /* defined with master row */
+
 static gboolean timeline_update_timer(gpointer data)
 {
     JackDawTimeline *tl = data;
     if (!JACKDAW_IS_TIMELINE(tl)) return G_SOURCE_REMOVE;
+
+    master_vu_tick(tl);   /* refresh the master header meter (decays when idle) */
 
     /* Keep the horizontal scrollbar's range in sync with content + view. */
     {
@@ -1311,6 +1316,13 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->ruler_drag_active = FALSE;
     tl->ruler_drag_last_x = 0.0;
     tl->ruler_drag_scroll = 0;
+    tl->master_row    = NULL;
+    tl->master_mute   = NULL;
+    tl->master_vu     = NULL;
+    tl->master_vu_L   = 0.0f;
+    tl->master_vu_R   = 0.0f;
+    tl->master_suppress = FALSE;
+    tl->master_sig_connected = FALSE;
     tl->sel_active    = FALSE;
     tl->selecting     = FALSE;
     tl->sel_start     = 0;
@@ -1479,6 +1491,157 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     gtk_widget_show_all(outer);
 
     g_hash_table_insert(tl->wave_views, track, JACKDAW_WAVE_VIEW(wv));
+}
+
+/* ---- Master-bus row (simplified header + display-only lane) ---- */
+
+static void mw_master_mute_toggled(GtkToggleButton *b, gpointer data)
+{
+    JackDawTimeline *tl = data;
+    if (tl->master_suppress) return;
+    jackdaw_track_set_muted(jackdaw_project_get_master_track(tl->project),
+                            gtk_toggle_button_get_active(b));
+}
+
+static void mw_master_fx_clicked(GtkButton *b, gpointer data)
+{
+    (void)b;
+    JackDawTimeline *tl = data;
+    jackdaw_fx_window_open(jackdaw_project_get_master_track(tl->project),
+                           tl->project);
+}
+
+/* Keep the header's Mute button in sync with master changes from the mixer. */
+static void mw_master_state_changed(JackDawTrack *t, gpointer data)
+{
+    JackDawTimeline *tl = data;
+    if (!tl->master_row) return;
+    tl->master_suppress = TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tl->master_mute),
+                                 jackdaw_track_is_muted(t));
+    tl->master_suppress = FALSE;
+}
+
+/* L/R level meter for the master header — same look as the track-strip VU. */
+static gboolean master_vu_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    JackDawTimeline *tl = data;
+    GtkAllocation a; gtk_widget_get_allocation(w, &a);
+    cairo_set_source_rgb(cr, 0.08, 0.08, 0.08);
+    cairo_paint(cr);
+
+    gfloat peaks[2] = { tl->master_vu_L, tl->master_vu_R };
+    gint   bar_w    = (a.width - 3) / 2;
+    for (int ch = 0; ch < 2; ch++) {
+        gint bx = (ch == 0) ? 1 : (2 + bar_w);
+        cairo_set_source_rgb(cr, 0.18, 0.18, 0.18);
+        cairo_rectangle(cr, bx, 0, bar_w, a.height);
+        cairo_fill(cr);
+        gfloat pk = peaks[ch];
+        if (pk > 0.0001f) {
+            float db   = 20.0f * log10f(pk);
+            float dbc  = CLAMP(db, -60.0f, 6.0f);
+            float frac = (dbc + 60.0f) / 66.0f;
+            gint  fh   = (gint)(frac * (float)a.height);
+            if (fh > a.height) fh = a.height;
+            if (fh > 0) {
+                if (db >= 0.0f)        cairo_set_source_rgb(cr, 0.90, 0.15, 0.15);
+                else if (db >= -12.0f) cairo_set_source_rgb(cr, 0.85, 0.78, 0.10);
+                else                   cairo_set_source_rgb(cr, 0.15, 0.68, 0.20);
+                cairo_rectangle(cr, bx, a.height - fh, bar_w, fh);
+                cairo_fill(cr);
+            }
+        }
+    }
+    return FALSE;
+}
+
+/* Called from the 50 ms timeline timer to refresh the master meter. */
+static void master_vu_tick(JackDawTimeline *tl)
+{
+    if (!tl->master_row || !tl->master_vu) return;
+    gfloat l = 0.0f, r = 0.0f;
+    jackdaw_engine_get_master_peaks(&l, &r);
+    tl->master_vu_L = (l > tl->master_vu_L) ? l : tl->master_vu_L * 0.89f;
+    tl->master_vu_R = (r > tl->master_vu_R) ? r : tl->master_vu_R * 0.89f;
+    gtk_widget_queue_draw(tl->master_vu);
+}
+
+void jackdaw_timeline_set_master_visible(JackDawTimeline *tl, gboolean show)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    if (show == (tl->master_row != NULL)) return;
+
+    JackDawTrack *mt = jackdaw_project_get_master_track(tl->project);
+
+    if (!show) {
+        if (tl->master_row) {
+            g_hash_table_remove(tl->wave_views, mt);
+            gtk_widget_destroy(tl->master_row);
+            tl->master_row = tl->master_mute = tl->master_vu = NULL;
+        }
+        return;
+    }
+
+    /* Outer wrapper sized like a normal track row. */
+    GtkWidget *outer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_size_request(outer, -1, TIMELINE_TRACK_HEIGHT);
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+
+    /* Simplified header: "Master" label + M + Fx (no Solo/input/arm/mono) and
+     * an L/R level meter on the right, like a normal track strip. */
+    GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    gtk_container_set_border_width(GTK_CONTAINER(hdr), 4);
+    gtk_size_group_add_widget(tl->header_size_group, hdr);
+
+    GtkWidget *lbl = gtk_label_new("Master");
+    gtk_widget_set_halign(lbl, GTK_ALIGN_START);
+    tl->master_mute = gtk_toggle_button_new_with_label("M");
+    GtkWidget *fx   = gtk_button_new_with_label("Fx");
+    gtk_widget_set_size_request(tl->master_mute, 20, 20);
+    gtk_widget_set_size_request(fx, 24, 20);
+    gtk_style_context_add_class(gtk_widget_get_style_context(tl->master_mute), "ts-mute");
+    gtk_style_context_add_class(gtk_widget_get_style_context(fx), "ts-fx");
+
+    tl->master_suppress = TRUE;
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(tl->master_mute),
+                                 jackdaw_track_is_muted(mt));
+    tl->master_suppress = FALSE;
+
+    g_signal_connect(tl->master_mute, "toggled",
+                     G_CALLBACK(mw_master_mute_toggled), tl);
+    g_signal_connect(fx, "clicked", G_CALLBACK(mw_master_fx_clicked), tl);
+    if (!tl->master_sig_connected) {   /* connect exactly once across show/hide */
+        g_signal_connect_object(mt, "state-changed",
+                                G_CALLBACK(mw_master_state_changed), tl, 0);
+        tl->master_sig_connected = TRUE;
+    }
+
+    tl->master_vu = gtk_drawing_area_new();
+    gtk_widget_set_size_request(tl->master_vu, 20, -1);
+    g_signal_connect(tl->master_vu, "draw", G_CALLBACK(master_vu_draw), tl);
+
+    gtk_box_pack_start(GTK_BOX(hdr), lbl, FALSE, FALSE, 2);
+    gtk_box_pack_start(GTK_BOX(hdr), tl->master_mute, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hdr), fx, FALSE, FALSE, 0);
+    gtk_box_pack_end  (GTK_BOX(hdr), tl->master_vu, FALSE, FALSE, 0);
+
+    /* Display-only lane: a normal wave view (grid + playhead; no regions). */
+    GtkWidget *wv = jackdaw_wave_view_new(mt, tl->time_adj, tl->zoom_adj,
+                                          tl->cursor_adj);
+    JACKDAW_WAVE_VIEW(wv)->project  = tl->project;
+    JACKDAW_WAVE_VIEW(wv)->timeline = tl;
+
+    gtk_box_pack_start(GTK_BOX(row), hdr, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(row), wv,  TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(outer), row, TRUE, TRUE, 0);
+
+    gtk_box_pack_start(GTK_BOX(tl->tracks_box), outer, FALSE, FALSE, 0);
+    gtk_box_reorder_child(GTK_BOX(tl->tracks_box), outer, 0);  /* pin to top */
+    gtk_widget_show_all(outer);
+
+    tl->master_row = outer;
+    g_hash_table_insert(tl->wave_views, mt, JACKDAW_WAVE_VIEW(wv));
 }
 
 void jackdaw_timeline_remove_track(JackDawTimeline *tl, JackDawTrack *track)

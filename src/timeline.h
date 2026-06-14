@@ -142,6 +142,15 @@ struct _JackDawTimeline {
     gboolean          ruler_drag_active;
     gdouble           ruler_drag_last_x;  /* last pointer x within the ruler */
     guint             ruler_drag_scroll;  /* GSource id for edge auto-scroll */
+
+    /* Optional master-bus row pinned at the top (display-only lane) */
+    GtkWidget        *master_row;     /* outer box; NULL when hidden */
+    GtkWidget        *master_mute;
+    GtkWidget        *master_vu;      /* L/R level meter in the master header */
+    gfloat            master_vu_L;
+    gfloat            master_vu_R;
+    gboolean          master_suppress;
+    gboolean          master_sig_connected; /* state-changed hooked up once */
 };
 
 struct _JackDawTimelineClass {
@@ -156,6 +165,9 @@ GtkWidget    *jackdaw_timeline_new(JackDawProject *project);
 
 void          jackdaw_timeline_add_track   (JackDawTimeline *tl, JackDawTrack *track);
 void          jackdaw_timeline_remove_track(JackDawTimeline *tl, JackDawTrack *track);
+
+/* Show/hide the master-bus track row pinned at the very top of the timeline. */
+void          jackdaw_timeline_set_master_visible(JackDawTimeline *tl, gboolean show);
 
 JackDawTrack *jackdaw_timeline_get_focused(JackDawTimeline *tl);
 void          jackdaw_timeline_zoom_in    (JackDawTimeline *tl);

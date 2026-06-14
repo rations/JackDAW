@@ -29,6 +29,8 @@ struct _JackDawProject {
 
     gfloat       master_volume;
     volatile gpointer master_rt_chain;  /* swapped atomically (Phase 5) */
+    JackDawTrack *master_track;         /* the master bus as a real track
+                                         * (owns master gain/FX/mute; NOT in tracks) */
 
     /* JACK port counts (0 = auto-detect from physical JACK ports at startup).
      * Non-zero values are user overrides saved in the inifile. */
@@ -68,6 +70,9 @@ JackDawTrack *jackdaw_project_get_track   (JackDawProject *p, guint idx);
 /* Master volume */
 void   jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);
 gfloat jackdaw_project_get_master_volume(JackDawProject *p);
+
+/* The master bus track (owns master gain, FX chain, mute). Never NULL. */
+JackDawTrack *jackdaw_project_get_master_track(JackDawProject *p);
 
 /* Project file */
 void         jackdaw_project_set_file(JackDawProject *p, const gchar *path);

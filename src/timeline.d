@@ -620,7 +620,7 @@ src/timeline.o: src/timeline.c src/config.h src/timeline.h \
  /usr/include/gtk-3.0/gtk/deprecated/gtkvseparator.h \
  /usr/include/gtk-3.0/gtk/gtk-autocleanups.h src/track.h src/audio_clip.h \
  src/clipregion.h src/midiclip.h src/project.h src/trackstrip.h \
- src/jackdaw-engine.h src/midiwindow.h src/main.h
+ src/jackdaw-engine.h src/midiwindow.h src/fxwindow.h src/main.h
 src/config.h:
 src/timeline.h:
 /usr/include/gtk-3.0/gtk/gtk.h:
@@ -1299,4 +1299,5 @@ src/project.h:
 src/trackstrip.h:
 src/jackdaw-engine.h:
 src/midiwindow.h:
+src/fxwindow.h:
 src/main.h:

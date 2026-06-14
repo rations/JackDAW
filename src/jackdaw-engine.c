@@ -963,9 +963,21 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         }
     }
 
-    /* Apply master volume and write to out_1 (L) / out_2 (R).
-     * Additional outputs (out_3+) are zeroed so no stale data leaks out. */
+    /* Master bus track: run its FX chain in place on the summed mix, then take
+     * the master gain (and mute) from the master track. Audio track, so the
+     * whole chain is effects (no instrument at index 0). */
+    JackDawTrack *mt = engine.project ? engine.project->master_track : NULL;
     gfloat mvol = engine.project ? engine.project->master_volume : 1.0f;
+    if (mt) {
+        JackDawFxChain *mchain = g_atomic_pointer_get(&mt->rt_chain);
+        if (mchain) {
+            for (int fi = 0; fi < mchain->n; fi++)
+                pluginhost_process((PluginInstance *)mchain->fx[fi],
+                                   engine.master_L, engine.master_R, (int)nframes);
+        }
+        mvol = mt->volume;
+        if (g_atomic_int_get(&mt->state_flags) & TRACK_MUTED) mvol = 0.0f;
+    }
     gfloat mpk_L = 0.0f, mpk_R = 0.0f;
     guint oi;
     for (oi = 0; oi < engine.audio_out_count; oi++) {

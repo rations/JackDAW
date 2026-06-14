@@ -34,6 +34,7 @@ static void jackdaw_project_finalize(GObject *obj)
         p->tracks = NULL;
     }
     g_free(p->project_file);
+    g_clear_object(&p->master_track);
 
     G_OBJECT_CLASS(jackdaw_project_parent_class)->finalize(obj);
 }
@@ -74,6 +75,9 @@ static void jackdaw_project_init(JackDawProject *p)
     p->project_file    = NULL;
     p->master_volume   = 1.0f;
     p->master_rt_chain = NULL;
+    /* Master bus as a real track: owns master gain/FX/mute. Kept out of the
+     * tracks array so it never shows in the normal track list / save loop. */
+    p->master_track    = jackdaw_track_new("Master", NULL);
     /* 0 = auto-detect from physical JACK ports at engine init */
     p->audio_in_count  = settings_get_uint32("jackAudioInCount",  0);
     p->audio_out_count = settings_get_uint32("jackAudioOutCount", 0);
@@ -146,6 +150,12 @@ gfloat jackdaw_project_get_master_volume(JackDawProject *p)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), 1.0f);
     return p->master_volume;
+}
+
+JackDawTrack *jackdaw_project_get_master_track(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), NULL);
+    return p->master_track;
 }
 
 /* ---- Project file ---- */
@@ -271,6 +281,67 @@ static gboolean kf_bool(GKeyFile *kf, const char *g, const char *k, gboolean def
 static gboolean cat_is_instrument(const char *c)
 { return c && (strstr(c, "Instrument") || strstr(c, "Synth")); }
 
+/* Write a track's FX chain. `grp` is the key group holding "fx_count"; each
+ * plugin goes into "<grp>.fx<i>". Shared by normal tracks and the master. */
+static void project_save_fx(GKeyFile *kf, JackDawTrack *t, const char *grp)
+{
+    guint fc = jackdaw_track_fx_count(t);
+    g_key_file_set_integer(kf, grp, "fx_count", (gint)fc);
+    for (guint fi = 0; fi < fc; fi++) {
+        PluginInstance *inst = jackdaw_track_fx_get(t, fi);
+        const char *key = pluginhost_key(inst), *cat = pluginhost_category(inst);
+        char fg[64]; g_snprintf(fg, sizeof fg, "%s.fx%u", grp, fi);
+        g_key_file_set_integer(kf, fg, "format", (gint)pluginhost_format(inst));
+        g_key_file_set_string (kf, fg, "key", key ? key : "");
+        g_key_file_set_string (kf, fg, "name", pluginhost_name(inst));
+        g_key_file_set_string (kf, fg, "category", cat ? cat : "");
+        g_key_file_set_boolean(kf, fg, "active", pluginhost_is_active(inst));
+        g_key_file_set_double (kf, fg, "mix", pluginhost_get_mix(inst));
+        guint pc = pluginhost_param_count(inst);
+        if (pc > 0 && pc < 4096) {
+            gdouble *pv = g_new(gdouble, pc);
+            for (guint pi = 0; pi < pc; pi++) pv[pi] = pluginhost_param_get(inst, pi);
+            g_key_file_set_double_list(kf, fg, "params", pv, pc);
+            g_free(pv);
+        }
+    }
+}
+
+/* Rebuild a track's FX chain from "<grp>.fx<i>" groups. */
+static void project_load_fx(GKeyFile *kf, JackDawTrack *t, const char *grp)
+{
+    gint fc = CLAMP(kf_int(kf, grp, "fx_count", 0), 0, 1024);
+    for (gint fi = 0; fi < fc; fi++) {
+        char fg[64]; g_snprintf(fg, sizeof fg, "%s.fx%d", grp, fi);
+        if (!g_key_file_has_group(kf, fg)) continue;
+        gchar *key = g_key_file_get_string(kf, fg, "key", NULL);
+        gchar *fnm = g_key_file_get_string(kf, fg, "name", NULL);
+        gchar *cat = g_key_file_get_string(kf, fg, "category", NULL);
+        gint   fmt = CLAMP(kf_int(kf, fg, "format", 0), 0, PH_NFORMATS - 1);
+        if (key && key[0]) {
+            PluginInfo info;
+            info.format        = (PluginFormat)fmt;
+            info.key           = key;
+            info.name          = fnm ? fnm : (char *)"fx";
+            info.category      = cat ? cat : (char *)"";
+            info.is_instrument = cat_is_instrument(cat);
+            PluginInstance *inst = pluginhost_instantiate(&info);
+            if (inst) {
+                pluginhost_set_active(inst, kf_bool(kf, fg, "active", TRUE));
+                pluginhost_set_mix(inst, (float)kf_dbl(kf, fg, "mix", 1.0));
+                gsize pn = 0;
+                gdouble *pv = g_key_file_get_double_list(kf, fg, "params", &pn, NULL);
+                guint pc = pluginhost_param_count(inst);
+                for (gsize pi = 0; pv && pi < pn && pi < pc; pi++)
+                    pluginhost_param_set(inst, (guint)pi, (float)pv[pi]);
+                g_free(pv);
+                jackdaw_track_fx_add(t, inst);
+            }
+        }
+        g_free(key); g_free(fnm); g_free(cat);
+    }
+}
+
 gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TRUE);
@@ -280,7 +351,9 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
     g_key_file_set_double (kf, "project", "bpm", p->bpm);
     g_key_file_set_integer(kf, "project", "beats_per_bar", (gint)p->beats_per_bar);
     g_key_file_set_integer(kf, "project", "beat_unit", (gint)p->beat_unit);
-    g_key_file_set_double (kf, "project", "master_volume", p->master_volume);
+    /* Legacy field: effective master gain (so old readers still get a level). */
+    g_key_file_set_double (kf, "project", "master_volume",
+                           jackdaw_track_get_volume(p->master_track));
     g_key_file_set_boolean(kf, "project", "grid", p->grid_enabled);
     g_key_file_set_boolean(kf, "project", "snap", p->snap_enabled);
     g_key_file_set_boolean(kf, "project", "metronome", p->metronome_enabled);
@@ -336,27 +409,15 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
             g_array_free(vals, TRUE);
         }
 
-        guint fc = jackdaw_track_fx_count(t);
-        g_key_file_set_integer(kf, grp, "fx_count", (gint)fc);
-        for (guint fi = 0; fi < fc; fi++) {
-            PluginInstance *inst = jackdaw_track_fx_get(t, fi);
-            const char *key = pluginhost_key(inst), *cat = pluginhost_category(inst);
-            char fg[48]; g_snprintf(fg, sizeof fg, "track%u.fx%u", ti, fi);
-            g_key_file_set_integer(kf, fg, "format", (gint)pluginhost_format(inst));
-            g_key_file_set_string (kf, fg, "key", key ? key : "");
-            g_key_file_set_string (kf, fg, "name", pluginhost_name(inst));
-            g_key_file_set_string (kf, fg, "category", cat ? cat : "");
-            g_key_file_set_boolean(kf, fg, "active", pluginhost_is_active(inst));
-            g_key_file_set_double (kf, fg, "mix", pluginhost_get_mix(inst));
-            guint pc = pluginhost_param_count(inst);
-            if (pc > 0 && pc < 4096) {
-                gdouble *pv = g_new(gdouble, pc);
-                for (guint pi = 0; pi < pc; pi++) pv[pi] = pluginhost_param_get(inst, pi);
-                g_key_file_set_double_list(kf, fg, "params", pv, pc);
-                g_free(pv);
-            }
-        }
+        project_save_fx(kf, t, grp);
     }
+
+    /* Master bus track: gain stages + FX chain under the "master" group. */
+    g_key_file_set_double (kf, "master", "trim",  jackdaw_track_get_trim(p->master_track));
+    g_key_file_set_double (kf, "master", "fader", jackdaw_track_get_fader(p->master_track));
+    g_key_file_set_integer(kf, "master", "muted",
+                           jackdaw_track_is_muted(p->master_track) ? 1 : 0);
+    project_save_fx(kf, p->master_track, "master");
 
     gboolean ok = g_key_file_save_to_file(kf, path, NULL);
     g_key_file_free(kf);
@@ -466,36 +527,22 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
         jackdaw_track_commit_midi(t, fpb);
 
         /* fx chain (incl. the instrument at index 0) */
-        gint fc = CLAMP(kf_int(kf, grp, "fx_count", 0), 0, 1024);
-        for (gint fi = 0; fi < fc; fi++) {
-            char fg[48]; g_snprintf(fg, sizeof fg, "track%d.fx%d", ti, fi);
-            if (!g_key_file_has_group(kf, fg)) continue;
-            gchar *key = g_key_file_get_string(kf, fg, "key", NULL);
-            gchar *fnm = g_key_file_get_string(kf, fg, "name", NULL);
-            gchar *cat = g_key_file_get_string(kf, fg, "category", NULL);
-            gint   fmt = CLAMP(kf_int(kf, fg, "format", 0), 0, PH_NFORMATS - 1);
-            if (key && key[0]) {
-                PluginInfo info;
-                info.format        = (PluginFormat)fmt;
-                info.key           = key;
-                info.name          = fnm ? fnm : (char *)"fx";
-                info.category      = cat ? cat : (char *)"";
-                info.is_instrument = cat_is_instrument(cat);
-                PluginInstance *inst = pluginhost_instantiate(&info);
-                if (inst) {
-                    pluginhost_set_active(inst, kf_bool(kf, fg, "active", TRUE));
-                    pluginhost_set_mix(inst, (float)kf_dbl(kf, fg, "mix", 1.0));
-                    gsize pn = 0;
-                    gdouble *pv = g_key_file_get_double_list(kf, fg, "params", &pn, NULL);
-                    guint pc = pluginhost_param_count(inst);
-                    for (gsize pi = 0; pv && pi < pn && pi < pc; pi++)
-                        pluginhost_param_set(inst, (guint)pi, (float)pv[pi]);
-                    g_free(pv);
-                    jackdaw_track_fx_add(t, inst);
-                }
-            }
-            g_free(key); g_free(fnm); g_free(cat);
-        }
+        project_load_fx(kf, t, grp);
+    }
+
+    /* Master bus track: gain stages + FX. Legacy sessions have no "master"
+     * group — fall back to master_volume on the fader, trim/FX at unity/none. */
+    {
+        double legacy_master = kf_dbl(kf, "project", "master_volume", 1.0);
+        jackdaw_track_set_trim (p->master_track,
+                                (gfloat)kf_dbl(kf, "master", "trim", 1.0));
+        jackdaw_track_set_fader(p->master_track,
+                                (gfloat)kf_dbl(kf, "master", "fader", legacy_master));
+        jackdaw_track_set_muted(p->master_track,
+                                kf_int(kf, "master", "muted", 0) != 0);
+        while (jackdaw_track_fx_count(p->master_track) > 0)   /* drop old chain */
+            jackdaw_track_fx_remove(p->master_track, 0);
+        project_load_fx(kf, p->master_track, "master");
     }
 
     g_key_file_free(kf);

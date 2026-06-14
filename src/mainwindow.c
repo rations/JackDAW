@@ -161,6 +161,13 @@ static void mw_add_track_cb(GtkMenuItem *item, gpointer data)
     g_object_unref(t);
 }
 
+static void mw_show_master_cb(GtkCheckMenuItem *item, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_timeline_set_master_visible(win->timeline,
+                                        gtk_check_menu_item_get_active(item));
+}
+
 static void mw_add_instrument_track_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -215,6 +222,14 @@ static gboolean mw_tracks_box_press_cb(GtkWidget *widget, GdkEventButton *ev,
     GtkWidget *mi_rem = gtk_menu_item_new_with_label("Remove Focused Track");
     g_signal_connect(mi_rem, "activate", G_CALLBACK(mw_remove_track_cb), win);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_rem);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+    GtkWidget *mi_master = gtk_check_menu_item_new_with_label("Show Master Track");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi_master),
+                                   win->timeline && win->timeline->master_row != NULL);
+    g_signal_connect(mi_master, "toggled", G_CALLBACK(mw_show_master_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_master);
 
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);

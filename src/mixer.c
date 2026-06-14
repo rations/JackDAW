@@ -268,6 +268,9 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     s->mixer = mixer;
     s->track = track;
 
+    gboolean is_master =
+        (track && track == jackdaw_project_get_master_track(mixer->project));
+
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_size_request(box, 80, -1);
     gtk_container_set_border_width(GTK_CONTAINER(box), 3);
@@ -280,8 +283,8 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     gtk_widget_set_size_request(name, 58, -1);
     gtk_box_pack_start(GTK_BOX(box), name, FALSE, FALSE, 0);
 
-    /* Pan (tracks only) */
-    if (track) {
+    /* Pan (real tracks only — not the master bus) */
+    if (track && !is_master) {
         s->pan = knob_new(-1.0, 1.0, (double)jackdaw_track_get_pan(track),
                           0.0, KNOB_PAN, mix_pan_changed, s);
         gtk_widget_set_halign(s->pan, GTK_ALIGN_CENTER);
@@ -332,36 +335,41 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     gtk_box_pack_start(GTK_BOX(mid), s->vu,     FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), mid, TRUE, TRUE, 0);
 
-    /* Mute / Solo / Fx (tracks only) — same look & padding as the track strip. */
+    /* Mute / Solo / Fx (tracks only) — same look & padding as the track strip.
+     * The master bus has no Solo (it would be a no-op against the solo bus). */
     if (track) {
         GtkWidget *ms = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
         gtk_widget_set_halign(ms, GTK_ALIGN_CENTER);
         s->btn_mute = gtk_toggle_button_new_with_label("M");
-        s->btn_solo = gtk_toggle_button_new_with_label("S");
         s->btn_fx   = gtk_button_new_with_label("Fx");
         gtk_widget_set_size_request(s->btn_mute, 20, 20);
-        gtk_widget_set_size_request(s->btn_solo, 20, 20);
         gtk_widget_set_size_request(s->btn_fx,   24, 20);
         gtk_widget_set_tooltip_text(s->btn_mute, "Mute");
-        gtk_widget_set_tooltip_text(s->btn_solo, "Solo");
         gtk_widget_set_tooltip_text(s->btn_fx,   "Open the effects window for this track");
         gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_mute), "ts-mute");
-        gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_solo), "ts-solo");
         gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_fx),   "ts-fx");
         s->suppress = TRUE;
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_mute),
                                      jackdaw_track_is_muted(track));
-        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_solo),
-                                     jackdaw_track_is_soloed(track));
         s->suppress = FALSE;
         g_signal_connect(s->btn_mute, "toggled",
                          G_CALLBACK(mix_mute_toggled), s);
-        g_signal_connect(s->btn_solo, "toggled",
-                         G_CALLBACK(mix_solo_toggled), s);
         g_signal_connect(s->btn_fx, "clicked",
                          G_CALLBACK(mix_fx_clicked), s);
         gtk_box_pack_start(GTK_BOX(ms), s->btn_mute, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(ms), s->btn_solo, FALSE, FALSE, 0);
+        if (!is_master) {                       /* real tracks keep Solo */
+            s->btn_solo = gtk_toggle_button_new_with_label("S");
+            gtk_widget_set_size_request(s->btn_solo, 20, 20);
+            gtk_widget_set_tooltip_text(s->btn_solo, "Solo");
+            gtk_style_context_add_class(gtk_widget_get_style_context(s->btn_solo), "ts-solo");
+            s->suppress = TRUE;
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(s->btn_solo),
+                                         jackdaw_track_is_soloed(track));
+            s->suppress = FALSE;
+            g_signal_connect(s->btn_solo, "toggled",
+                             G_CALLBACK(mix_solo_toggled), s);
+            gtk_box_pack_start(GTK_BOX(ms), s->btn_solo, FALSE, FALSE, 0);
+        }
         gtk_box_pack_start(GTK_BOX(ms), s->btn_fx,   FALSE, FALSE, 0);
         gtk_box_pack_start(GTK_BOX(box), ms, FALSE, FALSE, 0);
 
@@ -372,7 +380,7 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
 
     g_signal_connect(box, "destroy", G_CALLBACK(mix_strip_destroy), s);
 
-    if (!track) mixer->master = s;
+    if (is_master) mixer->master = s;
     return box;
 }
 
@@ -391,6 +399,13 @@ static gboolean mixer_vu_tick(gpointer data)
         s->pk_L = (l > s->pk_L) ? l : s->pk_L * 0.89f;
         s->pk_R = (r > s->pk_R) ? r : s->pk_R * 0.89f;
         gtk_widget_queue_draw(s->vu);
+        if (s->btn_fx && s->track) {
+            GtkStyleContext *fx = gtk_widget_get_style_context(s->btn_fx);
+            if (jackdaw_track_fx_count(s->track) > 0)
+                gtk_style_context_add_class(fx, "ts-fx-active");
+            else
+                gtk_style_context_remove_class(fx, "ts-fx-active");
+        }
     }
 
     GHashTableIter it; gpointer k, v;
@@ -486,7 +501,7 @@ GtkWidget *jackdaw_mixer_new(JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(m), scroll, TRUE, TRUE, 0);
 
     /* Master strip, pinned far left, then a divider */
-    GtkWidget *master = mixer_strip_new(m, NULL);
+    GtkWidget *master = mixer_strip_new(m, jackdaw_project_get_master_track(project));
     gtk_box_pack_start(GTK_BOX(m->strips_box), master, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(m->strips_box),
                        gtk_separator_new(GTK_ORIENTATION_VERTICAL),
