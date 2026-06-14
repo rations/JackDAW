@@ -825,6 +825,7 @@ static void timeline_clear_section_sel(JackDawTimeline *tl)
 {
     if (tl->sel_regions) g_ptr_array_set_size(tl->sel_regions, 0);
     tl->sel_track      = NULL;
+    tl->move_armed     = FALSE;
     tl->moving         = FALSE;
     tl->move_committed = FALSE;
     g_clear_pointer(&tl->move_orig, g_free);
@@ -1266,9 +1267,11 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
         return TRUE;
     }
 
-    /* Plain press on an already-selected section → begin a move-drag. */
+    /* Plain press on an already-selected section → arm a potential move-drag.
+     * If the pointer doesn't move, the release falls through to a plain seek. */
     if (r && tl->sel_track == wv->track && timeline_sel_contains(tl, r)) {
-        tl->moving         = TRUE;
+        tl->move_armed     = TRUE;
+        tl->moving         = FALSE;
         tl->move_committed = FALSE;
         tl->move_press_x   = event->x;
         guint n = tl->sel_regions->len;
@@ -1299,6 +1302,15 @@ static gboolean timeline_wave_motion(GtkWidget *widget,
 {
     (void)widget;
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+
+    /* A drag armed on a selected section becomes a real move once the pointer
+     * travels past a small threshold; until then it may still be a plain click. */
+    if (tl->move_armed && !tl->moving) {
+        if (fabs(event->x - tl->move_press_x) > 3.0)
+            tl->moving = TRUE;
+        else
+            return TRUE;   /* swallow tiny jitters; keep waiting */
+    }
 
     /* Section move-drag: shift every selected region by a snapped delta. */
     if (tl->moving && tl->sel_regions && tl->move_orig) {
@@ -1345,7 +1357,8 @@ static gboolean timeline_wave_released(GtkWidget *widget,
 
     /* Finalize a section move-drag: re-sort and rebuild the RT snapshot. */
     if (tl->moving) {
-        tl->moving = FALSE;
+        tl->moving      = FALSE;
+        tl->move_armed  = FALSE;
         if (tl->sel_track) {
             clip_region_list_sort(jackdaw_track_get_regions(tl->sel_track));
             jackdaw_track_commit_regions(tl->sel_track);
@@ -1355,9 +1368,23 @@ static gboolean timeline_wave_released(GtkWidget *widget,
         return TRUE;
     }
 
+    /* Armed but never dragged → it was a plain click on a selected section:
+     * seek the playhead there and keep the selection. */
+    if (tl->move_armed) {
+        tl->move_armed = FALSE;
+        g_clear_pointer(&tl->move_orig, g_free);
+        off_t sample = timeline_x_to_sample(tl, event->x);
+        timeline_set_playhead(tl, sample);
+        g_signal_emit(tl, timeline_signals[SIGNAL_POSITION_CHANGED], 0,
+                      (gint64)sample);
+        return TRUE;
+    }
+
+    /* Only a rubber-band drag (started in the press handler) selects on release;
+     * a Ctrl+click multi-select must not be collapsed here. */
+    gboolean was_selecting = tl->selecting;
     tl->selecting = FALSE;
-    /* A plain click (no drag) selects the region under the pointer. */
-    if (!tl->sel_active) {
+    if (was_selecting && !tl->sel_active) {
         JackDawWaveView *wv = JACKDAW_WAVE_VIEW(widget);
         timeline_select_region_at(tl, wv->track, tl->sel_start);
     }
@@ -1719,6 +1746,7 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->sel_end       = 0;
     tl->sel_track     = NULL;
     tl->sel_regions   = g_ptr_array_new();
+    tl->move_armed    = FALSE;
     tl->moving        = FALSE;
     tl->move_committed = FALSE;
     tl->move_press_x  = 0.0;

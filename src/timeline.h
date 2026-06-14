@@ -127,6 +127,8 @@ struct _JackDawTimeline {
     GPtrArray        *sel_regions; /* ClipRegion* (not owned) on sel_track */
 
     /* Section move-drag state */
+    gboolean          move_armed;    /* press landed on a selected section; a
+                                      * drag may begin (else it's a plain seek) */
     gboolean          moving;        /* a section move-drag is in progress */
     gboolean          move_committed;/* undo already pushed for this drag */
     gdouble           move_press_x;  /* pointer x (widget coords) at drag start */
