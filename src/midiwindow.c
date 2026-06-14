@@ -35,7 +35,7 @@ typedef struct {
 
     GtkWidget      *window;
     GtkWidget      *roll, *keys, *vel, *ruler;
-    GtkWidget      *btn_play, *btn_pause, *btn_stop;
+    GtkWidget      *btn_play, *btn_pause, *btn_stop, *btn_loop;
     GtkWidget      *time_label;
     GtkAdjustment  *h_adj;      /* value = leftmost tick */
     GtkAdjustment  *v_adj;      /* value = topmost row (0 = pitch 127) */
@@ -70,6 +70,7 @@ typedef struct {
     double   play_tick;         /* clip-relative tick of playhead; -1 = off / before region */
     off_t    prev_play_pos;     /* last seen engine position (for auto-scroll) */
     gboolean ruler_dragging;    /* left button held on the ruler (scrubbing) */
+    int      loop_drag_edge;    /* 0 none, 1 dragging loop start, 2 loop end */
 
     guint    update_timer;      /* 50 ms timer id */
 } MidiWindow;
@@ -309,6 +310,26 @@ static gboolean roll_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_stroke(cr);
     }
 
+    /* loop-region band (faint amber over the grid) */
+    if (jackdaw_engine_has_loop_region()) {
+        double fpb = jackdaw_project_frames_per_beat(mw->project,
+                                                     jackdaw_engine_get_sample_rate());
+        if (fpb > 0.0) {
+            off_t ls, le;
+            jackdaw_engine_get_loop_range(&ls, &le);
+            double x0 = tick_to_x(mw, (double)ls * JACKDAW_PPQ / fpb);
+            double x1 = tick_to_x(mw, (double)le * JACKDAW_PPQ / fpb);
+            x0 = CLAMP(x0, 0.0, (double)a.width);
+            x1 = CLAMP(x1, 0.0, (double)a.width);
+            if (x1 > x0) {
+                gboolean on = jackdaw_engine_get_loop_enabled();
+                cairo_set_source_rgba(cr, 0.95, 0.65, 0.10, on ? 0.10 : 0.05);
+                cairo_rectangle(cr, x0, 0, x1 - x0, a.height);
+                cairo_fill(cr);
+            }
+        }
+    }
+
     /* playhead — drawn last so it's on top */
     if (mw->play_tick >= 0.0) {
         double cx = tick_to_x(mw, mw->play_tick);
@@ -455,6 +476,36 @@ static gboolean ruler_draw(GtkWidget *w, cairo_t *cr, gpointer data)
             cairo_stroke(cr);
         }
     }
+
+    /* loop-region band + end tabs (amber) */
+    {
+        double fpb = jackdaw_project_frames_per_beat(mw->project,
+                                                     jackdaw_engine_get_sample_rate());
+        if (fpb > 0.0) {
+            off_t ls, le;
+            jackdaw_engine_get_loop_range(&ls, &le);
+            gboolean has = jackdaw_engine_has_loop_region();
+            gboolean on  = jackdaw_engine_get_loop_enabled();
+            double x0 = tick_to_x(mw, (double)ls * JACKDAW_PPQ / fpb);
+            double x1 = tick_to_x(mw, (double)le * JACKDAW_PPQ / fpb);
+            if (has && x1 >= 0 && x0 <= (double)a.width) {
+                double bx0 = CLAMP(x0, 0.0, (double)a.width);
+                double bx1 = CLAMP(x1, 0.0, (double)a.width);
+                cairo_set_source_rgba(cr, 0.95, 0.65, 0.10, on ? 0.30 : 0.15);
+                cairo_rectangle(cr, bx0, 0, bx1 - bx0, a.height);
+                cairo_fill(cr);
+            }
+            cairo_set_source_rgb(cr, 0.95, 0.65, 0.10);
+            if (x0 >= -5.0 && x0 <= (double)a.width + 5.0) {
+                cairo_rectangle(cr, x0, 0, 4, a.height);
+                cairo_fill(cr);
+            }
+            if (x1 >= -5.0 && x1 <= (double)a.width + 5.0) {
+                cairo_rectangle(cr, x1 - 4, 0, 4, a.height);
+                cairo_fill(cr);
+            }
+        }
+    }
     return FALSE;
 }
 
@@ -476,11 +527,59 @@ static void ruler_seek_to_x(MidiWindow *mw, double x)
     gtk_widget_queue_draw(mw->roll);
 }
 
+/* Hit-test the ruler x against the loop tabs (frame edges -> ticks -> x).
+ * Returns 1 (start), 2 (end), or 0. When no region exists both tabs sit at
+ * frame 0; a hit grabs the end tab so the user drags right to create it. */
+static int ruler_loop_hit(MidiWindow *mw, double x)
+{
+    double fpb = jackdaw_project_frames_per_beat(mw->project,
+                                                 jackdaw_engine_get_sample_rate());
+    if (fpb <= 0.0) return 0;
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    double x0 = tick_to_x(mw, (double)ls * JACKDAW_PPQ / fpb);
+    double x1 = tick_to_x(mw, (double)le * JACKDAW_PPQ / fpb);
+    if (!jackdaw_engine_has_loop_region())
+        return (fabs(x - x0) <= 6.0) ? 2 : 0;
+    if (fabs(x - x0) <= 6.0) return 1;
+    if (fabs(x - x1) <= 6.0) return 2;
+    return 0;
+}
+
+/* Apply a loop-tab drag to ruler x, snapping to the grid and clamping so the
+ * dragged edge cannot cross the other one. */
+static void ruler_loop_drag_to(MidiWindow *mw, double x)
+{
+    double fpb = jackdaw_project_frames_per_beat(mw->project,
+                                                 jackdaw_engine_get_sample_rate());
+    if (fpb <= 0.0) return;
+    double tick = snap_tick(mw, x_to_tick(mw, x));
+    if (tick < 0) tick = 0;
+    off_t frame = (off_t)(tick * fpb / (double)JACKDAW_PPQ);
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    if (mw->loop_drag_edge == 1) {            /* start tab */
+        if (frame > le) frame = le;
+        jackdaw_engine_set_loop_range(frame, le);
+    } else {                                  /* end tab */
+        if (frame < ls) frame = ls;
+        jackdaw_engine_set_loop_range(ls, frame);
+    }
+    gtk_widget_queue_draw(mw->ruler);
+    gtk_widget_queue_draw(mw->roll);
+}
+
 static gboolean ruler_press(GtkWidget *w, GdkEventButton *e, gpointer data)
 {
     (void)w;
     MidiWindow *mw = data;
     if (e->button != 1) return FALSE;
+    int edge = ruler_loop_hit(mw, e->x);
+    if (edge) {
+        mw->loop_drag_edge = edge;
+        ruler_loop_drag_to(mw, e->x);
+        return TRUE;
+    }
     mw->ruler_dragging = TRUE;
     ruler_seek_to_x(mw, e->x);
     return TRUE;
@@ -490,6 +589,10 @@ static gboolean ruler_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
 {
     (void)w;
     MidiWindow *mw = data;
+    if (mw->loop_drag_edge && (e->state & GDK_BUTTON1_MASK)) {
+        ruler_loop_drag_to(mw, e->x);
+        return TRUE;
+    }
     if (mw->ruler_dragging && (e->state & GDK_BUTTON1_MASK))
         ruler_seek_to_x(mw, e->x);
     return TRUE;
@@ -499,6 +602,7 @@ static gboolean ruler_release(GtkWidget *w, GdkEventButton *e, gpointer data)
 {
     (void)w; (void)e;
     MidiWindow *mw = data;
+    mw->loop_drag_edge = 0;
     mw->ruler_dragging = FALSE;
     return TRUE;
 }
@@ -556,6 +660,16 @@ static void mw_ctx_select_all(GtkMenuItem *item, gpointer data)
     sel_all((MidiWindow *)data);
 }
 
+static void mw_ctx_clear_loop(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    MidiWindow *mw = data;
+    jackdaw_engine_set_loop_range(0, 0);
+    jackdaw_engine_set_loop_enabled(FALSE);
+    gtk_widget_queue_draw(mw->ruler);
+    gtk_widget_queue_draw(mw->roll);
+}
+
 static void roll_show_context_menu(MidiWindow *mw, GdkEventButton *ev, int note_idx)
 {
     mw->ctx_note_idx = note_idx;
@@ -578,6 +692,13 @@ static void roll_show_context_menu(MidiWindow *mw, GdkEventButton *ev, int note_
                                       ? "Quantize Selected  [Q]"
                                       : "Quantize All  [Q]");
     g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_quantize_all), mw);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+    mi = gtk_menu_item_new_with_label("Clear Loop Region");
+    gtk_widget_set_sensitive(mi, jackdaw_engine_has_loop_region());
+    g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_clear_loop), mw);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
 
     gtk_widget_show_all(menu);
@@ -839,6 +960,16 @@ static void mw_play_toggled(GtkToggleButton *b, gpointer data)
     mw_set_class(GTK_WIDGET(b), "transport-play", on);
 }
 
+static void mw_loop_toggled(GtkToggleButton *b, gpointer data)
+{
+    MidiWindow *mw = data;
+    gboolean on = gtk_toggle_button_get_active(b);
+    jackdaw_engine_set_loop_enabled(on);
+    mw_set_class(GTK_WIDGET(b), "transport-loop", on);
+    gtk_widget_queue_draw(mw->ruler);
+    gtk_widget_queue_draw(mw->roll);
+}
+
 /* Shared helper: stop playback and sync the play toggle (no locate). */
 static void mw_stop_transport(MidiWindow *mw)
 {
@@ -926,6 +1057,18 @@ static gboolean transport_update(gpointer data)
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mw->btn_play), playing);
         mw_set_class(mw->btn_play, "transport-play", playing);
         g_signal_handlers_unblock_by_func(mw->btn_play, mw_play_toggled, mw);
+    }
+
+    /* --- Sync loop-toggle with engine loop state (may be toggled elsewhere) --- */
+    {
+        gboolean loop_on  = jackdaw_engine_get_loop_enabled();
+        gboolean lbtn_on  = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(mw->btn_loop));
+        if (lbtn_on != loop_on) {
+            g_signal_handlers_block_by_func(mw->btn_loop, mw_loop_toggled, mw);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(mw->btn_loop), loop_on);
+            mw_set_class(mw->btn_loop, "transport-loop", loop_on);
+            g_signal_handlers_unblock_by_func(mw->btn_loop, mw_loop_toggled, mw);
+        }
     }
 
     /* --- Update time display (same as mainwindow's 100ms timer) --- */
@@ -1077,6 +1220,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->btn_play             = gtk_toggle_button_new_with_label("▶");
     mw->btn_pause            = gtk_button_new_with_label("||");
     mw->btn_stop             = gtk_button_new_with_label("■");
+    mw->btn_loop             = gtk_toggle_button_new_with_label("⟳");
 
     gtk_widget_set_tooltip_text(btn_start,     "Return to start  [Home]");
     gtk_widget_set_tooltip_text(btn_step_back, "Step back one frame (25fps)");
@@ -1085,6 +1229,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     gtk_widget_set_tooltip_text(mw->btn_play,  "Play / Stop  [Space]");
     gtk_widget_set_tooltip_text(mw->btn_pause, "Pause");
     gtk_widget_set_tooltip_text(mw->btn_stop,  "Stop");
+    gtk_widget_set_tooltip_text(mw->btn_loop,  "Loop region");
 
     g_signal_connect(btn_start,     "clicked", G_CALLBACK(mw_locate_start_cb),   mw);
     g_signal_connect(btn_step_back, "clicked", G_CALLBACK(mw_step_back_cb),      mw);
@@ -1093,6 +1238,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     g_signal_connect(mw->btn_play,  "toggled", G_CALLBACK(mw_play_toggled),      mw);
     g_signal_connect(mw->btn_pause, "clicked", G_CALLBACK(mw_pause_cb),          mw);
     g_signal_connect(mw->btn_stop,  "clicked", G_CALLBACK(mw_transport_stop_cb), mw);
+    g_signal_connect(mw->btn_loop,  "toggled", G_CALLBACK(mw_loop_toggled),      mw);
 
     gtk_box_pack_start(GTK_BOX(tb), btn_start,     FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tb), btn_step_back, FALSE, FALSE, 0);
@@ -1103,6 +1249,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_play,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_pause, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tb), mw->btn_stop,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tb), mw->btn_loop,  FALSE, FALSE, 0);
 
     mw->time_label = gtk_label_new("00:00.0");
     gtk_style_context_add_class(gtk_widget_get_style_context(mw->time_label),

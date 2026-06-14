@@ -143,6 +143,9 @@ struct _JackDawTimeline {
     gdouble           ruler_drag_last_x;  /* last pointer x within the ruler */
     guint             ruler_drag_scroll;  /* GSource id for edge auto-scroll */
 
+    /* Loop-region tab drag: 0 none, 1 dragging start tab, 2 dragging end tab */
+    int               loop_drag_edge;
+
     /* Optional master-bus row pinned at the top (display-only lane) */
     GtkWidget        *master_row;     /* outer box; NULL when hidden */
     GtkWidget        *master_mute;

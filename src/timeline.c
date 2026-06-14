@@ -16,6 +16,43 @@
 
 G_DEFINE_TYPE(JackDawTimeRuler, jackdaw_time_ruler, GTK_TYPE_DRAWING_AREA)
 
+/* Draw the loop-region band and the two draggable end tabs onto the ruler.
+ * Shared by both ruler modes. x = (frame - start_samp) / spp. The tabs are
+ * always meaningful: when no region is set both edges sit at frame 0. */
+static void ruler_draw_loop(cairo_t *cr, gint w, gint h,
+                            off_t start_samp, gdouble spp)
+{
+    if (spp <= 0.0) return;
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    gboolean has = jackdaw_engine_has_loop_region();
+    gboolean on  = jackdaw_engine_get_loop_enabled();
+
+    double x0 = ((double)ls - (double)start_samp) / spp;
+    double x1 = ((double)le - (double)start_samp) / spp;
+
+    /* Band between the tabs (only when a region exists). */
+    if (has && x1 >= 0 && x0 <= (double)w) {
+        double bx0 = CLAMP(x0, 0.0, (double)w);
+        double bx1 = CLAMP(x1, 0.0, (double)w);
+        cairo_set_source_rgba(cr, 0.95, 0.65, 0.10, on ? 0.30 : 0.15);
+        cairo_rectangle(cr, bx0, 0, bx1 - bx0, h);
+        cairo_fill(cr);
+    }
+
+    /* End tabs — solid amber handles a few px wide, grown to one side so they
+     * stay visible even when both edges coincide at frame 0. */
+    cairo_set_source_rgb(cr, 0.95, 0.65, 0.10);
+    if (x0 >= -5.0 && x0 <= (double)w + 5.0) {
+        cairo_rectangle(cr, x0, 0, 4, h);          /* start tab: right of x0 */
+        cairo_fill(cr);
+    }
+    if (x1 >= -5.0 && x1 <= (double)w + 5.0) {
+        cairo_rectangle(cr, x1 - 4, 0, 4, h);      /* end tab: left of x1 */
+        cairo_fill(cr);
+    }
+}
+
 static gboolean ruler_draw(GtkWidget *widget, cairo_t *cr)
 {
     JackDawTimeRuler *r = JACKDAW_TIME_RULER(widget);
@@ -79,6 +116,7 @@ static gboolean ruler_draw(GtkWidget *widget, cairo_t *cr)
                 cairo_stroke(cr);
             }
         }
+        ruler_draw_loop(cr, w, h, start_samp, spp);
         return FALSE;
     }
 
@@ -150,6 +188,8 @@ static gboolean ruler_draw(GtkWidget *widget, cairo_t *cr)
             cairo_stroke(cr);
         }
     }
+
+    ruler_draw_loop(cr, w, h, start_samp, spp);
 
     return FALSE;
 }
@@ -393,6 +433,27 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
             cairo_set_line_width(cr, 1.0);
             cairo_move_to(cr, sx0 + 0.5, 0); cairo_line_to(cr, sx0 + 0.5, h);
             cairo_move_to(cr, sx1 + 0.5, 0); cairo_line_to(cr, sx1 + 0.5, h);
+            cairo_stroke(cr);
+        }
+    }
+
+    /* Loop-region band (shared across all tracks; amber). */
+    if (spp > 0.0 && jackdaw_engine_has_loop_region()) {
+        off_t ls, le;
+        jackdaw_engine_get_loop_range(&ls, &le);
+        double lx0 = ((gdouble)ls - start) / spp;
+        double lx1 = ((gdouble)le - start) / spp;
+        lx0 = CLAMP(lx0, 0.0, (double)w);
+        lx1 = CLAMP(lx1, 0.0, (double)w);
+        if (lx1 > lx0) {
+            gboolean on = jackdaw_engine_get_loop_enabled();
+            cairo_set_source_rgba(cr, 0.95, 0.65, 0.10, on ? 0.16 : 0.08);
+            cairo_rectangle(cr, lx0, 0, lx1 - lx0, h);
+            cairo_fill(cr);
+            cairo_set_source_rgba(cr, 0.95, 0.65, 0.10, 0.7);
+            cairo_set_line_width(cr, 1.0);
+            cairo_move_to(cr, lx0 + 0.5, 0); cairo_line_to(cr, lx0 + 0.5, h);
+            cairo_move_to(cr, lx1 + 0.5, 0); cairo_line_to(cr, lx1 + 0.5, h);
             cairo_stroke(cr);
         }
     }
@@ -882,6 +943,16 @@ static void menu_delete_region_cb(GtkMenuItem *item, gpointer data)
     jackdaw_timeline_redraw_all(tl);
 }
 
+static void menu_clear_loop_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    jackdaw_engine_set_loop_range(0, 0);
+    jackdaw_engine_set_loop_enabled(FALSE);
+    gtk_widget_queue_draw(GTK_WIDGET(tl->ruler));
+    jackdaw_timeline_redraw_all(tl);
+}
+
 static void menu_open_midi_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -934,6 +1005,8 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
         { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    tl->sel_active },
         { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          tl->sel_active },
         { "Delete Region",       G_CALLBACK(menu_delete_region_cb), TRUE },
+        { "Clear Loop Region",   G_CALLBACK(menu_clear_loop_cb),
+          jackdaw_engine_has_loop_region() },
     };
     for (guint i = 0; i < G_N_ELEMENTS(items); i++) {
         GtkWidget *mi = gtk_menu_item_new_with_label(items[i].label);
@@ -1193,12 +1266,57 @@ static gboolean ruler_edge_scroll(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
+/* Apply a loop-tab drag to the timeline x-coordinate, clamping so the dragged
+ * edge cannot cross the other one. */
+static void ruler_loop_drag_to(JackDawTimeline *tl, gdouble x)
+{
+    off_t frame = timeline_x_to_sample(tl, x);   /* snapped, clamped >= 0 */
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    if (tl->loop_drag_edge == 1) {            /* dragging start tab */
+        if (frame > le) frame = le;
+        jackdaw_engine_set_loop_range(frame, le);
+    } else {                                  /* dragging end tab */
+        if (frame < ls) frame = ls;
+        jackdaw_engine_set_loop_range(ls, frame);
+    }
+    gtk_widget_queue_draw(GTK_WIDGET(tl->ruler));
+    jackdaw_timeline_redraw_all(tl);
+}
+
+/* Hit-test the ruler x against the loop tabs. Returns 1 (start), 2 (end), or 0.
+ * When no region exists both tabs sit at frame 0; a hit grabs the end tab so
+ * the user drags right to create the region. */
+static int ruler_loop_hit(JackDawTimeline *tl, gdouble x)
+{
+    gdouble spp   = gtk_adjustment_get_value(tl->zoom_adj);
+    gdouble start = gtk_adjustment_get_value(tl->time_adj);
+    if (spp <= 0.0) return 0;
+    off_t ls, le;
+    jackdaw_engine_get_loop_range(&ls, &le);
+    double x0 = ((double)ls - start) / spp;
+    double x1 = ((double)le - start) / spp;
+    if (!jackdaw_engine_has_loop_region())
+        return (fabs(x - x0) <= 6.0) ? 2 : 0;
+    if (fabs(x - x0) <= 6.0) return 1;
+    if (fabs(x - x1) <= 6.0) return 2;
+    return 0;
+}
+
 static gboolean ruler_button_press_cb(GtkWidget *widget, GdkEventButton *ev,
                                        gpointer data)
 {
     (void)widget;
     if (ev->button != 1) return FALSE;
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+
+    /* Grab a loop tab if the click landed on one — takes priority over scrub. */
+    int edge = ruler_loop_hit(tl, ev->x);
+    if (edge) {
+        tl->loop_drag_edge = edge;
+        ruler_loop_drag_to(tl, ev->x);
+        return TRUE;
+    }
 
     gdouble spp   = gtk_adjustment_get_value(tl->zoom_adj);
     gdouble start = gtk_adjustment_get_value(tl->time_adj);
@@ -1215,6 +1333,12 @@ static gboolean ruler_motion_cb(GtkWidget *widget, GdkEventMotion *ev,
                                   gpointer data)
 {
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+
+    if (tl->loop_drag_edge) {
+        ruler_loop_drag_to(tl, ev->x);
+        return TRUE;
+    }
+
     if (!tl->ruler_drag_active) return FALSE;
 
     tl->ruler_drag_last_x = ev->x;
@@ -1248,6 +1372,7 @@ static gboolean ruler_button_release_cb(GtkWidget *widget, GdkEventButton *ev,
     (void)widget;
     if (ev->button != 1) return FALSE;
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    tl->loop_drag_edge = 0;
     tl->ruler_drag_active = FALSE;
     if (tl->ruler_drag_scroll) {
         g_source_remove(tl->ruler_drag_scroll);

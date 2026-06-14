@@ -56,6 +56,13 @@ typedef struct {
     volatile gint transport_flags; /* ENGINE_PLAYING | ENGINE_RECORDING */
     volatile off_t play_pos;       /* sample counter, incremented by process cb */
 
+    /* Loop region (frames). Looping is active only while loop_enabled is set and
+     * loop_end > loop_start; the playhead wraps loop_end -> loop_start once it has
+     * entered the region. Set/cleared from the main thread; read in the RT path. */
+    volatile gint  loop_enabled;
+    volatile off_t loop_start;
+    volatile off_t loop_end;
+
     jack_nframes_t sample_rate;    /* cached at init */
 
     /* Pre-rendered metronome click (mono), built at init. */
@@ -229,6 +236,32 @@ static void *feeder_thread_func(void *arg)
                     break; /* buffer full */
 
                 off_t pf = feeder_slots[i].play_frame;
+
+                /* --- Loop wrap: keep the feeder's stream inside the loop
+                 * region so the ringbuffer never buffers audio past loop_end.
+                 * Production is clamped to stop exactly on loop_start (when
+                 * approaching from before) and on loop_end (when inside); the
+                 * wrap then fires precisely at loop_end. A position already
+                 * past loop_end (playhead placed after the region) is left
+                 * alone, so playback there does not loop. --- */
+                if (g_atomic_int_get(&engine.loop_enabled)) {
+                    off_t l_start = engine.loop_start;
+                    off_t l_end   = engine.loop_end;
+                    if (l_end > l_start) {
+                        if (pf == l_end) {
+                            pf = l_start;
+                            feeder_slots[i].play_frame = pf;
+                            feeder_slot_close(i);  /* force re-seek of source */
+                        }
+                        if (pf < l_start) {
+                            off_t room = l_start - pf;  /* stop at region start */
+                            if ((off_t)out_want > room) out_want = (size_t)room;
+                        } else if (pf < l_end) {
+                            off_t room = l_end - pf;     /* stop at region end */
+                            if ((off_t)out_want > room) out_want = (size_t)room;
+                        }
+                    }
+                }
 
                 /* Locate the region covering pf and the next region after it. */
                 ClipRegion *reg = NULL;
@@ -756,6 +789,22 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     if (flags & ENGINE_PLAYING)
         engine.play_pos += nframes;
+
+    /* Loop wrap (master clock — drives MIDI scheduling, metronome, plugin
+     * transport and the UI playhead). Only engages when this block started
+     * inside the region: blk_start in [loop_start, loop_end). A playhead placed
+     * after the region therefore plays straight through without looping. The
+     * remainder past loop_end is carried over so the clock's loop period equals
+     * the region length, matching the feeder. Checked at block granularity, so
+     * the loop point quantizes to the JACK period (acceptable for now). */
+    if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.loop_enabled)) {
+        off_t l_start = engine.loop_start;
+        off_t l_end   = engine.loop_end;
+        off_t bstart  = engine.play_pos - (off_t)nframes;
+        if (l_end > l_start && bstart >= l_start && bstart < l_end &&
+            engine.play_pos >= l_end)
+            engine.play_pos = l_start + (engine.play_pos - l_end);
+    }
 
     /* Block start frame + transport for plugins that query host time (VST2
      * audioMasterGetTime, VST3 processContext). play_pos was just advanced. */
@@ -1859,6 +1908,61 @@ void jackdaw_engine_locate(off_t sample)
         feeder_slots[i].locate_frame = sample;
         g_atomic_int_set(&feeder_slots[i].locate_req, 1);
     }
+}
+
+/* Re-seek every feeder slot to the current play_pos without moving the
+ * playhead, so the ringbuffers refill with audio that respects the current
+ * loop state. While stopped this is a clean reset (RT is not draining, same as
+ * jackdaw_engine_locate); while playing it is best-effort — already-buffered
+ * audio plays out first. */
+static void engine_loop_reseek(void)
+{
+    off_t pos = engine.play_pos;
+    gboolean playing =
+        (g_atomic_int_get(&engine.transport_flags) & ENGINE_PLAYING) != 0;
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        JackDawTrack *t = engine.slots[i];
+        if (!t) continue;
+        if (!playing) {
+            t->played_frames = pos;
+            if (t->play_buf_L) jack_ringbuffer_reset(t->play_buf_L);
+            if (t->play_buf_R) jack_ringbuffer_reset(t->play_buf_R);
+        }
+        feeder_slots[i].locate_frame = pos;
+        g_atomic_int_set(&feeder_slots[i].locate_req, 1);
+    }
+}
+
+void jackdaw_engine_set_loop_range(off_t start, off_t end)
+{
+    if (start < 0) start = 0;
+    if (end   < 0) end   = 0;
+    if (end < start) { off_t tmp = start; start = end; end = tmp; }
+    engine.loop_start = start;
+    engine.loop_end   = end;
+    engine_loop_reseek();
+}
+
+void jackdaw_engine_get_loop_range(off_t *start, off_t *end)
+{
+    if (start) *start = engine.loop_start;
+    if (end)   *end   = engine.loop_end;
+}
+
+void jackdaw_engine_set_loop_enabled(gboolean on)
+{
+    g_atomic_int_set(&engine.loop_enabled, on ? 1 : 0);
+    engine_loop_reseek();
+}
+
+gboolean jackdaw_engine_get_loop_enabled(void)
+{
+    return g_atomic_int_get(&engine.loop_enabled) != 0;
+}
+
+gboolean jackdaw_engine_has_loop_region(void)
+{
+    return engine.loop_end > engine.loop_start;
 }
 
 jack_nframes_t jackdaw_engine_get_sample_rate(void)

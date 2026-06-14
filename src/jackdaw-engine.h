@@ -76,6 +76,17 @@ void jackdaw_engine_start_recording(void);
 void jackdaw_engine_stop_recording (void);
 void jackdaw_engine_locate         (off_t sample);
 
+/* --- Loop region ---
+ * A loop region (in timeline frames) plays on repeat when looping is enabled.
+ * The playhead wraps loop_end -> loop_start only once it has entered the region,
+ * so enabling looping never moves the playhead and a playhead placed after the
+ * region plays straight through. set_loop_range normalises start <= end. */
+void     jackdaw_engine_set_loop_range  (off_t start, off_t end);
+void     jackdaw_engine_get_loop_range  (off_t *start, off_t *end);
+void     jackdaw_engine_set_loop_enabled(gboolean on);
+gboolean jackdaw_engine_get_loop_enabled(void);
+gboolean jackdaw_engine_has_loop_region (void); /* TRUE when loop_end > loop_start */
+
 /* Sample rate reported by JACK (valid after jackdaw_engine_init) */
 jack_nframes_t jackdaw_engine_get_sample_rate(void);
 jack_nframes_t jackdaw_engine_get_buffer_size(void);

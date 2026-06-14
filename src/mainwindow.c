@@ -255,6 +255,18 @@ static void mw_transport_play_cb(GtkWidget *widget, gpointer data)
     mw_set_class(widget, "transport-play", on);
 }
 
+static void mw_transport_loop_cb(GtkWidget *widget, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
+    jackdaw_engine_set_loop_enabled(on);
+    mw_set_class(widget, "transport-loop", on);
+    if (win->timeline) {
+        jackdaw_timeline_redraw_all(win->timeline);
+        gtk_widget_queue_draw(GTK_WIDGET(win->timeline));  /* refresh ruler band */
+    }
+}
+
 static void mw_pause_cb(GtkWidget *widget, gpointer data)
 {
     (void)widget;
@@ -475,6 +487,22 @@ static gboolean mw_transport_timer(gpointer data)
     gchar tbuf[64];
     get_time(sr, pos, pos, tbuf, default_timescale_mode);
     gtk_label_set_text(GTK_LABEL(win->time_label), tbuf);
+
+    /* Keep the loop toggle in sync (it may be toggled from the MIDI window). */
+    if (win->loop_button) {
+        gboolean loop_on = jackdaw_engine_get_loop_enabled();
+        gboolean btn_on  =
+            gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(win->loop_button));
+        if (btn_on != loop_on) {
+            g_signal_handlers_block_by_func(win->loop_button,
+                                            mw_transport_loop_cb, win);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->loop_button),
+                                         loop_on);
+            mw_set_class(win->loop_button, "transport-loop", loop_on);
+            g_signal_handlers_unblock_by_func(win->loop_button,
+                                              mw_transport_loop_cb, win);
+        }
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -569,6 +597,7 @@ static void jackdaw_main_window_init(JackDawMainWindow *win)
     win->timeline        = NULL;
     win->play_button     = NULL;
     win->record_button   = NULL;
+    win->loop_button     = NULL;
     win->time_label      = NULL;
     win->mixer           = NULL;
     win->paned           = NULL;
@@ -606,6 +635,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
             "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
             "button.transport-rec  {"
             "  background-image:none; background-color:#c0392b; color:#ffffff; }"
+            "button.transport-loop {"
+            "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
             "label.transport-time  {"
             "  font-size:22px; font-weight:bold; font-family:monospace; }"
             /* Track strip buttons — compact size */
@@ -774,6 +805,12 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     g_signal_connect(win->record_button, "toggled",
                      G_CALLBACK(mw_transport_record_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), win->record_button, FALSE, FALSE, 0);
+
+    win->loop_button = gtk_toggle_button_new_with_label("⟳");
+    gtk_widget_set_tooltip_text(win->loop_button, "Loop region");
+    g_signal_connect(win->loop_button, "toggled",
+                     G_CALLBACK(mw_transport_loop_cb), win);
+    gtk_box_pack_start(GTK_BOX(toolbar), win->loop_button, FALSE, FALSE, 0);
 
     win->time_label = gtk_label_new("00:00.0");
     gtk_style_context_add_class(gtk_widget_get_style_context(win->time_label),
