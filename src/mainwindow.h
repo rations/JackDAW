@@ -32,6 +32,9 @@ struct _JackDawMainWindow {
     /* Mixer dock */
     GtkWidget *mixer;
     GtkWidget *paned;
+    GtkWidget *mixer_window;   /* top-level host when "in window" mode is on; NULL until created */
+    GtkWidget *mixer_button;   /* the "Mixer" toggle button, so menu/window can sync it */
+    gboolean   mixer_in_window;/* current mode */
 
     guint      track_counter;   /* incremented for "Track N" names */
     guint      transport_timer; /* 100 ms source id for time display */

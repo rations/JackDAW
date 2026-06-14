@@ -455,11 +455,85 @@ static void mw_timesig_changed(GtkSpinButton *sb, gpointer data)
             (guint)gtk_spin_button_get_value_as_int(den));
 }
 
+/* Move the mixer back into the bottom dock (paned pack2) if it isn't already. */
+static void mw_mixer_dock(JackDawMainWindow *win)
+{
+    GtkWidget *parent = gtk_widget_get_parent(win->mixer);
+    if (parent == win->paned) return;
+    g_object_ref(win->mixer);
+    if (parent) gtk_container_remove(GTK_CONTAINER(parent), win->mixer);
+    gtk_paned_pack2(GTK_PANED(win->paned), win->mixer, FALSE, FALSE);
+    g_object_unref(win->mixer);
+}
+
+static gboolean mw_mixer_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer data)
+{
+    (void)w; (void)e;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    /* Closing the window via the WM behaves like toggling the Mixer button off;
+       the toggle handler hides the window for us. Returning TRUE prevents the
+       default destroy so the window can be reused. */
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->mixer_button), FALSE);
+    return TRUE;
+}
+
+/* Move the mixer into its own top-level window, creating it lazily. */
+static void mw_mixer_undock(JackDawMainWindow *win)
+{
+    if (!win->mixer_window) {
+        win->mixer_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win->mixer_window), "Mixer");
+        gtk_window_set_default_size(GTK_WINDOW(win->mixer_window), 700, 320);
+        gtk_window_set_transient_for(GTK_WINDOW(win->mixer_window),
+                                     GTK_WINDOW(win));
+        g_signal_connect(win->mixer_window, "delete-event",
+                         G_CALLBACK(mw_mixer_window_delete_cb), win);
+    }
+    GtkWidget *parent = gtk_widget_get_parent(win->mixer);
+    if (parent == win->mixer_window) return;
+    g_object_ref(win->mixer);
+    if (parent) gtk_container_remove(GTK_CONTAINER(parent), win->mixer);
+    gtk_container_add(GTK_CONTAINER(win->mixer_window), win->mixer);
+    gtk_widget_show(win->mixer);
+    g_object_unref(win->mixer);
+}
+
+/* Apply the current mixer-button state under the current docked/windowed mode. */
+static void mw_mixer_apply(JackDawMainWindow *win)
+{
+    gboolean active = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(win->mixer_button));
+    if (win->mixer_in_window) {
+        if (active) {
+            mw_mixer_undock(win);
+            gtk_widget_show_all(win->mixer_window);
+            gtk_window_present(GTK_WINDOW(win->mixer_window));
+        } else if (win->mixer_window) {
+            gtk_widget_hide(win->mixer_window);
+        }
+    } else {
+        if (win->mixer_window) gtk_widget_hide(win->mixer_window);
+        mw_mixer_dock(win);
+        gtk_widget_set_visible(win->mixer, active);
+    }
+}
+
 static void mw_mixer_toggled(GtkToggleButton *b, gpointer data)
 {
+    (void)b;
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     if (!win->mixer) return;
-    gtk_widget_set_visible(win->mixer, gtk_toggle_button_get_active(b));
+    mw_mixer_apply(win);
+}
+
+static void mw_mixer_window_mode_cb(GtkCheckMenuItem *item, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gboolean on = gtk_check_menu_item_get_active(item);
+    settings_set_uint32("mixer_in_window", on ? 1 : 0);
+    win->mixer_in_window = on;
+    /* Live switch: move an already-open mixer to the new location. */
+    mw_mixer_apply(win);
 }
 
 static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
@@ -722,6 +796,9 @@ static void jackdaw_main_window_init(JackDawMainWindow *win)
     win->time_label      = NULL;
     win->mixer           = NULL;
     win->paned           = NULL;
+    win->mixer_window    = NULL;
+    win->mixer_button    = NULL;
+    win->mixer_in_window = FALSE;
     win->track_counter   = 0;
     win->transport_timer = 0;
 }
@@ -822,6 +899,16 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
         g_signal_connect(mi_dark, "toggled",
                          G_CALLBACK(mw_dark_mode_cb), win);
         gtk_menu_shell_append(GTK_MENU_SHELL(m), mi_dark);
+    }
+    {
+        GtkWidget *mi_mixwin =
+            gtk_check_menu_item_new_with_label("Open Mixer in Window");
+        gtk_check_menu_item_set_active(
+            GTK_CHECK_MENU_ITEM(mi_mixwin),
+            settings_get_uint32("mixer_in_window", 0) != 0);
+        g_signal_connect(mi_mixwin, "toggled",
+                         G_CALLBACK(mw_mixer_window_mode_cb), win);
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), mi_mixwin);
     }
 
     /* ---- Transport toolbar ---- */
@@ -948,6 +1035,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(ftb), ts_den, FALSE, FALSE, 0);
 
     GtkWidget *tg_mixer = gtk_toggle_button_new_with_label("Mixer");
+    win->mixer_button = tg_mixer;
     g_signal_connect(tg_mixer, "toggled", G_CALLBACK(mw_mixer_toggled), win);
     gtk_box_pack_end(GTK_BOX(ftb), tg_mixer, FALSE, FALSE, 0);
 
@@ -955,6 +1043,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     GtkWidget *tl_widget = jackdaw_timeline_new(project);
     win->timeline = JACKDAW_TIMELINE(tl_widget);
     win->mixer    = jackdaw_mixer_new(project);
+    win->mixer_in_window = settings_get_uint32("mixer_in_window", 0) != 0;
 
     win->paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
     gtk_paned_pack1(GTK_PANED(win->paned), tl_widget,  TRUE,  FALSE);
