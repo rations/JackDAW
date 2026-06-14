@@ -1783,7 +1783,17 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
     for (guint e = 0; e < ne; e++) {
         int st = ev[e].data[0] & 0xF0, ch = ev[e].data[0] & 0x0F,
             p  = ev[e].data[1] & 0x7F;
-        if (st == 0x90 && ev[e].data[2] > 0) {
+        gboolean is_on  = (st == 0x90 && ev[e].data[2] > 0);
+        gboolean is_off = (st == 0x80 || (st == 0x90 && ev[e].data[2] == 0));
+
+        /* Any note-on or note-off for this pitch ends a note that is still open,
+         * so a released OR re-triggered note can never keep extending to the
+         * playhead. Only the genuinely-held note (open at the end) stays "now". */
+        if ((is_on || is_off) && on_idx[ch][p] >= 0) {
+            notes[on_idx[ch][p]].end_frame = (off_t)ev[e].frame;
+            on_idx[ch][p] = -1;
+        }
+        if (is_on) {
             if (nn >= ENG_REC_PREVIEW_MAX) break;
             notes[nn].start_frame = (off_t)ev[e].frame;
             notes[nn].end_frame   = now;            /* held -> extend to playhead */
@@ -1792,11 +1802,6 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
             notes[nn].channel     = (guint8)ch;
             on_idx[ch][p] = (gint)nn;
             nn++;
-        } else if (st == 0x80 || (st == 0x90 && ev[e].data[2] == 0)) {
-            if (on_idx[ch][p] >= 0) {
-                notes[on_idx[ch][p]].end_frame = (off_t)ev[e].frame;
-                on_idx[ch][p] = -1;
-            }
         }
     }
     if (count) *count = nn;
