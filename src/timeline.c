@@ -684,6 +684,8 @@ void jackdaw_wave_view_invalidate(JackDawWaveView *wv)
 
 typedef struct {
     GtkWidget *outer;       /* vertical box containing row + handle */
+    GtkWidget *strip;       /* track strip header (collapses as row shrinks) */
+    GtkWidget *wv;          /* wave view (drops its min height when collapsing) */
     gint       base_h;      /* outer height at drag start */
     gdouble    drag_y_root; /* pointer y_root at drag start */
     gboolean   dragging;
@@ -749,6 +751,12 @@ static gboolean resize_handle_motion(GtkWidget *w, GdkEventMotion *ev,
     new_h = CLAMP(new_h,
                   TIMELINE_TRACK_MIN_HEIGHT + TIMELINE_RESIZE_HANDLE_H,
                   TIMELINE_TRACK_MAX_HEIGHT + TIMELINE_RESIZE_HANDLE_H);
+
+    /* Collapse strip controls so the row can shrink below their natural size.
+     * Hide first, then request the new height, so GTK recomputes the minimum. */
+    gint content_h = new_h - TIMELINE_RESIZE_HANDLE_H;
+    if (rd->strip)
+        jackdaw_track_strip_set_height(JACKDAW_TRACK_STRIP(rd->strip), content_h);
     gtk_widget_set_size_request(rd->outer, -1, new_h);
     return TRUE;
 }
@@ -1900,6 +1908,8 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
 
     ResizeData *rd   = g_new0(ResizeData, 1);
     rd->outer        = outer;
+    rd->strip        = strip;
+    rd->wv           = wv;
     g_object_set_data_full(G_OBJECT(handle), "resize-data", rd, g_free);
 
     g_signal_connect(handle, "draw",

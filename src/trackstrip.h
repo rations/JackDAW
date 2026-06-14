@@ -49,6 +49,7 @@ struct _JackDawTrackStrip {
     GtkWidget    *btn_mono;      /* mono/stereo record toggle */
     GtkWidget    *btn_fx;        /* FX window toggle */
 
+    GtkWidget    *ctrl_row;      /* [A][M][S][Mo][Fx] + vol/pan row */
     GtkWidget    *vol_knob;      /* GtkDrawingArea; KnobData via g_object_set_data */
     GtkWidget    *pan_knob;
 
@@ -76,6 +77,11 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
 /* Rebuild input combo from current JACK port state.
  * Called automatically when project emits "ports-changed". */
 void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip);
+
+/* Adapt the strip to the available track-row height: progressively hide the
+ * input combo, then the control row + VU meter, so the row can shrink down to
+ * just the track name. `content_h` is the row height (excluding resize handle). */
+void jackdaw_track_strip_set_height(JackDawTrackStrip *strip, gint content_h);
 
 G_END_DECLS
 

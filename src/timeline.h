@@ -10,7 +10,7 @@ G_BEGIN_DECLS
 #define TIMELINE_HEADER_WIDTH      180  /* px: fixed-width track name column */
 #define TIMELINE_TRACK_HEIGHT       80  /* px: default height per track row  */
 #define TIMELINE_RULER_HEIGHT       28  /* px: time ruler                    */
-#define TIMELINE_TRACK_MIN_HEIGHT   40  /* px: minimum resizable height      */
+#define TIMELINE_TRACK_MIN_HEIGHT   22  /* px: minimum resizable height (name-only) */
 #define TIMELINE_TRACK_MAX_HEIGHT  600  /* px: maximum resizable height      */
 #define TIMELINE_RESIZE_HANDLE_H     5  /* px: drag handle below each track  */
 

@@ -382,6 +382,7 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->btn_solo        = NULL;
     strip->btn_mono        = NULL;
     strip->btn_fx          = NULL;
+    strip->ctrl_row        = NULL;
     strip->vol_knob        = NULL;
     strip->pan_knob        = NULL;
     strip->input_combo     = NULL;
@@ -428,6 +429,7 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
 
     /* Row 2: [A][M][S][Mo] | V knob | P knob */
     GtkWidget *ctrl_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
+    strip->ctrl_row = ctrl_row;
 
     strip->btn_arm  = gtk_toggle_button_new_with_label("A");
     strip->btn_mute = gtk_toggle_button_new_with_label("M");
@@ -566,4 +568,30 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     strip->vu_timer = g_timeout_add(50, vu_timer_cb, strip);
 
     return GTK_WIDGET(strip);
+}
+
+/* ---- Height-adaptive collapse --------------------------------------------
+ * As the user drags a track shorter than its full layout, drop the rows that
+ * no longer fit so the strip never blocks the row from shrinking. The name
+ * entry is always kept, so the smallest a track collapses to is its name.
+ *   >= TS_FULL_MIN : name + controls + input combo
+ *   >= TS_CTRL_MIN : name + controls (no input combo)
+ *   <  TS_CTRL_MIN : name only
+ */
+#define TS_FULL_MIN 72   /* px: room for all three rows */
+#define TS_CTRL_MIN 48   /* px: room for name + control row */
+
+void jackdaw_track_strip_set_height(JackDawTrackStrip *strip, gint content_h)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK_STRIP(strip));
+
+    gboolean show_input = content_h >= TS_FULL_MIN;
+    gboolean show_ctrl  = content_h >= TS_CTRL_MIN;
+
+    if (strip->input_combo)
+        gtk_widget_set_visible(strip->input_combo, show_input);
+    if (strip->ctrl_row)
+        gtk_widget_set_visible(strip->ctrl_row, show_ctrl);
+    if (strip->vu_meter)
+        gtk_widget_set_visible(strip->vu_meter, show_ctrl);
 }
