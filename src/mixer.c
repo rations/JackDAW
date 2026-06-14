@@ -7,6 +7,7 @@
 #include "track.h"
 #include "fxwindow.h"
 #include "jackdaw-engine.h"
+#include "settings.h"
 
 G_DEFINE_TYPE(JackDawMixer, jackdaw_mixer, GTK_TYPE_BOX)
 
@@ -103,6 +104,10 @@ static gboolean mix_scale_draw(GtkWidget *w, cairo_t *cr, gpointer data)
     double usable = a.height - 2.0 * FADER_SLIDER_HALF;
     if (usable < 1.0) usable = a.height;
 
+    /* dB label colour follows the chrome theme: dark text on light, light
+     * text on dark (the scale shares the GTK panel background). */
+    gboolean dark = settings_get_uint32("dark_mode", 1) != 0;
+
     cairo_set_font_size(cr, 14.0);
     for (int d = (int)FADER_DB_MAX; d >= (int)FADER_DB_MIN; d -= 6) {
         double pos = fader_db_to_pos((double)d);          /* 1 = top */
@@ -116,7 +121,8 @@ static gboolean mix_scale_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         cairo_stroke(cr);
         /* right-aligned label, vertically centred on the tick */
         cairo_text_extents_t ext; cairo_text_extents(cr, m, &ext);
-        cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);   /* black */
+        if (dark) cairo_set_source_rgb(cr, 0.90, 0.90, 0.90); /* light */
+        else      cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);    /* black */
         cairo_move_to(cr, a.width - 9.0 - ext.width,
                           y - (ext.height / 2.0 + ext.y_bearing));
         cairo_show_text(cr, m);

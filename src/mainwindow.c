@@ -9,6 +9,7 @@
 #include "mixer.h"
 #include "main.h"
 #include "um.h"
+#include "settings.h"
 
 G_DEFINE_TYPE(JackDawMainWindow, jackdaw_main_window, GTK_TYPE_WINDOW)
 
@@ -17,6 +18,103 @@ G_DEFINE_TYPE(JackDawMainWindow, jackdaw_main_window, GTK_TYPE_WINDOW)
 static JackDawTimeline *mw_timeline(GtkWidget *widget)
 {
     return JACKDAW_MAIN_WINDOW(widget)->timeline;
+}
+
+/* ========================================================================
+ * Theme (light / dark) — one screen-global CSS provider, rebuilt on toggle.
+ *
+ * The functional/state colours (transport, track-strip, fader, VU) live in
+ * the shared block and are IDENTICAL in both modes. Only the generic
+ * text/background/outline rules differ, plus gtk-application-prefer-dark-theme
+ * so the underlying theme's menus/scrollbars/entries follow along.
+ * ======================================================================== */
+
+static GtkCssProvider *g_app_css = NULL;
+
+/* Functional + geometry rules — same in light and dark. */
+static const char MW_CSS_SHARED[] =
+    "tooltip label { color:#ffffff; }"
+    /* Transport state colours override the generic button rules. */
+    "button.transport-play {"
+    "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
+    "button.transport-rec  {"
+    "  background-image:none; background-color:#c0392b; color:#ffffff; }"
+    "button.transport-loop {"
+    "  background-image:none; background-color:#8ce68c; color:#101010; }"
+    "label.transport-time  {"
+    "  font-size:22px; font-weight:bold; font-family:monospace; }"
+    /* Track strip buttons — compact size */
+    "button.ts-arm, button.ts-mute, button.ts-solo,"
+    "button.ts-mono, button.ts-fx {"
+    "  padding:1px 3px; min-height:0; min-width:0; font-size:10px; }"
+    /* Track strip button active colours */
+    "button.ts-arm:checked  {"
+    "  background-image:none; background-color:#c0392b; color:#ffffff; }"
+    "button.ts-mute:checked {"
+    "  background-image:none; background-color:#e67e22; color:#ffffff; }"
+    "button.ts-solo:checked {"
+    "  background-image:none; background-color:#ffe000; color:#101010; }"
+    "button.ts-fx.ts-fx-active {"
+    "  background-image:none; background-color:#2980b9; color:#ffffff; }"
+    /* Mixer fader: flat horizontal cap (not the theme's round handle)
+     * so its centre is a clear reference that lines up with the dB
+     * labels. Trough margins = half the cap height so the cap centre
+     * reaches the full travel; keep this in sync with FADER_SLIDER_HALF
+     * (7px) in mixer.c. */
+    "scale.mix-fader { padding:0; }"
+    "scale.mix-fader trough {"
+    "  margin:7px 0; min-width:5px;"
+    "  background-image:none; background-color:#262629; }"
+    "scale.mix-fader highlight {"
+    "  background-image:none; background-color:#3a6ea5; }"
+    "scale.mix-fader slider {"
+    "  min-width:24px; min-height:12px; margin:-7px -10px;"
+    "  border-radius:2px; border:1px solid #2a2a2e;"
+    "  background-image:none; background-color:#d2d2d6; }"
+    /* Floating real-time dB read-out shown beside the fader. */
+    "label.mix-db-pop {"
+    "  font-size:11px; font-family:monospace; color:#ffffff;"
+    "  background-color:#202024; padding:2px 5px;"
+    "  border:1px solid #4a90d9; border-radius:3px; }";
+
+/* Generic chrome rules — light variant (current look). */
+static const char MW_CSS_LIGHT[] =
+    "button { color:#101010; border:1px solid #808080; }"
+    "button:checked { background-image:none; background-color:#b8c4d8;"
+    "  color:#101010; }"
+    "spinbutton, spinbutton entry { color:#101010; }"
+    "label { color:#101010; }";
+
+/* Generic chrome rules — dark variant (light text on near-black, not gray). */
+static const char MW_CSS_DARK[] =
+    "window, .background { background-color:#1a1a1a; color:#e6e6e6; }"
+    "menubar, menu, toolbar, box, paned, scrolledwindow, viewport {"
+    "  background-color:#1a1a1a; }"
+    "label { color:#e6e6e6; }"
+    "button { color:#e6e6e6; background-color:#2a2a2a;"
+    "  border:1px solid #555555; }"
+    "button:checked { background-image:none; background-color:#3a3f4a;"
+    "  color:#e6e6e6; }"
+    "spinbutton, spinbutton entry { color:#e6e6e6;"
+    "  background-color:#262626; }";
+
+static void mw_apply_theme(gboolean dark)
+{
+    GtkSettings *gs = gtk_settings_get_default();
+    if (gs)
+        g_object_set(gs, "gtk-application-prefer-dark-theme", dark, NULL);
+
+    if (!g_app_css) {
+        g_app_css = gtk_css_provider_new();
+        gtk_style_context_add_provider_for_screen(
+            gdk_screen_get_default(), GTK_STYLE_PROVIDER(g_app_css),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+    gchar *css = g_strconcat(dark ? MW_CSS_DARK : MW_CSS_LIGHT,
+                             MW_CSS_SHARED, NULL);
+    gtk_css_provider_load_from_data(g_app_css, css, -1, NULL);
+    g_free(css);
 }
 
 /* ---- File menu ---- */
@@ -458,6 +556,17 @@ static void mw_zoom_out_cb(GtkMenuItem *item, gpointer data)
     jackdaw_timeline_zoom_out(mw_timeline(GTK_WIDGET(data)));
 }
 
+static void mw_dark_mode_cb(GtkCheckMenuItem *item, gpointer data)
+{
+    (void)data;
+    gboolean on = gtk_check_menu_item_get_active(item);
+    settings_set_uint32("dark_mode", on ? 1 : 0);
+    mw_apply_theme(on);
+    /* Force Cairo-drawn surfaces (e.g. the mixer dB scale, which picks its
+     * text colour from the theme) to repaint with the new scheme. */
+    gtk_widget_queue_draw(GTK_WIDGET(data));
+}
+
 /* ---- Timeline position-changed signal ---- */
 
 static void mw_on_position_changed(JackDawTimeline *tl, gint64 sample,
@@ -619,65 +728,9 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_window_set_title(GTK_WINDOW(win), "JackDAW 0.1.0");
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 700);
 
-    /* Transport button state colours (play = green, record = red). */
-    {
-        GtkCssProvider *css = gtk_css_provider_new();
-        gtk_css_provider_load_from_data(css,
-            /* Readable controls: dark text, visible button outlines. */
-            "button { color:#101010; border:1px solid #808080; }"
-            "button:checked { background-image:none; background-color:#b8c4d8;"
-            "  color:#101010; }"
-            "spinbutton, spinbutton entry { color:#101010; }"
-            "label { color:#101010; }"
-            "tooltip label { color:#ffffff; }"
-            /* Transport state colours override the generic button rules. */
-            "button.transport-play {"
-            "  background-image:none; background-color:#2e8b57; color:#ffffff; }"
-            "button.transport-rec  {"
-            "  background-image:none; background-color:#c0392b; color:#ffffff; }"
-            "button.transport-loop {"
-            "  background-image:none; background-color:#8ce68c; color:#101010; }"
-            "label.transport-time  {"
-            "  font-size:22px; font-weight:bold; font-family:monospace; }"
-            /* Track strip buttons — compact size */
-            "button.ts-arm, button.ts-mute, button.ts-solo,"
-            "button.ts-mono, button.ts-fx {"
-            "  padding:1px 3px; min-height:0; min-width:0; font-size:10px; }"
-            /* Track strip button active colours */
-            "button.ts-arm:checked  {"
-            "  background-image:none; background-color:#c0392b; color:#ffffff; }"
-            "button.ts-mute:checked {"
-            "  background-image:none; background-color:#e67e22; color:#ffffff; }"
-            "button.ts-solo:checked {"
-            "  background-image:none; background-color:#ffe000; color:#101010; }"
-            "button.ts-fx.ts-fx-active {"
-            "  background-image:none; background-color:#2980b9; color:#ffffff; }"
-            /* Mixer fader: flat horizontal cap (not the theme's round handle)
-             * so its centre is a clear reference that lines up with the dB
-             * labels. Trough margins = half the cap height so the cap centre
-             * reaches the full travel; keep this in sync with FADER_SLIDER_HALF
-             * (7px) in mixer.c. */
-            "scale.mix-fader { padding:0; }"
-            "scale.mix-fader trough {"
-            "  margin:7px 0; min-width:5px;"
-            "  background-image:none; background-color:#262629; }"
-            "scale.mix-fader highlight {"
-            "  background-image:none; background-color:#3a6ea5; }"
-            "scale.mix-fader slider {"
-            "  min-width:24px; min-height:12px; margin:-7px -10px;"
-            "  border-radius:2px; border:1px solid #2a2a2e;"
-            "  background-image:none; background-color:#d2d2d6; }"
-            /* Floating real-time dB read-out shown beside the fader. */
-            "label.mix-db-pop {"
-            "  font-size:11px; font-family:monospace; color:#ffffff;"
-            "  background-color:#202024; padding:2px 5px;"
-            "  border:1px solid #4a90d9; border-radius:3px; }",
-            -1, NULL);
-        gtk_style_context_add_provider_for_screen(
-            gdk_screen_get_default(), GTK_STYLE_PROVIDER(css),
-            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
-        g_object_unref(css);
-    }
+    /* Transport/track state colours + light-or-dark chrome. Applies the
+     * persisted dark-mode preference (default: light). */
+    mw_apply_theme(settings_get_uint32("dark_mode", 1) != 0);
 
     g_signal_connect(win, "delete-event", G_CALLBACK(mw_delete_event), NULL);
     g_signal_connect(win, "key-press-event", G_CALLBACK(mw_key_press), NULL);
@@ -749,6 +802,15 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "Zoom _Out  [Ctrl+-]",
               G_CALLBACK(mw_zoom_out_cb), win,
               GDK_KEY_minus, GDK_CONTROL_MASK, ag);
+    {
+        GtkWidget *mi_dark = gtk_check_menu_item_new_with_label("Dark Mode");
+        gtk_check_menu_item_set_active(
+            GTK_CHECK_MENU_ITEM(mi_dark),
+            settings_get_uint32("dark_mode", 1) != 0);
+        g_signal_connect(mi_dark, "toggled",
+                         G_CALLBACK(mw_dark_mode_cb), win);
+        gtk_menu_shell_append(GTK_MENU_SHELL(m), mi_dark);
+    }
 
     /* ---- Transport toolbar ---- */
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
