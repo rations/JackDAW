@@ -54,9 +54,10 @@ typedef struct {
     gboolean *sel;              /* sel[i] = note i is selected */
     guint     sel_cap;          /* allocated entries in sel */
 
-    /* group move: original start/pitch of every note, captured at press */
+    /* group edit: original start/pitch/velocity of every note, at press */
     guint32  *grp_start;
     guint8   *grp_pitch;
+    guint8   *grp_vel;
     guint     grp_cap;
 
     /* right-drag rubber-band selection box */
@@ -169,12 +170,18 @@ static guint sel_count(MidiWindow *mw)
         if (mw->sel[i]) c++;
     return c;
 }
+/* Redraw the surfaces that show the selection (roll + velocity lane). */
+static void sel_redraw(MidiWindow *mw)
+{
+    gtk_widget_queue_draw(mw->roll);
+    gtk_widget_queue_draw(mw->vel);
+}
 static void sel_all(MidiWindow *mw)
 {
     sel_ensure(mw);
     guint nc = midi_clip_note_count(mw->clip);
     for (guint i = 0; i < nc; i++) mw->sel[i] = TRUE;
-    gtk_widget_queue_draw(mw->roll);
+    sel_redraw(mw);
 }
 
 /* Snapshot every note's start/pitch so a group drag can apply a uniform
@@ -185,12 +192,14 @@ static void grp_capture(MidiWindow *mw)
     if (nc > mw->grp_cap) {
         mw->grp_start = g_realloc(mw->grp_start, nc * sizeof(guint32));
         mw->grp_pitch = g_realloc(mw->grp_pitch, nc * sizeof(guint8));
+        mw->grp_vel   = g_realloc(mw->grp_vel,   nc * sizeof(guint8));
         mw->grp_cap = nc;
     }
     for (guint i = 0; i < nc; i++) {
         MidiNote *n = midi_clip_note(mw->clip, i);
         mw->grp_start[i] = n->start;
         mw->grp_pitch[i] = n->pitch;
+        mw->grp_vel[i]   = n->velocity;
     }
 }
 
@@ -364,6 +373,14 @@ static gboolean vel_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         double nx = tick_to_x(mw, n->start);
         if (nx < -(double)VEL_BAR_W || nx > a.width) continue;
         double h = (n->velocity / 127.0) * (a.height - 4);
+        gboolean selected = sel_is(mw, i);
+        if (selected) {                  /* white halo behind selected bars */
+            cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+            cairo_set_line_width(cr, 4.0);
+            cairo_move_to(cr, floor(nx) + 1, a.height);
+            cairo_line_to(cr, floor(nx) + 1, a.height - h);
+            cairo_stroke(cr);
+        }
         double r, g, b; vel_color(n->velocity, &r, &g, &b);
         /* velocity bar: drawn as a 2px line (same width as original) */
         cairo_set_source_rgb(cr, r, g, b);
@@ -376,7 +393,9 @@ static gboolean vel_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         double label_y = a.height - h - 3;
         if (label_y < 11) label_y = 11;
         cairo_set_line_width(cr, 1.0);
-        cairo_set_source_rgb(cr, 0.75, 0.75, 0.75);
+        cairo_set_source_rgb(cr, selected ? 1.0 : 0.75,
+                                 selected ? 1.0 : 0.75,
+                                 selected ? 1.0 : 0.75);
         cairo_move_to(cr, floor(nx) - 2, label_y);
         cairo_show_text(cr, buf);
     }
@@ -551,7 +570,7 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
             return TRUE;
         }
         sel_clear(mw);                  /* clicked away: just deselect, place nothing */
-        gtk_widget_queue_draw(mw->roll);
+        sel_redraw(mw);
         return TRUE;
     }
 
@@ -584,7 +603,7 @@ static gboolean roll_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
             (fabs(e->x - mw->sel_x0) > 3.0 || fabs(e->y - mw->sel_y0) > 3.0))
             mw->sel_moved = TRUE;
         if (mw->sel_moved) sel_update_box(mw);
-        gtk_widget_queue_draw(mw->roll);
+        sel_redraw(mw);
         return TRUE;
     }
     if (mw->drag_mode == 0 || mw->drag_note < 0) {
@@ -643,7 +662,7 @@ static gboolean roll_release(GtkWidget *w, GdkEventButton *e, gpointer data)
         mw->sel_dragging = FALSE;
         if (mw->sel_moved) {                  /* it was a box drag: keep selection */
             mw->sel_moved = FALSE;
-            gtk_widget_queue_draw(mw->roll);  /* drop the box outline, keep highlight */
+            sel_redraw(mw);                   /* drop the box outline, keep highlight */
         } else {                              /* a plain click: open the menu */
             roll_show_context_menu(mw, e, mw->ctx_note_idx);
         }
@@ -673,9 +692,21 @@ static void vel_apply_y(MidiWindow *mw, int note_idx, double y)
 {
     GtkAllocation a; gtk_widget_get_allocation(mw->vel, &a);
     int v = (int)((1.0 - CLAMP(y, 0.0, (double)a.height) / (double)a.height) * 127.0 + 0.5);
-    MidiNote *n = midi_clip_note(mw->clip, (guint)note_idx);
-    if (!n) return;
-    n->velocity = (guint8)CLAMP(v, 1, 127);
+    v = CLAMP(v, 1, 127);
+    if (sel_count(mw) > 0 && sel_is(mw, (guint)note_idx) && note_idx < (int)mw->grp_cap) {
+        /* grabbed bar is selected: shift every selected note by the same delta
+         * from its captured original, preserving relative dynamics. */
+        int delta = v - (int)mw->grp_vel[note_idx];
+        guint nc = midi_clip_note_count(mw->clip);
+        for (guint i = 0; i < nc && i < mw->grp_cap; i++)
+            if (sel_is(mw, i))
+                midi_clip_note(mw->clip, i)->velocity =
+                    (guint8)CLAMP((int)mw->grp_vel[i] + delta, 1, 127);
+    } else {
+        MidiNote *n = midi_clip_note(mw->clip, (guint)note_idx);
+        if (!n) return;
+        n->velocity = (guint8)v;
+    }
     mw_commit(mw);
 }
 
@@ -688,6 +719,7 @@ static gboolean vel_press(GtkWidget *w, GdkEventButton *e, gpointer data)
     if (idx >= 0) {
         mw->drag_mode = 3;
         mw->drag_note = idx;
+        grp_capture(mw);            /* snapshot originals for relative group edit */
         vel_apply_y(mw, idx, e->y);
     }
     return TRUE;
@@ -920,7 +952,7 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
         break;
     case GDK_KEY_Escape:
         sel_clear(mw);
-        gtk_widget_queue_draw(mw->roll);
+        sel_redraw(mw);
         return TRUE;
     default:
         break;
@@ -949,6 +981,7 @@ static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
     g_free(mw->sel);
     g_free(mw->grp_start);
     g_free(mw->grp_pitch);
+    g_free(mw->grp_vel);
     g_free(mw);
     return TRUE;
 }
