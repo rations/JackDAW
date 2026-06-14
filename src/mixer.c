@@ -87,6 +87,40 @@ static double fader_db_to_pos(double db)
     return (CLAMP(db, FADER_DB_MIN, FADER_DB_MAX) - FADER_DB_MIN) / FADER_DB_SPAN;
 }
 
+/* dB scale column drawn beside the fader. We draw the 6 dB labels ourselves
+ * instead of using gtk_scale_add_mark(), because scale marks act as snap
+ * "stop values" and make the fader drag in steps rather than smoothly. */
+#define FADER_SLIDER_HALF 8.0   /* approx half the slider knob (px) */
+
+static gboolean mix_scale_draw(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    (void)data;
+    GtkAllocation a; gtk_widget_get_allocation(w, &a);
+    double usable = a.height - 2.0 * FADER_SLIDER_HALF;
+    if (usable < 1.0) usable = a.height;
+
+    cairo_set_font_size(cr, 7.0);
+    for (int d = (int)FADER_DB_MAX; d >= (int)FADER_DB_MIN; d -= 6) {
+        double pos = fader_db_to_pos((double)d);          /* 1 = top */
+        double y   = FADER_SLIDER_HALF + (1.0 - pos) * usable;
+        char m[8]; g_snprintf(m, sizeof m, "%d", d);
+        /* tick */
+        cairo_set_source_rgb(cr, 0.44, 0.44, 0.47);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, a.width - 6.0, floor(y) + 0.5);
+        cairo_line_to(cr, a.width - 1.0, floor(y) + 0.5);
+        cairo_stroke(cr);
+        /* right-aligned label */
+        cairo_text_extents_t ext; cairo_text_extents(cr, m, &ext);
+        cairo_set_source_rgb(cr, (d == 0) ? 0.85 : 0.69,
+                                 (d == 0) ? 0.85 : 0.69,
+                                 (d == 0) ? 0.90 : 0.69);
+        cairo_move_to(cr, a.width - 8.0 - ext.width, y + 2.5);
+        cairo_show_text(cr, m);
+    }
+    return FALSE;
+}
+
 /* ---- Floating dB read-out (shown beside the fader while dragging) ---- */
 
 static void mix_db_popup_show(MixerStrip *s, double db)
@@ -139,7 +173,7 @@ static void mix_fader_changed(GtkRange *range, gpointer data)
     gfloat lin = (gfloat)pow(10.0, db / 20.0);
     s->self_update = TRUE;
     if (s->track)
-        jackdaw_track_set_volume(s->track, lin);
+        jackdaw_track_set_fader(s->track, lin);   /* fader = channel level stage */
     else
         jackdaw_project_set_master_volume(s->mixer->project, lin);
     s->self_update = FALSE;
@@ -258,17 +292,14 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
                                         0.0, 1.0, 0.001);   /* fine = smooth */
     gtk_range_set_inverted(GTK_RANGE(s->fader), TRUE);  /* up = louder */
     gtk_scale_set_draw_value(GTK_SCALE(s->fader), FALSE);
-    gtk_widget_set_size_request(s->fader, 34, 150);
+    /* Fine value resolution so the motion is continuous (not stepped). */
+    gtk_scale_set_digits(GTK_SCALE(s->fader), 3);
+    gtk_range_set_round_digits(GTK_RANGE(s->fader), 3);
+    gtk_widget_set_size_request(s->fader, 26, 150);
     gtk_style_context_add_class(gtk_widget_get_style_context(s->fader),
                                 "mix-fader");
-    /* Tick marks every 6 dB across the whole travel (+12 .. -42). */
-    for (int d = (int)FADER_DB_MAX; d >= (int)FADER_DB_MIN; d -= 6) {
-        char m[8]; g_snprintf(m, sizeof m, "%d", d);
-        gtk_scale_add_mark(GTK_SCALE(s->fader), fader_db_to_pos((double)d),
-                           GTK_POS_LEFT, m);
-    }
     {
-        gfloat vol = track ? jackdaw_track_get_volume(track)
+        gfloat vol = track ? jackdaw_track_get_fader(track)
                            : jackdaw_project_get_master_volume(mixer->project);
         double db  = (vol > 0.0001f) ? 20.0 * log10((double)vol) : FADER_DB_MIN;
         s->suppress = TRUE;
@@ -287,8 +318,15 @@ static GtkWidget *mixer_strip_new(JackDawMixer *mixer, JackDawTrack *track)
     gtk_widget_set_size_request(s->vu, 18, 120);
     g_signal_connect(s->vu, "draw", G_CALLBACK(mix_vu_draw), s);
 
-    gtk_box_pack_start(GTK_BOX(mid), s->fader, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(mid), s->vu,    FALSE, FALSE, 0);
+    /* dB scale labels (drawn, not GtkScale marks — see mix_scale_draw). */
+    GtkWidget *scale_lbl = gtk_drawing_area_new();
+    gtk_widget_set_size_request(scale_lbl, 22, -1);
+    gtk_widget_set_vexpand(scale_lbl, TRUE);
+    g_signal_connect(scale_lbl, "draw", G_CALLBACK(mix_scale_draw), NULL);
+
+    gtk_box_pack_start(GTK_BOX(mid), scale_lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(mid), s->fader,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(mid), s->vu,     FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), mid, TRUE, TRUE, 0);
 
     /* Mute / Solo / Fx (tracks only) — same look & padding as the track strip. */

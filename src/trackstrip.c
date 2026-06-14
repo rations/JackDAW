@@ -17,7 +17,9 @@ static void on_vol_changed(double db, gpointer data)
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
     gfloat linear = (gfloat)pow(10.0, db / 20.0);
-    jackdaw_track_set_volume(strip->track, linear);
+    strip->self_update = TRUE;
+    jackdaw_track_set_trim(strip->track, linear);   /* dial = input trim stage */
+    strip->self_update = FALSE;
 }
 
 static void on_pan_changed(double pan, gpointer data)
@@ -444,17 +446,17 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_widget_set_tooltip_text(strip->btn_mono,
         "Record mode: Mo = mono (single channel), St = stereo");
 
-    gfloat vol_linear = jackdaw_track_get_volume(track);
-    double vol_db = (vol_linear > 0.0f)
-                    ? CLAMP(20.0 * log10((double)vol_linear), -25.0, 25.0)
+    gfloat trim_linear = jackdaw_track_get_trim(track);
+    double trim_db = (trim_linear > 0.0f)
+                    ? CLAMP(20.0 * log10((double)trim_linear), -25.0, 25.0)
                     : -25.0;
-    strip->vol_knob = knob_new(-25.0, 25.0, vol_db, 0.0, KNOB_DB,
+    strip->vol_knob = knob_new(-25.0, 25.0, trim_db, 0.0, KNOB_DB,
                                on_vol_changed, strip);
     strip->pan_knob = knob_new( -1.0,  1.0,
                                (double)jackdaw_track_get_pan(track), 0.0,
                                KNOB_PAN, on_pan_changed, strip);
     gtk_widget_set_tooltip_text(strip->vol_knob,
-        "Volume: drag up/down or scroll. Centre = 0 dB");
+        "Input trim/gain (separate from the mixer fader). Centre = 0 dB");
     gtk_widget_set_tooltip_text(strip->pan_knob,
         "Pan: drag up/down or scroll. Centre = C");
 

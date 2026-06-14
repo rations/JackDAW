@@ -103,6 +103,8 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->midi_src_port  = NULL;
     t->state_flags   = 0;
     t->volume        = 1.0f;
+    t->trim          = 1.0f;
+    t->fader         = 1.0f;
     t->pan           = 0.0f;
     t->peak_L        = 0.0f;
     t->peak_R        = 0.0f;
@@ -334,15 +336,53 @@ gboolean jackdaw_track_is_soloed(JackDawTrack *t)
 
 /* ---- Volume / pan ---- */
 
+/* Fold the two stages into the effective gain the RT callback reads. */
+static void track_recompute_volume(JackDawTrack *t)
+{
+    gfloat v = t->trim * t->fader;
+    t->volume = CLAMP(v, 0.0f, 18.0f); /* 18.0 ≈ linear gain for +25 dB */
+}
+
 void jackdaw_track_set_volume(JackDawTrack *t, gfloat vol)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(t));
-    t->volume = CLAMP(vol, 0.0f, 18.0f); /* 18.0 ≈ linear gain for +25 dB */
+    /* Legacy entry point: treat the value as the fader stage, trim stays unity. */
+    t->fader = CLAMP(vol, 0.0f, 18.0f);
+    track_recompute_volume(t);
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
 }
 
 gfloat jackdaw_track_get_volume(JackDawTrack *t)
 {
     return t->volume;
+}
+
+void jackdaw_track_set_trim(JackDawTrack *t, gfloat trim)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    t->trim = CLAMP(trim, 0.0f, 18.0f);
+    track_recompute_volume(t);
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
+}
+
+gfloat jackdaw_track_get_trim(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), 1.0f);
+    return t->trim;
+}
+
+void jackdaw_track_set_fader(JackDawTrack *t, gfloat fader)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    t->fader = CLAMP(fader, 0.0f, 18.0f);
+    track_recompute_volume(t);
+    g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
+}
+
+gfloat jackdaw_track_get_fader(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), 1.0f);
+    return t->fader;
 }
 
 void jackdaw_track_set_pan(JackDawTrack *t, gfloat pan)

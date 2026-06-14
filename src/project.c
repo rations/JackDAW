@@ -294,6 +294,8 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
         g_key_file_set_string (kf, grp, "name", jackdaw_track_get_name(t));
         g_key_file_set_integer(kf, grp, "kind", (gint)jackdaw_track_get_kind(t));
         g_key_file_set_double (kf, grp, "volume", jackdaw_track_get_volume(t));
+        g_key_file_set_double (kf, grp, "trim",  jackdaw_track_get_trim(t));
+        g_key_file_set_double (kf, grp, "fader", jackdaw_track_get_fader(t));
         g_key_file_set_double (kf, grp, "pan", jackdaw_track_get_pan(t));
         gint flags = (jackdaw_track_is_armed(t)  ? 1 : 0) |
                      (jackdaw_track_is_muted(t)  ? 2 : 0) |
@@ -405,7 +407,11 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
 
         jackdaw_track_set_kind(t, kf_int(kf, grp, "kind", 0) ?
                                JACKDAW_TRACK_INSTRUMENT : JACKDAW_TRACK_AUDIO);
-        jackdaw_track_set_volume(t, (gfloat)kf_dbl(kf, grp, "volume", 1.0));
+        /* Restore both gain stages. Legacy sessions had only "volume" — fall
+         * back to placing it on the fader with trim at unity. */
+        double legacy_vol = kf_dbl(kf, grp, "volume", 1.0);
+        jackdaw_track_set_trim (t, (gfloat)kf_dbl(kf, grp, "trim", 1.0));
+        jackdaw_track_set_fader(t, (gfloat)kf_dbl(kf, grp, "fader", legacy_vol));
         jackdaw_track_set_pan   (t, (gfloat)kf_dbl(kf, grp, "pan", 0.0));
         gint flags = kf_int(kf, grp, "flags", 0);
         jackdaw_track_set_armed (t, (flags & 1) != 0);

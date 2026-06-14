@@ -63,7 +63,9 @@ struct _JackDawTrack {
 
     /* RT-safe state: written atomically by main thread */
     volatile gint32  state_flags;
-    volatile gfloat  volume;    /* 0.0 – 2.0, unity = 1.0 */
+    volatile gfloat  volume;    /* EFFECTIVE gain (= trim * fader), RT reads this */
+    volatile gfloat  trim;      /* input trim gain (track strip dial) */
+    volatile gfloat  fader;     /* channel fader gain (mixer fader) */
     volatile gfloat  pan;       /* -1.0 (L) … 0.0 (C) … 1.0 (R) */
 
     /* Peak metering: written by RT callback, read by main thread */
@@ -185,8 +187,17 @@ gboolean jackdaw_track_is_muted (JackDawTrack *t);
 gboolean jackdaw_track_is_soloed(JackDawTrack *t);
 
 /* Volume/pan — stored as volatile float, main thread writes, RT reads */
+/* Effective gain = trim * fader. set_volume() is legacy (sets the fader stage
+ * with trim left at unity); get_volume() returns the effective product. */
 void   jackdaw_track_set_volume(JackDawTrack *t, gfloat vol);
 gfloat jackdaw_track_get_volume(JackDawTrack *t);
+
+/* Two independent gain stages (gain staging): the track-strip dial drives the
+ * trim; the mixer fader drives the fader. Both fold into the effective volume. */
+void   jackdaw_track_set_trim (JackDawTrack *t, gfloat trim);
+gfloat jackdaw_track_get_trim (JackDawTrack *t);
+void   jackdaw_track_set_fader(JackDawTrack *t, gfloat fader);
+gfloat jackdaw_track_get_fader(JackDawTrack *t);
 void   jackdaw_track_set_pan   (JackDawTrack *t, gfloat pan);
 gfloat jackdaw_track_get_pan   (JackDawTrack *t);
 
