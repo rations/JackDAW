@@ -112,11 +112,25 @@ struct _JackDawTimeline {
 
     JackDawTrack     *focused_track; /* weak ref; NULL when nothing focused */
 
-    /* Shared selection range (timeline frames). sel_active = a region is set. */
+    /* Shared selection range (timeline frames). sel_active = a region is set.
+     * This is the rubber-band range used by Delete Selected Area / Gain when no
+     * section selection is active. */
     gboolean          sel_active;
     gboolean          selecting;   /* button1 drag in progress */
     off_t             sel_start;
     off_t             sel_end;
+
+    /* Section selection (single track): a set of whole regions the user has
+     * clicked / Ctrl-clicked.  Pointers reference the track's live region list
+     * and are valid only between structural edits. */
+    JackDawTrack     *sel_track;   /* track owning the section selection, or NULL */
+    GPtrArray        *sel_regions; /* ClipRegion* (not owned) on sel_track */
+
+    /* Section move-drag state */
+    gboolean          moving;        /* a section move-drag is in progress */
+    gboolean          move_committed;/* undo already pushed for this drag */
+    gdouble           move_press_x;  /* pointer x (widget coords) at drag start */
+    off_t            *move_orig;     /* orig tl_pos per selected region (sel_regions->len) */
 
     /* Right-click context: track + timeline frame under the pointer */
     JackDawTrack     *menu_track;
@@ -179,6 +193,7 @@ void          jackdaw_timeline_set_cursor (JackDawTimeline *tl, off_t sample);
 
 /* Region editing (operate on the focused track / current selection) */
 void          jackdaw_timeline_split_at_cursor(JackDawTimeline *tl);
+void          jackdaw_timeline_group_selection(JackDawTimeline *tl);
 void          jackdaw_timeline_undo           (JackDawTimeline *tl);
 void          jackdaw_timeline_redo           (JackDawTimeline *tl);
 

@@ -145,6 +145,39 @@ void clip_region_list_set_gain_range(GPtrArray *list, off_t a, off_t b,
     }
 }
 
+void clip_region_list_group(GPtrArray *list, const off_t *sel_tlpos, guint n,
+                            int jack_sr)
+{
+    if (!list || !sel_tlpos || n < 2) return;
+    clip_region_list_sort(list);
+
+    ClipRegion *acc = NULL;   /* the selected region we're accumulating into */
+    for (guint i = 0; i < list->len; ) {
+        ClipRegion *r = g_ptr_array_index(list, i);
+
+        gboolean sel = FALSE;
+        for (guint k = 0; k < n; k++)
+            if (sel_tlpos[k] == r->tl_pos) { sel = TRUE; break; }
+
+        if (!sel) {                 /* a non-selected region breaks contiguity */
+            acc = NULL;
+            i++;
+            continue;
+        }
+        /* Same source and file-contiguous with the accumulator → merge.  This
+         * also pulls a same-clip region flush, closing any timeline gap. */
+        if (acc && r->clip == acc->clip &&
+            r->file_in == acc->file_in + tl_to_file(acc, acc->length, jack_sr)) {
+            acc->length += r->length;
+            g_ptr_array_remove_index(list, i);   /* free func runs; i unchanged */
+        } else {
+            acc = r;
+            i++;
+        }
+    }
+    clip_region_list_sort(list);
+}
+
 void clip_region_list_remove_at(GPtrArray *list, off_t frame)
 {
     if (!list) return;

@@ -398,13 +398,23 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
                 cairo_stroke(cr);
             }
 
-            /* Region boundary line (left edge) — skip the very first region
-             * at timeline 0 so the start edge isn't cluttered. */
+            /* Region boundary lines — draw both the left (start) and right
+             * (end) edge.  Drawing the right edge keeps a boundary visible after
+             * a neighbouring section is deleted, so a gap reads as two real
+             * edges.  Skip the very first region's start edge at timeline 0. */
+            cairo_set_source_rgba(cr, 0.95, 0.95, 0.55, 0.9);
+            cairo_set_line_width(cr, 1.0);
             if (r_tl0 > 0) {
                 double bx = ((gdouble)r_tl0 - start) / spp;
                 if (bx >= 0.0 && bx < (double)w) {
-                    cairo_set_source_rgba(cr, 0.95, 0.95, 0.55, 0.9);
-                    cairo_set_line_width(cr, 1.0);
+                    cairo_move_to(cr, bx + 0.5, 0);
+                    cairo_line_to(cr, bx + 0.5, h);
+                    cairo_stroke(cr);
+                }
+            }
+            {
+                double bx = ((gdouble)r_tl1 - start) / spp;
+                if (bx >= 0.0 && bx < (double)w) {
                     cairo_move_to(cr, bx + 0.5, 0);
                     cairo_line_to(cr, bx + 0.5, h);
                     cairo_stroke(cr);
@@ -416,8 +426,31 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
         }
     }
 
-    /* Selection overlay (shared across all tracks) */
-    if (wv->timeline && wv->timeline->sel_active && spp > 0.0) {
+    /* Section selection overlay — highlight each selected region on its track. */
+    if (wv->timeline && wv->timeline->sel_track == wv->track &&
+        wv->timeline->sel_regions && wv->timeline->sel_regions->len > 0 &&
+        spp > 0.0) {
+        GPtrArray *sel = wv->timeline->sel_regions;
+        for (guint si = 0; si < sel->len; si++) {
+            ClipRegion *r = g_ptr_array_index(sel, si);
+            double sx0 = ((gdouble)r->tl_pos - start) / spp;
+            double sx1 = ((gdouble)clip_region_end(r) - start) / spp;
+            sx0 = CLAMP(sx0, 0.0, (double)w);
+            sx1 = CLAMP(sx1, 0.0, (double)w);
+            if (sx1 > sx0) {
+                cairo_set_source_rgba(cr, 0.40, 0.60, 0.90, 0.18);
+                cairo_rectangle(cr, sx0, 0, sx1 - sx0, h);
+                cairo_fill(cr);
+                cairo_set_source_rgba(cr, 0.40, 0.60, 0.90, 0.6);
+                cairo_set_line_width(cr, 1.0);
+                cairo_move_to(cr, sx0 + 0.5, 0); cairo_line_to(cr, sx0 + 0.5, h);
+                cairo_move_to(cr, sx1 + 0.5, 0); cairo_line_to(cr, sx1 + 0.5, h);
+                cairo_stroke(cr);
+            }
+        }
+    }
+    /* Rubber-band range overlay (shared across all tracks) */
+    else if (wv->timeline && wv->timeline->sel_active && spp > 0.0) {
         off_t a = wv->timeline->sel_start;
         off_t b = wv->timeline->sel_end;
         if (b < a) { off_t tmp = a; a = b; b = tmp; }
@@ -787,19 +820,36 @@ static off_t timeline_x_to_sample(JackDawTimeline *tl, gdouble x)
     return s;
 }
 
-/* Select the region of `track` that covers `frame` (highlight its full span);
- * clears the selection if the frame is in a gap. */
+/* Drop the whole section selection and any in-flight move. */
+static void timeline_clear_section_sel(JackDawTimeline *tl)
+{
+    if (tl->sel_regions) g_ptr_array_set_size(tl->sel_regions, 0);
+    tl->sel_track      = NULL;
+    tl->moving         = FALSE;
+    tl->move_committed = FALSE;
+    g_clear_pointer(&tl->move_orig, g_free);
+}
+
+static gboolean timeline_sel_contains(JackDawTimeline *tl, ClipRegion *r)
+{
+    if (!tl->sel_regions) return FALSE;
+    for (guint i = 0; i < tl->sel_regions->len; i++)
+        if (g_ptr_array_index(tl->sel_regions, i) == r) return TRUE;
+    return FALSE;
+}
+
+/* Select the single region of `track` that covers `frame` (highlight its full
+ * span); clears the selection if the frame is in a gap. */
 static void timeline_select_region_at(JackDawTimeline *tl, JackDawTrack *track,
                                       off_t frame)
 {
+    timeline_clear_section_sel(tl);
+    tl->sel_active = FALSE;          /* section selection supersedes the range */
     ClipRegion *r = track
         ? clip_region_list_at(jackdaw_track_get_regions(track), frame) : NULL;
     if (r) {
-        tl->sel_active = TRUE;
-        tl->sel_start  = r->tl_pos;
-        tl->sel_end    = clip_region_end(r);
-    } else {
-        tl->sel_active = FALSE;
+        tl->sel_track = track;
+        g_ptr_array_add(tl->sel_regions, r);
     }
     jackdaw_timeline_redraw_all(tl);
 }
@@ -867,6 +917,7 @@ void jackdaw_timeline_undo(JackDawTimeline *tl)
     GPtrArray *snap = g_queue_pop_head(u);
     timeline_apply_regions(t, snap);
     region_snapshot_free(snap);
+    timeline_clear_section_sel(tl);   /* region pointers are now stale */
     jackdaw_timeline_redraw_all(tl);
 }
 
@@ -882,6 +933,7 @@ void jackdaw_timeline_redo(JackDawTimeline *tl)
     GPtrArray *snap = g_queue_pop_head(r);
     timeline_apply_regions(t, snap);
     region_snapshot_free(snap);
+    timeline_clear_section_sel(tl);   /* region pointers are now stale */
     jackdaw_timeline_redraw_all(tl);
 }
 
@@ -908,6 +960,31 @@ void jackdaw_timeline_split_at_cursor(JackDawTimeline *tl)
     timeline_split_track_at_playhead(tl, tl->focused_track);
 }
 
+/* Merge the selected sections (single track) into single regions where they are
+ * adjacent and share a source clip. */
+void jackdaw_timeline_group_selection(JackDawTimeline *tl)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    if (!tl->sel_track || !tl->sel_regions || tl->sel_regions->len < 2) return;
+
+    JackDawTrack *track = tl->sel_track;
+    guint n = tl->sel_regions->len;
+    off_t *tlpos = g_new(off_t, n);
+    for (guint i = 0; i < n; i++)
+        tlpos[i] = ((ClipRegion *)g_ptr_array_index(tl->sel_regions, i))->tl_pos;
+
+    timeline_push_undo(tl, track);
+    clip_region_list_group(jackdaw_track_get_regions(track),
+                           tlpos, n, (int)timeline_jack_sr());
+    g_free(tlpos);
+
+    /* The merge frees the absorbed regions, so the selection pointers are now
+     * stale — drop the selection. */
+    timeline_clear_section_sel(tl);
+    jackdaw_track_commit_regions(track);
+    jackdaw_timeline_redraw_all(tl);
+}
+
 /* ---- Context menu ---- */
 
 static void menu_split_cb(GtkMenuItem *item, gpointer data)
@@ -921,14 +998,43 @@ static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawTimeline *tl = data;
+    int sr = (int)timeline_jack_sr();
+
+    /* Prefer the section selection; fall back to the rubber-band range. */
+    if (tl->sel_track && tl->sel_regions && tl->sel_regions->len > 0) {
+        JackDawTrack *track = tl->sel_track;
+        guint n = tl->sel_regions->len;
+        off_t *aa = g_new(off_t, n), *bb = g_new(off_t, n);
+        for (guint i = 0; i < n; i++) {
+            ClipRegion *r = g_ptr_array_index(tl->sel_regions, i);
+            aa[i] = r->tl_pos;
+            bb[i] = clip_region_end(r);
+        }
+        timeline_push_undo(tl, track);
+        GPtrArray *regs = jackdaw_track_get_regions(track);
+        for (guint i = 0; i < n; i++)          /* spans cached: pointers freed */
+            clip_region_list_delete_range(regs, aa[i], bb[i], sr);
+        g_free(aa); g_free(bb);
+        timeline_clear_section_sel(tl);
+        jackdaw_track_commit_regions(track);
+        jackdaw_timeline_redraw_all(tl);
+        return;
+    }
+
     if (!tl->menu_track || !tl->sel_active) return;
     off_t a = tl->sel_start, b = tl->sel_end;
     if (b < a) { off_t tmp = a; a = b; b = tmp; }
     timeline_push_undo(tl, tl->menu_track);
     clip_region_list_delete_range(jackdaw_track_get_regions(tl->menu_track),
-                                  a, b, (int)timeline_jack_sr());
+                                  a, b, sr);
     jackdaw_track_commit_regions(tl->menu_track);
     jackdaw_timeline_redraw_all(tl);
+}
+
+static void menu_group_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_group_selection((JackDawTimeline *)data);
 }
 
 static void menu_delete_region_cb(GtkMenuItem *item, gpointer data)
@@ -965,7 +1071,12 @@ static void menu_gain_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawTimeline *tl = data;
-    if (!tl->menu_track || !tl->sel_active) return;
+
+    gboolean have_sections =
+        tl->sel_track && tl->sel_regions && tl->sel_regions->len > 0;
+    JackDawTrack *track = have_sections ? tl->sel_track : tl->menu_track;
+    if (!track) return;
+    if (!have_sections && !tl->sel_active) return;
     off_t a = tl->sel_start, b = tl->sel_end;
     if (b < a) { off_t tmp = a; a = b; b = tmp; }
 
@@ -987,11 +1098,23 @@ static void menu_gain_cb(GtkMenuItem *item, gpointer data)
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         double db = gtk_range_get_value(GTK_RANGE(sc));
         gfloat g  = (gfloat)pow(10.0, db / 20.0);
-        timeline_push_undo(tl, tl->menu_track);
-        clip_region_list_set_gain_range(
-            jackdaw_track_get_regions(tl->menu_track), a, b, g,
-            (int)timeline_jack_sr());
-        jackdaw_track_commit_regions(tl->menu_track);
+        int sr = (int)timeline_jack_sr();
+        GPtrArray *regs = jackdaw_track_get_regions(track);
+        timeline_push_undo(tl, track);
+        if (have_sections) {
+            guint n = tl->sel_regions->len;
+            off_t *aa = g_new(off_t, n), *bb = g_new(off_t, n);
+            for (guint i = 0; i < n; i++) {
+                ClipRegion *r = g_ptr_array_index(tl->sel_regions, i);
+                aa[i] = r->tl_pos; bb[i] = clip_region_end(r);
+            }
+            for (guint i = 0; i < n; i++)
+                clip_region_list_set_gain_range(regs, aa[i], bb[i], g, sr);
+            g_free(aa); g_free(bb);
+        } else {
+            clip_region_list_set_gain_range(regs, a, b, g, sr);
+        }
+        jackdaw_track_commit_regions(track);
         jackdaw_timeline_redraw_all(tl);
     }
     gtk_widget_destroy(dlg);
@@ -1000,10 +1123,14 @@ static void menu_gain_cb(GtkMenuItem *item, gpointer data)
 static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
 {
     GtkWidget *menu = gtk_menu_new();
+    gboolean have_sel = (tl->sel_regions && tl->sel_regions->len > 0) ||
+                        tl->sel_active;
+    gboolean can_group = tl->sel_regions && tl->sel_regions->len >= 2;
     struct { const char *label; GCallback cb; gboolean sens; } items[] = {
         { "Split at Playhead",   G_CALLBACK(menu_split_cb),         TRUE },
-        { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    tl->sel_active },
-        { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          tl->sel_active },
+        { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    have_sel },
+        { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          have_sel },
+        { "Group Sections",      G_CALLBACK(menu_group_cb),         can_group },
         { "Delete Region",       G_CALLBACK(menu_delete_region_cb), TRUE },
         { "Clear Loop Region",   G_CALLBACK(menu_clear_loop_cb),
           jackdaw_engine_has_loop_region() },
@@ -1026,6 +1153,60 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
 }
 
+/* Snap a section-move delta (timeline frames).  When snap is enabled, consider
+ * both the beat grid (block leading edge) and the edges of non-selected regions
+ * on the move track, and apply the smallest correction within ~10px. */
+static off_t timeline_snap_move_delta(JackDawTimeline *tl, off_t raw_delta)
+{
+    if (!tl->project || !tl->project->snap_enabled) return raw_delta;
+    if (!tl->sel_track || !tl->sel_regions || !tl->move_orig) return raw_delta;
+
+    gdouble spp    = gtk_adjustment_get_value(tl->zoom_adj);
+    off_t   thresh = (off_t)(spp * 10.0);     /* ~10px snap radius */
+    if (thresh < 1) thresh = 1;
+    int   sr = (int)timeline_jack_sr();
+    guint n  = tl->sel_regions->len;
+
+    gboolean have = FALSE;
+    off_t best_corr = 0;
+    off_t best_abs  = thresh + 1;
+
+    /* Candidate: snap the block's leading (leftmost) edge to the beat grid. */
+    off_t lead = G_MAXINT64;
+    for (guint i = 0; i < n; i++) {
+        off_t e = tl->move_orig[i] + raw_delta;
+        if (e < lead) lead = e;
+    }
+    {
+        off_t corr = jackdaw_project_snap_frame(tl->project, lead, sr) - lead;
+        off_t a = corr < 0 ? -corr : corr;
+        if (a <= thresh && a < best_abs) { best_abs = a; best_corr = corr; have = TRUE; }
+    }
+
+    /* Candidate: snap any moving edge to any non-selected region edge. */
+    GPtrArray *regs = jackdaw_track_get_regions(tl->sel_track);
+    for (guint i = 0; i < n; i++) {
+        ClipRegion *m = g_ptr_array_index(tl->sel_regions, i);
+        off_t mine[2] = { tl->move_orig[i] + raw_delta,
+                          tl->move_orig[i] + raw_delta + m->length };
+        for (guint j = 0; j < regs->len; j++) {
+            ClipRegion *o = g_ptr_array_index(regs, j);
+            if (timeline_sel_contains(tl, o)) continue;   /* skip moving regions */
+            off_t edges[2] = { o->tl_pos, clip_region_end(o) };
+            for (int em = 0; em < 2; em++)
+                for (int eo = 0; eo < 2; eo++) {
+                    off_t corr = edges[eo] - mine[em];
+                    off_t a = corr < 0 ? -corr : corr;
+                    if (a <= thresh && a < best_abs) {
+                        best_abs = a; best_corr = corr; have = TRUE;
+                    }
+                }
+        }
+    }
+
+    return have ? raw_delta + best_corr : raw_delta;
+}
+
 /* Button press on a WaveView — focus, selection anchor, or context menu */
 static gboolean timeline_wave_clicked(GtkWidget *widget,
                                        GdkEventButton *event, gpointer data)
@@ -1039,6 +1220,7 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
     /* Double-click on an instrument track opens the MIDI window. */
     if (event->type == GDK_2BUTTON_PRESS && wv->track &&
         jackdaw_track_is_instrument(wv->track)) {
+        timeline_clear_section_sel(tl);
         tl->sel_active = FALSE;
         tl->selecting  = FALSE;
         jackdaw_midi_window_open(wv->track, tl->project);
@@ -1049,15 +1231,57 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
     if (event->button == 3) {
         tl->menu_track = wv->track;
         tl->menu_frame = sample;
-        timeline_select_region_at(tl, wv->track, sample);
+        ClipRegion *r = wv->track
+            ? clip_region_list_at(jackdaw_track_get_regions(wv->track), sample)
+            : NULL;
+        /* Keep an existing multi-selection if the user right-clicked one of its
+         * members; otherwise select the region under the pointer. */
+        if (!(r && tl->sel_track == wv->track && timeline_sel_contains(tl, r)))
+            timeline_select_region_at(tl, wv->track, sample);
         timeline_show_context_menu(tl, event);
         return TRUE;
     }
 
     if (event->button != 1) return FALSE;
 
-    /* Move the playhead to the click (seeks the engine when stopped) and start
-     * a potential drag-selection. */
+    ClipRegion *r = wv->track
+        ? clip_region_list_at(jackdaw_track_get_regions(wv->track), sample)
+        : NULL;
+
+    /* Ctrl+click toggles a section in the multi-selection (single track). */
+    if (event->state & GDK_CONTROL_MASK) {
+        if (r) {
+            if (tl->sel_track != wv->track) {
+                timeline_clear_section_sel(tl);
+                tl->sel_active = FALSE;
+                tl->sel_track  = wv->track;
+            }
+            if (timeline_sel_contains(tl, r))
+                g_ptr_array_remove(tl->sel_regions, r);
+            else
+                g_ptr_array_add(tl->sel_regions, r);
+            if (tl->sel_regions->len == 0) tl->sel_track = NULL;
+        }
+        jackdaw_timeline_redraw_all(tl);
+        return TRUE;
+    }
+
+    /* Plain press on an already-selected section → begin a move-drag. */
+    if (r && tl->sel_track == wv->track && timeline_sel_contains(tl, r)) {
+        tl->moving         = TRUE;
+        tl->move_committed = FALSE;
+        tl->move_press_x   = event->x;
+        guint n = tl->sel_regions->len;
+        g_free(tl->move_orig);
+        tl->move_orig = g_new(off_t, n);
+        for (guint i = 0; i < n; i++)
+            tl->move_orig[i] =
+                ((ClipRegion *)g_ptr_array_index(tl->sel_regions, i))->tl_pos;
+        return TRUE;
+    }
+
+    /* Otherwise: move the playhead and start a potential rubber-band range. */
+    timeline_clear_section_sel(tl);
     timeline_set_playhead(tl, sample);
     tl->selecting  = TRUE;
     tl->sel_active = FALSE;
@@ -1075,6 +1299,32 @@ static gboolean timeline_wave_motion(GtkWidget *widget,
 {
     (void)widget;
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+
+    /* Section move-drag: shift every selected region by a snapped delta. */
+    if (tl->moving && tl->sel_regions && tl->move_orig) {
+        gdouble spp = gtk_adjustment_get_value(tl->zoom_adj);
+        off_t   raw = (off_t)((event->x - tl->move_press_x) * spp);
+        off_t   delta = timeline_snap_move_delta(tl, raw);
+        guint   n = tl->sel_regions->len;
+
+        /* Clamp so no region starts before 0. */
+        off_t min_orig = G_MAXINT64;
+        for (guint i = 0; i < n; i++)
+            if (tl->move_orig[i] < min_orig) min_orig = tl->move_orig[i];
+        if (min_orig + delta < 0) delta = -min_orig;
+
+        if (delta != 0 && !tl->move_committed) {
+            timeline_push_undo(tl, tl->sel_track);   /* captures pre-move state */
+            tl->move_committed = TRUE;
+        }
+        for (guint i = 0; i < n; i++) {
+            ClipRegion *r = g_ptr_array_index(tl->sel_regions, i);
+            r->tl_pos = tl->move_orig[i] + delta;
+        }
+        jackdaw_timeline_redraw_all(tl);
+        return TRUE;
+    }
+
     if (!tl->selecting) return FALSE;
     off_t sample = timeline_x_to_sample(tl, event->x);
     tl->sel_end = sample;
@@ -1092,6 +1342,19 @@ static gboolean timeline_wave_released(GtkWidget *widget,
 {
     JackDawTimeline *tl = JACKDAW_TIMELINE(data);
     if (event->button != 1) return FALSE;
+
+    /* Finalize a section move-drag: re-sort and rebuild the RT snapshot. */
+    if (tl->moving) {
+        tl->moving = FALSE;
+        if (tl->sel_track) {
+            clip_region_list_sort(jackdaw_track_get_regions(tl->sel_track));
+            jackdaw_track_commit_regions(tl->sel_track);
+        }
+        g_clear_pointer(&tl->move_orig, g_free);
+        jackdaw_timeline_redraw_all(tl);
+        return TRUE;
+    }
+
     tl->selecting = FALSE;
     /* A plain click (no drag) selects the region under the pointer. */
     if (!tl->sel_active) {
@@ -1401,6 +1664,8 @@ static void jackdaw_timeline_finalize(GObject *obj)
         tl->header_size_group = NULL;
     }
     g_hash_table_destroy(tl->wave_views);
+    if (tl->sel_regions) g_ptr_array_unref(tl->sel_regions);
+    g_free(tl->move_orig);
     if (tl->undo_stacks) g_hash_table_destroy(tl->undo_stacks);
     if (tl->redo_stacks) g_hash_table_destroy(tl->redo_stacks);
 
@@ -1452,6 +1717,12 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->selecting     = FALSE;
     tl->sel_start     = 0;
     tl->sel_end       = 0;
+    tl->sel_track     = NULL;
+    tl->sel_regions   = g_ptr_array_new();
+    tl->moving        = FALSE;
+    tl->move_committed = FALSE;
+    tl->move_press_x  = 0.0;
+    tl->move_orig     = NULL;
     tl->menu_track    = NULL;
     tl->menu_frame    = 0;
     tl->hscroll       = NULL;
@@ -1781,6 +2052,8 @@ void jackdaw_timeline_remove_track(JackDawTimeline *tl, JackDawTrack *track)
     g_hash_table_remove(tl->wave_views, track);
     if (tl->focused_track == track)
         tl->focused_track = NULL;
+    if (tl->sel_track == track)
+        timeline_clear_section_sel(tl);
 
     /* hierarchy: wv -> row -> outer; destroy outer tears down everything */
     GtkWidget *row   = gtk_widget_get_parent(wv_widget);

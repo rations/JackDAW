@@ -62,6 +62,14 @@ void clip_region_list_set_gain_range(GPtrArray *list, off_t a, off_t b,
                                      gfloat gain, int jack_sr);
 void clip_region_list_remove_at   (GPtrArray *list, off_t frame);
 
+/* Merge selected regions back into single sections ("Group").  Selected regions
+ * are identified by their tl_pos (passed in `sel_tlpos`, `n` entries).  Adjacent
+ * selected regions that share a source clip and are file-contiguous are merged
+ * (same-clip regions are pulled flush, closing any gap, then merged); regions
+ * from different clips, or separated by a non-selected region, are left as-is. */
+void clip_region_list_group(GPtrArray *list, const off_t *sel_tlpos, guint n,
+                            int jack_sr);
+
 /* ---- Immutable snapshot for the feeder thread ----
  * Built on the main thread under the track's region lock; the feeder takes a
  * ref, uses it for a cycle, then unrefs.  Each entry's clip carries a ref. */

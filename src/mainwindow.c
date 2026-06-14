@@ -635,6 +635,18 @@ static gboolean mw_key_press(GtkWidget *widget, GdkEventKey *event,
     case GDK_KEY_KP_Home:
         mw_locate_start_cb(NULL, win);
         return TRUE;
+    case GDK_KEY_s:
+    case GDK_KEY_g: {
+        /* Plain-letter shortcuts must not fire while text is being edited. */
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
+        if (focus && GTK_IS_EDITABLE(focus)) return FALSE;
+        JackDawTimeline *tl = mw_timeline(GTK_WIDGET(win));
+        if (event->keyval == GDK_KEY_s)
+            jackdaw_timeline_split_at_cursor(tl);
+        else
+            jackdaw_timeline_group_selection(tl);
+        return TRUE;
+    }
     default:
         break;
     }
