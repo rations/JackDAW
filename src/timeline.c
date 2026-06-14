@@ -1081,6 +1081,14 @@ static void menu_gain_cb(GtkMenuItem *item, gpointer data)
     off_t a = tl->sel_start, b = tl->sel_end;
     if (b < a) { off_t tmp = a; a = b; b = tmp; }
 
+    /* Seed the slider with the selection's current gain so re-opening the dialog
+     * shows (and adjusts from) the value already applied. */
+    ClipRegion *cur = have_sections
+        ? g_ptr_array_index(tl->sel_regions, 0)
+        : clip_region_list_at(jackdaw_track_get_regions(track), a);
+    double cur_db = (cur && cur->gain > 0.0f)
+        ? CLAMP(20.0 * log10((double)cur->gain), -25.0, 25.0) : 0.0;
+
     GtkWidget *dlg = gtk_dialog_new_with_buttons(
         "Region Gain",
         GTK_WINDOW(gtk_widget_get_toplevel(GTK_WIDGET(tl))),
@@ -1088,8 +1096,8 @@ static void menu_gain_cb(GtkMenuItem *item, gpointer data)
         "_Cancel", GTK_RESPONSE_CANCEL, "_Apply", GTK_RESPONSE_ACCEPT, NULL);
     GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
     GtkWidget *sc  = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL,
-                                              -24.0, 12.0, 0.5);
-    gtk_range_set_value(GTK_RANGE(sc), 0.0);
+                                              -25.0, 25.0, 0.5);
+    gtk_range_set_value(GTK_RANGE(sc), cur_db);
     gtk_widget_set_size_request(sc, 260, -1);
     GtkWidget *lbl = gtk_label_new("Gain (dB) for the selected area:");
     gtk_box_pack_start(GTK_BOX(box), lbl, FALSE, FALSE, 4);

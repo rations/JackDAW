@@ -11,16 +11,19 @@
 #define KNOB_END_ANG    (M_PI / 4.0)          /* max value: ~4:30 */
 
 typedef struct {
-    double   value;
-    double   min;
-    double   max;
-    double   default_val;
-    KnobKind kind;
-    double   drag_start_y;
-    double   drag_start_val;
-    gboolean dragging;
-    void   (*on_change)(double val, gpointer user_data);
-    gpointer user_data;
+    double     value;
+    double     min;
+    double     max;
+    double     default_val;
+    KnobKind   kind;
+    double     drag_start_y;
+    double     drag_start_val;
+    gboolean   dragging;
+    GtkWidget *popup;       /* floating value read-out, shown while adjusting */
+    GtkWidget *popup_lbl;
+    guint      hide_id;     /* auto-hide timeout source */
+    void     (*on_change)(double val, gpointer user_data);
+    gpointer   user_data;
 } KnobData;
 
 static double knob_angle(KnobData *kd)
@@ -31,26 +34,80 @@ static double knob_angle(KnobData *kd)
     return KNOB_START_ANG + t * (KNOB_END_ANG - KNOB_START_ANG);
 }
 
-static void knob_format(KnobData *kd, char *buf, size_t n)
+/* Value text for the floating read-out: dB with unit, pan as L/R percent. */
+static void knob_format_popup(KnobData *kd, char *buf, size_t n)
 {
     switch (kd->kind) {
     case KNOB_DB:
         if (kd->value <= kd->min + 0.01)
             g_snprintf(buf, n, "-inf");
         else
-            g_snprintf(buf, n, "%+.1f", kd->value);
+            g_snprintf(buf, n, "%+.1f dB", kd->value);
         break;
     case KNOB_PAN: {
         int p = (int)lround(fabs(kd->value) * 100.0);
-        if (p == 0)            g_snprintf(buf, n, "C");
-        else if (kd->value < 0) g_snprintf(buf, n, "L%d", p);
-        else                    g_snprintf(buf, n, "R%d", p);
+        if (p == 0)             g_snprintf(buf, n, "C");
+        else if (kd->value < 0) g_snprintf(buf, n, "L%d%%", p);
+        else                    g_snprintf(buf, n, "R%d%%", p);
         break;
     }
     default:
         g_snprintf(buf, n, "%.2f", kd->value);
         break;
     }
+}
+
+static gboolean knob_popup_hide_cb(gpointer data)
+{
+    KnobData *kd = data;
+    kd->hide_id = 0;
+    if (kd->popup) gtk_widget_hide(kd->popup);
+    return G_SOURCE_REMOVE;
+}
+
+/* Show (or refresh) the floating value read-out, centered above the knob, and
+ * arm an auto-hide as a safety net (covers scroll, which has no release). */
+static void knob_popup_show(GtkWidget *widget, KnobData *kd)
+{
+    if (!kd->popup) {
+        kd->popup = gtk_window_new(GTK_WINDOW_POPUP);
+        gtk_window_set_type_hint(GTK_WINDOW(kd->popup),
+                                 GDK_WINDOW_TYPE_HINT_TOOLTIP);
+        gtk_window_set_resizable(GTK_WINDOW(kd->popup), FALSE);
+        kd->popup_lbl = gtk_label_new("");
+        gtk_style_context_add_class(
+            gtk_widget_get_style_context(kd->popup_lbl), "mix-db-pop");
+        gtk_container_add(GTK_CONTAINER(kd->popup), kd->popup_lbl);
+        gtk_widget_show(kd->popup_lbl);
+    }
+
+    char buf[32];
+    knob_format_popup(kd, buf, sizeof buf);
+    gtk_label_set_text(GTK_LABEL(kd->popup_lbl), buf);
+
+    GtkWidget *top = gtk_widget_get_toplevel(widget);
+    GdkWindow *tw  = top ? gtk_widget_get_window(top) : NULL;
+    if (tw) {
+        gint ox, oy, wx = 0, wy = 0;
+        gdk_window_get_origin(tw, &ox, &oy);
+        gtk_widget_translate_coordinates(widget, top, 0, 0, &wx, &wy);
+        GtkAllocation a; gtk_widget_get_allocation(widget, &a);
+        GtkRequisition req;
+        gtk_widget_get_preferred_size(kd->popup, NULL, &req);
+        gtk_window_move(GTK_WINDOW(kd->popup),
+                        ox + wx + a.width / 2 - req.width / 2,
+                        oy + wy - req.height - 2);
+    }
+    gtk_widget_show(kd->popup);
+
+    if (kd->hide_id) g_source_remove(kd->hide_id);
+    kd->hide_id = g_timeout_add(900, knob_popup_hide_cb, kd);
+}
+
+static void knob_popup_hide(KnobData *kd)
+{
+    if (kd->hide_id) { g_source_remove(kd->hide_id); kd->hide_id = 0; }
+    if (kd->popup) gtk_widget_hide(kd->popup);
 }
 
 static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
@@ -83,18 +140,9 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_arc(cr, px, py, 2.0, 0.0, 2.0 * M_PI);
     cairo_fill(cr);
 
-    /* Numeric readout */
-    char buf[24];
-    knob_format(kd, buf, sizeof(buf));
-    cairo_set_font_size(cr, 8.0);
-    cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
-    cairo_text_extents_t ext;
-    cairo_text_extents(cr, buf, &ext);
-    double tx = cx - ext.width / 2.0 - ext.x_bearing;
-    if (tx < 0.0) tx = 0.0;
-    cairo_move_to(cr, tx, KNOB_DIAM + KNOB_TEXT_H - 3.0);
-    cairo_show_text(cr, buf);
-
+    /* The numeric value is shown in a floating popup while the knob is being
+     * adjusted (see knob_popup_show) rather than drawn inline — an inline
+     * readout was unreadable against the dark theme. */
     return FALSE;
 }
 
@@ -109,6 +157,7 @@ static gboolean knob_press(GtkWidget *widget, GdkEventButton *ev, gpointer data)
         kd->dragging = FALSE;
         gtk_widget_queue_draw(widget);
         if (kd->on_change) kd->on_change(kd->value, kd->user_data);
+        knob_popup_show(widget, kd);
         return TRUE;
     }
 
@@ -116,6 +165,7 @@ static gboolean knob_press(GtkWidget *widget, GdkEventButton *ev, gpointer data)
     kd->drag_start_y   = ev->y_root;
     kd->drag_start_val = kd->value;
     gtk_widget_grab_focus(widget);
+    knob_popup_show(widget, kd);
     return TRUE;
 }
 
@@ -128,6 +178,7 @@ static gboolean knob_motion(GtkWidget *widget, GdkEventMotion *ev, gpointer data
     kd->value = CLAMP(kd->drag_start_val + delta, kd->min, kd->max);
     gtk_widget_queue_draw(widget);
     if (kd->on_change) kd->on_change(kd->value, kd->user_data);
+    knob_popup_show(widget, kd);
     return TRUE;
 }
 
@@ -136,6 +187,7 @@ static gboolean knob_release(GtkWidget *widget, GdkEventButton *ev, gpointer dat
     (void)widget; (void)ev;
     KnobData *kd = data;
     kd->dragging = FALSE;
+    knob_popup_hide(kd);
     return TRUE;
 }
 
@@ -151,7 +203,16 @@ static gboolean knob_scroll(GtkWidget *widget, GdkEventScroll *ev, gpointer data
         return FALSE;
     gtk_widget_queue_draw(widget);
     if (kd->on_change) kd->on_change(kd->value, kd->user_data);
+    knob_popup_show(widget, kd);
     return TRUE;
+}
+
+static void knob_destroy(GtkWidget *widget, gpointer data)
+{
+    (void)widget;
+    KnobData *kd = data;
+    if (kd->hide_id) { g_source_remove(kd->hide_id); kd->hide_id = 0; }
+    if (kd->popup) { gtk_widget_destroy(kd->popup); kd->popup = NULL; }
 }
 
 GtkWidget *knob_new(double min, double max, double value, double default_val,
@@ -180,6 +241,7 @@ GtkWidget *knob_new(double min, double max, double value, double default_val,
     g_signal_connect(da, "motion-notify-event",  G_CALLBACK(knob_motion),  kd);
     g_signal_connect(da, "button-release-event", G_CALLBACK(knob_release), kd);
     g_signal_connect(da, "scroll-event",         G_CALLBACK(knob_scroll),  kd);
+    g_signal_connect(da, "destroy",              G_CALLBACK(knob_destroy), kd);
 
     return da;
 }
