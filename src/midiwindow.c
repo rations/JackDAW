@@ -69,6 +69,7 @@ typedef struct {
     /* playhead */
     double   play_tick;         /* clip-relative tick of playhead; -1 = off / before region */
     off_t    prev_play_pos;     /* last seen engine position (for auto-scroll) */
+    gboolean ruler_dragging;    /* left button held on the ruler (scrubbing) */
 
     guint    update_timer;      /* 50 ms timer id */
 } MidiWindow;
@@ -455,6 +456,51 @@ static gboolean ruler_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         }
     }
     return FALSE;
+}
+
+/* ---- ruler playhead seek / scrub ---- */
+
+/* Move the engine playhead to the tick under ruler x-coordinate. */
+static void ruler_seek_to_x(MidiWindow *mw, double x)
+{
+    double tick = x_to_tick(mw, x);          /* absolute timeline tick */
+    if (tick < 0) tick = 0;
+    double fpb = jackdaw_project_frames_per_beat(mw->project,
+                                                 jackdaw_engine_get_sample_rate());
+    if (fpb <= 0.0) return;
+    off_t frame = (off_t)(tick * fpb / (double)JACKDAW_PPQ);
+    jackdaw_engine_locate(frame);
+    /* reflect immediately (the 50 ms timer only updates while engine runs) */
+    mw->play_tick = tick;
+    gtk_widget_queue_draw(mw->ruler);
+    gtk_widget_queue_draw(mw->roll);
+}
+
+static gboolean ruler_press(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w;
+    MidiWindow *mw = data;
+    if (e->button != 1) return FALSE;
+    mw->ruler_dragging = TRUE;
+    ruler_seek_to_x(mw, e->x);
+    return TRUE;
+}
+
+static gboolean ruler_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
+{
+    (void)w;
+    MidiWindow *mw = data;
+    if (mw->ruler_dragging && (e->state & GDK_BUTTON1_MASK))
+        ruler_seek_to_x(mw, e->x);
+    return TRUE;
+}
+
+static gboolean ruler_release(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w; (void)e;
+    MidiWindow *mw = data;
+    mw->ruler_dragging = FALSE;
+    return TRUE;
 }
 
 /* ---- quantize ---- */
@@ -1090,6 +1136,8 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->ruler = gtk_drawing_area_new();
     gtk_widget_set_size_request(mw->ruler, -1, RULER_H);
     gtk_widget_set_hexpand(mw->ruler, TRUE);
+    gtk_widget_add_events(mw->ruler, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK);
 
     mw->keys = gtk_drawing_area_new();
     gtk_widget_set_size_request(mw->keys, KEY_W, -1);
@@ -1121,6 +1169,9 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     g_signal_connect(mw->keys,  "draw",                 G_CALLBACK(keys_draw),    mw);
     g_signal_connect(mw->vel,   "draw",                 G_CALLBACK(vel_draw),     mw);
     g_signal_connect(mw->ruler, "draw",                 G_CALLBACK(ruler_draw),   mw);
+    g_signal_connect(mw->ruler, "button-press-event",   G_CALLBACK(ruler_press),  mw);
+    g_signal_connect(mw->ruler, "button-release-event", G_CALLBACK(ruler_release),mw);
+    g_signal_connect(mw->ruler, "motion-notify-event",  G_CALLBACK(ruler_motion), mw);
     g_signal_connect(mw->roll,  "button-press-event",   G_CALLBACK(roll_press),   mw);
     g_signal_connect(mw->roll,  "button-release-event", G_CALLBACK(roll_release), mw);
     g_signal_connect(mw->roll,  "motion-notify-event",  G_CALLBACK(roll_motion),  mw);
