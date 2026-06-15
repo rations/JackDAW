@@ -540,6 +540,101 @@ static gboolean mw_metro_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer d)
     return TRUE; /* don't destroy */
 }
 
+/* ---- Inputs/Outputs window (audio JACK port counts) ---------------------- */
+
+static gboolean mw_io_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer d)
+{
+    (void)e; (void)d;
+    gtk_widget_hide(w);
+    return TRUE; /* keep for reuse */
+}
+
+static void mw_io_in_changed(GtkSpinButton *sb, gpointer data)
+{
+    (void)data;
+    jackdaw_engine_set_audio_in_count((guint)gtk_spin_button_get_value_as_int(sb));
+}
+
+static void mw_io_out_changed(GtkSpinButton *sb, gpointer data)
+{
+    (void)data;
+    jackdaw_engine_set_audio_out_count((guint)gtk_spin_button_get_value_as_int(sb));
+}
+
+/* Open (creating lazily) the Inputs/Outputs settings window. Lets the user
+ * grow/shrink the number of audio JACK ports jackdaw exposes. The engine
+ * setters re-register ports, persist the count, and emit "ports-changed",
+ * which refreshes every track's input combo automatically. */
+static void mw_open_io_window(JackDawMainWindow *win)
+{
+    if (!win->io_window) {
+        win->io_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win->io_window), "Inputs / Outputs");
+        gtk_window_set_resizable(GTK_WINDOW(win->io_window), FALSE);
+        gtk_window_set_transient_for(GTK_WINDOW(win->io_window),
+                                     GTK_WINDOW(win));
+        g_signal_connect(win->io_window, "delete-event",
+                         G_CALLBACK(mw_io_window_delete_cb), win);
+
+        GtkWidget *grid = gtk_grid_new();
+        gtk_container_set_border_width(GTK_CONTAINER(grid), 10);
+        gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+        gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
+        gtk_container_add(GTK_CONTAINER(win->io_window), grid);
+
+        GtkWidget *in_label = gtk_label_new("Inputs");
+        gtk_widget_set_halign(in_label, GTK_ALIGN_START);
+        GtkWidget *in_spin = gtk_spin_button_new_with_range(1.0, 64.0, 1.0);
+        gtk_grid_attach(GTK_GRID(grid), in_label, 0, 0, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), in_spin,  1, 0, 1, 1);
+
+        GtkWidget *out_label = gtk_label_new("Outputs");
+        gtk_widget_set_halign(out_label, GTK_ALIGN_START);
+        GtkWidget *out_spin = gtk_spin_button_new_with_range(1.0, 64.0, 1.0);
+        gtk_grid_attach(GTK_GRID(grid), out_label, 0, 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), out_spin,  1, 1, 1, 1);
+
+        g_signal_connect(in_spin,  "value-changed",
+                         G_CALLBACK(mw_io_in_changed),  win);
+        g_signal_connect(out_spin, "value-changed",
+                         G_CALLBACK(mw_io_out_changed), win);
+
+        g_object_set_data(G_OBJECT(win->io_window), "in-spin",  in_spin);
+        g_object_set_data(G_OBJECT(win->io_window), "out-spin", out_spin);
+    }
+
+    /* Re-sync spins to the live engine counts. Block the handlers so this
+     * resync doesn't trigger a needless port re-register cycle. */
+    {
+        GtkWidget *in_spin  =
+            g_object_get_data(G_OBJECT(win->io_window), "in-spin");
+        GtkWidget *out_spin =
+            g_object_get_data(G_OBJECT(win->io_window), "out-spin");
+
+        g_signal_handlers_block_by_func(in_spin,
+                                        G_CALLBACK(mw_io_in_changed), win);
+        g_signal_handlers_block_by_func(out_spin,
+                                        G_CALLBACK(mw_io_out_changed), win);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(in_spin),
+                                  jackdaw_engine_get_audio_in_count());
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(out_spin),
+                                  jackdaw_engine_get_audio_out_count());
+        g_signal_handlers_unblock_by_func(in_spin,
+                                          G_CALLBACK(mw_io_in_changed), win);
+        g_signal_handlers_unblock_by_func(out_spin,
+                                          G_CALLBACK(mw_io_out_changed), win);
+    }
+
+    gtk_widget_show_all(win->io_window);
+    gtk_window_present(GTK_WINDOW(win->io_window));
+}
+
+static void mw_io_menu_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    mw_open_io_window(JACKDAW_MAIN_WINDOW(data));
+}
+
 /* Open (creating lazily) the metronome settings window. */
 static void mw_open_metronome_window(JackDawMainWindow *win)
 {
@@ -1119,6 +1214,11 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);  /* separator */
     menu_item(m, "_Metronome…",
               G_CALLBACK(mw_metro_menu_cb), win, 0, 0, ag);
+
+    /* Options */
+    m = make_submenu_item(menubar, "_Options");
+    menu_item(m, "_Inputs/Outputs…",
+              G_CALLBACK(mw_io_menu_cb), win, 0, 0, ag);
 
     /* ---- Transport toolbar ---- */
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
