@@ -994,6 +994,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         double fpb = (double)engine.sample_rate * 60.0 / engine.project->bpm;
         guint  bpb = engine.project->beats_per_bar
                      ? engine.project->beats_per_bar : 4;
+        float  click_gain = engine.project->metronome_gain;
         if (fpb > 1.0) {
             off_t base = engine.play_pos - (off_t)nframes;
             for (k = 0; k < nframes; k++) {
@@ -1003,7 +1004,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 off_t boundary = (off_t)((double)beat * fpb + 0.5);
                 off_t off      = a - boundary;
                 if (off >= 0 && off < engine.click_len) {
-                    float s = engine.click_buf[off];
+                    float s = engine.click_buf[off] * click_gain;
                     if ((beat % (off_t)bpb) != 0) s *= 0.45f; /* accent downbeat */
                     engine.master_L[k] += s;
                     engine.master_R[k] += s;

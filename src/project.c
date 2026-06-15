@@ -90,6 +90,8 @@ static void jackdaw_project_init(JackDawProject *p)
     p->grid_enabled      = FALSE;
     p->snap_enabled      = FALSE;
     p->metronome_enabled = FALSE;
+    p->metronome_volume_db = 0.0;  /* unity; loaded per-project from save file */
+    p->metronome_gain    = 1.0f;
     p->ruler_mode        = JACKDAW_RULER_TIME;
 }
 
@@ -250,6 +252,22 @@ void jackdaw_project_set_metronome(JackDawProject *p, gboolean on)
     jackdaw_project_emit_timing_changed(p);
 }
 
+void jackdaw_project_set_metronome_volume(JackDawProject *p, gdouble db)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    if (db < -25.0) db = -25.0;
+    if (db >  25.0) db =  25.0;
+    p->metronome_volume_db = db;
+    p->metronome_gain = (gfloat)pow(10.0, db / 20.0);
+    jackdaw_project_emit_timing_changed(p);
+}
+
+gdouble jackdaw_project_get_metronome_volume(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), 0.0);
+    return p->metronome_volume_db;
+}
+
 void jackdaw_project_set_ruler_mode(JackDawProject *p, JackDawRulerMode m)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
@@ -376,6 +394,7 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
     g_key_file_set_boolean(kf, "project", "grid", p->grid_enabled);
     g_key_file_set_boolean(kf, "project", "snap", p->snap_enabled);
     g_key_file_set_boolean(kf, "project", "metronome", p->metronome_enabled);
+    g_key_file_set_double (kf, "project", "metronome_volume", p->metronome_volume_db);
     g_key_file_set_integer(kf, "project", "ruler", (gint)p->ruler_mode);
     g_key_file_set_integer(kf, "project", "track_count", (gint)p->tracks->len);
 
@@ -470,6 +489,9 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     p->grid_enabled      = kf_bool(kf, "project", "grid", FALSE);
     p->snap_enabled      = kf_bool(kf, "project", "snap", FALSE);
     p->metronome_enabled = kf_bool(kf, "project", "metronome", FALSE);
+    p->metronome_volume_db =
+        CLAMP(kf_dbl(kf, "project", "metronome_volume", 0.0), -25.0, 25.0);
+    p->metronome_gain = (gfloat)pow(10.0, p->metronome_volume_db / 20.0);
     p->ruler_mode    = kf_int(kf, "project", "ruler", JACKDAW_RULER_TIME) ?
                        JACKDAW_RULER_BARS : JACKDAW_RULER_TIME;
 

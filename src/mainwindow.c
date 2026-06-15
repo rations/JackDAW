@@ -429,6 +429,110 @@ static void mw_metro_toggled(GtkToggleButton *b, gpointer data)
                                   gtk_toggle_button_get_active(b));
 }
 
+/* Live update of the value label next to the metronome volume slider. */
+static void mw_metro_vol_changed(GtkRange *r, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gdouble db = gtk_range_get_value(r);
+    jackdaw_project_set_metronome_volume(win->project, db);
+
+    GtkWidget *lbl = g_object_get_data(G_OBJECT(r), "value-label");
+    if (lbl) {
+        gchar buf[32];
+        g_snprintf(buf, sizeof buf, "%+.1f dB", db);
+        gtk_label_set_text(GTK_LABEL(lbl), buf);
+    }
+}
+
+/* Keep the metronome window alive (singleton) when the user closes it. */
+static gboolean mw_metro_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer d)
+{
+    (void)e; (void)d;
+    gtk_widget_hide(w);
+    return TRUE; /* don't destroy */
+}
+
+/* Open (creating lazily) the metronome settings window. */
+static void mw_open_metronome_window(JackDawMainWindow *win)
+{
+    if (!win->metro_window) {
+        win->metro_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win->metro_window), "Metronome");
+        gtk_window_set_resizable(GTK_WINDOW(win->metro_window), FALSE);
+        gtk_window_set_transient_for(GTK_WINDOW(win->metro_window),
+                                     GTK_WINDOW(win));
+        g_signal_connect(win->metro_window, "delete-event",
+                         G_CALLBACK(mw_metro_window_delete_cb), win);
+
+        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 6);
+        gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+        gtk_container_add(GTK_CONTAINER(win->metro_window), vbox);
+
+        GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+        gtk_box_pack_start(GTK_BOX(vbox), row, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Volume"),
+                           FALSE, FALSE, 0);
+
+        gdouble db = jackdaw_project_get_metronome_volume(win->project);
+
+        GtkWidget *vlabel = gtk_label_new(NULL);
+        {
+            gchar buf[32];
+            g_snprintf(buf, sizeof buf, "%+.1f dB", db);
+            gtk_label_set_text(GTK_LABEL(vlabel), buf);
+        }
+
+        GtkWidget *scale = gtk_scale_new_with_range(
+            GTK_ORIENTATION_HORIZONTAL, -25.0, 25.0, 0.5);
+        gtk_range_set_value(GTK_RANGE(scale), db);
+        gtk_scale_set_draw_value(GTK_SCALE(scale), FALSE);
+        gtk_scale_add_mark(GTK_SCALE(scale), -25.0, GTK_POS_BOTTOM, "-25");
+        gtk_scale_add_mark(GTK_SCALE(scale),   0.0, GTK_POS_BOTTOM, "0");
+        gtk_scale_add_mark(GTK_SCALE(scale),  25.0, GTK_POS_BOTTOM, "+25");
+        gtk_widget_set_size_request(scale, 240, -1);
+        g_object_set_data(G_OBJECT(scale), "value-label", vlabel);
+        g_signal_connect(scale, "value-changed",
+                         G_CALLBACK(mw_metro_vol_changed), win);
+        gtk_box_pack_start(GTK_BOX(vbox), scale, FALSE, FALSE, 0);
+
+        gtk_box_pack_start(GTK_BOX(vbox), vlabel, FALSE, FALSE, 0);
+
+        /* Remember the slider so subsequent opens can re-sync to the project. */
+        g_object_set_data(G_OBJECT(win->metro_window), "vol-scale", scale);
+    }
+
+    /* Re-sync the slider to the current project's stored value (it may differ
+     * after loading a different session). value-changed updates the label. */
+    {
+        GtkWidget *scale =
+            g_object_get_data(G_OBJECT(win->metro_window), "vol-scale");
+        gtk_range_set_value(GTK_RANGE(scale),
+                            jackdaw_project_get_metronome_volume(win->project));
+    }
+
+    gtk_widget_show_all(win->metro_window);
+    gtk_window_present(GTK_WINDOW(win->metro_window));
+}
+
+/* Right-click on the Metro toolbar button opens the settings window. */
+static gboolean mw_metro_button_press_cb(GtkWidget *w, GdkEventButton *ev,
+                                         gpointer data)
+{
+    (void)w;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
+        mw_open_metronome_window(win);
+        return TRUE; /* don't toggle on right-click */
+    }
+    return FALSE;
+}
+
+static void mw_metro_menu_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    mw_open_metronome_window(JACKDAW_MAIN_WINDOW(data));
+}
+
 static void mw_bars_toggled(GtkToggleButton *b, gpointer data)
 {
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
@@ -910,6 +1014,9 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                          G_CALLBACK(mw_mixer_window_mode_cb), win);
         gtk_menu_shell_append(GTK_MENU_SHELL(m), mi_mixwin);
     }
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);  /* separator */
+    menu_item(m, "_Metronome…",
+              G_CALLBACK(mw_metro_menu_cb), win, 0, 0, ag);
 
     /* ---- Transport toolbar ---- */
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -1006,7 +1113,11 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(ftb), tg_snap, FALSE, FALSE, 0);
 
     GtkWidget *tg_metro = gtk_toggle_button_new_with_label("Metro");
+    gtk_widget_set_tooltip_text(tg_metro,
+        "Toggle metronome  (right-click for settings)");
     g_signal_connect(tg_metro, "toggled", G_CALLBACK(mw_metro_toggled), win);
+    g_signal_connect(tg_metro, "button-press-event",
+                     G_CALLBACK(mw_metro_button_press_cb), win);
     gtk_box_pack_start(GTK_BOX(ftb), tg_metro, FALSE, FALSE, 0);
 
     GtkWidget *tg_bars = gtk_toggle_button_new_with_label("Bars");

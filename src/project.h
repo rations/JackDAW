@@ -46,6 +46,9 @@ struct _JackDawProject {
     gboolean         grid_enabled;   /* draw beat/bar grid on tracks */
     gboolean         snap_enabled;   /* snap edits/cursor to grid */
     gboolean         metronome_enabled;
+    gdouble          metronome_volume_db; /* user-set, -25..+25 dB (0 = unity) */
+    gfloat           metronome_gain;      /* linear gain derived from the dB,
+                                           * read by the RT process callback */
     JackDawRulerMode ruler_mode;
 };
 
@@ -102,6 +105,10 @@ void     jackdaw_project_set_time_signature(JackDawProject *p,
 void     jackdaw_project_set_grid_enabled (JackDawProject *p, gboolean on);
 void     jackdaw_project_set_snap_enabled (JackDawProject *p, gboolean on);
 void     jackdaw_project_set_metronome    (JackDawProject *p, gboolean on);
+/* Metronome click volume in dB (clamped to -25..+25). Updates the linear gain
+ * read by the engine and persists the setting globally. */
+void     jackdaw_project_set_metronome_volume(JackDawProject *p, gdouble db);
+gdouble  jackdaw_project_get_metronome_volume(JackDawProject *p);
 void     jackdaw_project_set_ruler_mode   (JackDawProject *p, JackDawRulerMode m);
 void     jackdaw_project_emit_timing_changed(JackDawProject *p);
 

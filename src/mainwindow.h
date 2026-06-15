@@ -36,6 +36,8 @@ struct _JackDawMainWindow {
     GtkWidget *mixer_button;   /* the "Mixer" toggle button, so menu/window can sync it */
     gboolean   mixer_in_window;/* current mode */
 
+    GtkWidget *metro_window;   /* metronome settings window; NULL until created */
+
     guint      track_counter;   /* incremented for "Track N" names */
     guint      transport_timer; /* 100 ms source id for time display */
 };
