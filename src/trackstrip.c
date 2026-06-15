@@ -206,7 +206,11 @@ static void ts_update_input_label(JackDawTrackStrip *strip)
         g_free(summary);
         summary = both;
     }
-    gtk_button_set_label(GTK_BUTTON(strip->input_button), summary);
+    /* Update the ellipsizing child label directly (gtk_button_set_label would
+     * replace it with a fresh, non-ellipsizing label and re-break the layout). */
+    GtkWidget *btn_lbl = gtk_bin_get_child(GTK_BIN(strip->input_button));
+    if (GTK_IS_LABEL(btn_lbl))
+        gtk_label_set_text(GTK_LABEL(btn_lbl), summary);
 
     gchar *tip = g_strdup_printf("Left: %s\nRight: %s\nMIDI: %s",
                                  l ? l : "None", r ? r : "None", m ? m : "None");
@@ -456,14 +460,20 @@ void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip)
     strip->suppress_update = FALSE;
 }
 
-/* ---- Fixed-width override ----------------------------------------------- */
-
+/* ---- Width: fit the controls, with TIMELINE_HEADER_WIDTH as a floor --------
+ * Report the strip's real content width (so the [A][M][S][Mo][Fx] + knobs row
+ * and the VU meter are never clipped) but never narrower than the design floor.
+ * The timeline puts every strip and the ruler's left spacer in one horizontal
+ * GtkSizeGroup, so whatever width we ask for here becomes the shared header
+ * column width — the ruler and waveform area line up just to its right. */
 static void jackdaw_track_strip_get_preferred_width(GtkWidget *widget,
                                                      gint *minimum,
                                                      gint *natural)
 {
-    (void)widget;
-    *minimum = *natural = TIMELINE_HEADER_WIDTH;
+    GTK_WIDGET_CLASS(jackdaw_track_strip_parent_class)
+        ->get_preferred_width(widget, minimum, natural);
+    if (*minimum < TIMELINE_HEADER_WIDTH) *minimum = TIMELINE_HEADER_WIDTH;
+    if (*natural < *minimum)              *natural = *minimum;
 }
 
 /* ---- GObject boilerplate ------------------------------------------------ */
@@ -677,9 +687,37 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_container_add(GTK_CONTAINER(popover), pop_grid);
 
     strip->input_button = gtk_menu_button_new();
-    gtk_button_set_label(GTK_BUTTON(strip->input_button), "In: None");
+    /* Ellipsizing label that can shrink to 1 char, so a long source name never
+     * widens the fixed-width strip (which would push the pan knob / VU meter
+     * off-screen). */
+    GtkWidget *btn_lbl = gtk_label_new("In: None");
+    gtk_label_set_ellipsize(GTK_LABEL(btn_lbl), PANGO_ELLIPSIZE_END);
+    gtk_label_set_xalign(GTK_LABEL(btn_lbl), 0.0);
+    gtk_label_set_width_chars(GTK_LABEL(btn_lbl), 1);
+    gtk_label_set_max_width_chars(GTK_LABEL(btn_lbl), 1);
+    gtk_container_add(GTK_CONTAINER(strip->input_button), btn_lbl);
     gtk_menu_button_set_popover(GTK_MENU_BUTTON(strip->input_button), popover);
-    gtk_widget_set_size_request(strip->input_button, 1, -1);
+    /* A GtkMenuButton's theme padding/min-height is much larger than the old
+     * combo's — left unchecked it inflates the strip past the track-row height
+     * and clips the control row (pan) and VU meter. Strip the padding/min-size
+     * so row 3 stays as compact as the combo it replaced. */
+    gtk_button_set_relief(GTK_BUTTON(strip->input_button), GTK_RELIEF_NONE);
+    gtk_widget_set_valign(strip->input_button, GTK_ALIGN_CENTER);
+    gtk_widget_set_vexpand(strip->input_button, FALSE);
+    {
+        static GtkCssProvider *prov = NULL;
+        if (!prov) {
+            prov = gtk_css_provider_new();
+            gtk_css_provider_load_from_data(prov,
+                "button.ts-input { min-height: 0; min-width: 0; "
+                "padding: 0px 4px; margin: 0; }", -1, NULL);
+        }
+        GtkStyleContext *ctx = gtk_widget_get_style_context(strip->input_button);
+        gtk_style_context_add_class(ctx, "ts-input");
+        gtk_style_context_add_provider(ctx, GTK_STYLE_PROVIDER(prov),
+            GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+    gtk_widget_set_size_request(strip->input_button, 1, 22);
 
     gtk_box_pack_start(GTK_BOX(left_box), strip->input_button, FALSE, FALSE, 0);
 
