@@ -24,6 +24,7 @@ static void jackdaw_track_finalize(GObject *obj)
 
     g_free(t->name);
     g_free(t->audio_src_port);
+    g_free(t->audio_src_port_r);
     g_free(t->midi_src_port);
 
     if (t->regions) g_ptr_array_unref(t->regions);
@@ -99,8 +100,9 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->rt_snapshot   = clip_region_snapshot_new(t->regions);
     t->audio_in_idx  = -1;
     t->midi_in_idx   = -1;
-    t->audio_src_port = NULL;
-    t->midi_src_port  = NULL;
+    t->audio_src_port   = NULL;
+    t->audio_src_port_r = NULL;
+    t->midi_src_port    = NULL;
     t->state_flags   = 0;
     t->volume        = 1.0f;
     t->trim          = 1.0f;

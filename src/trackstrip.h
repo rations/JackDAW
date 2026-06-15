@@ -13,7 +13,7 @@ G_BEGIN_DECLS
  * Layout (vertical):
  *   Row 1: [A][M][S] toggle buttons + track name label
  *   Row 2: Vol knob (Cairo) + Pan knob (Cairo)
- *   Row 3: Single input combo (audio and MIDI sources grouped with separator)
+ *   Row 3: Input source menu button (popover: Mono/Stereo/MIDI mode + combos)
  * ======================================================================== */
 
 #define JACKDAW_TYPE_TRACK_STRIP \
@@ -26,14 +26,11 @@ G_BEGIN_DECLS
 typedef struct _JackDawTrackStrip      JackDawTrackStrip;
 typedef struct _JackDawTrackStripClass JackDawTrackStripClass;
 
-/* Columns in the input combo GtkListStore */
+/* Columns in the port-selector GtkListStores (audio + MIDI source combos) */
 enum {
-    ICOL_TEXT = 0,      /* display text */
-    ICOL_PORT,          /* JACK port name; NULL for headers / None / separators */
-    ICOL_IS_AUDIO,      /* TRUE = audio port; FALSE = MIDI or non-port row */
-    ICOL_IS_SEP,        /* TRUE = GTK row separator (invisible divider) */
-    ICOL_SENSITIVE,     /* FALSE = header row (shown grayed, not selectable) */
-    ICOL_COUNT
+    PCOL_TEXT = 0,      /* display text ("None" or the JACK port name) */
+    PCOL_PORT,          /* JACK port name; NULL for the "None" row */
+    PCOL_COUNT
 };
 
 struct _JackDawTrackStrip {
@@ -53,8 +50,22 @@ struct _JackDawTrackStrip {
     GtkWidget    *vol_knob;      /* GtkDrawingArea; KnobData via g_object_set_data */
     GtkWidget    *pan_knob;
 
-    GtkWidget    *input_combo;   /* GtkComboBox backed by input_store */
-    GtkListStore *input_store;
+    /* Input routing selector: a menu button (row 3) whose popover offers an
+     * input MODE — Mono / Stereo / MIDI. Mono shows one audio source combo;
+     * Stereo reveals Left + Right combos (true stereo); MIDI shows a MIDI
+     * source combo. */
+    GtkWidget    *input_button;  /* GtkMenuButton; label summarises the source */
+    GtkWidget    *rb_mono;       /* mode radio: Mono   */
+    GtkWidget    *rb_stereo;     /* mode radio: Stereo */
+    GtkWidget    *rb_midi;       /* mode radio: MIDI   */
+    GtkWidget    *lbl_src;       /* "Source"/"Left" label beside in_combo_l */
+    GtkWidget    *lbl_right;     /* "Right" label beside in_combo_r */
+    GtkWidget    *lbl_midi;      /* "MIDI"  label beside in_combo_midi */
+    GtkWidget    *in_combo_l;    /* audio mono/left source (GtkComboBox) */
+    GtkWidget    *in_combo_r;    /* audio right source (GtkComboBox) */
+    GtkWidget    *in_combo_midi; /* MIDI source (GtkComboBox) */
+    GtkListStore *audio_store;   /* shared model for the mono/left + right combos */
+    GtkListStore *midi_store;    /* model for the MIDI combo */
 
     GtkWidget    *vu_meter;      /* GtkDrawingArea: L/R level bars */
     gfloat        vu_peak_L;

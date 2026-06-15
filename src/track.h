@@ -101,8 +101,11 @@ struct _JackDawTrack {
     guint          rec_peak_block;  /* samples per bucket (= jack_get_buffer_size) */
 
     /* External JACK ports connected to this track's input ports (main-thread only).
-     * NULL = no connection established by jackdaw. */
+     * NULL = no connection established by jackdaw.
+     * audio_src_port = left channel source; audio_src_port_r = right channel
+     * source (NULL when the track input is mono). */
     gchar *audio_src_port;
+    gchar *audio_src_port_r;
     gchar *midi_src_port;
 
     /* FX: main-thread list of PluginInstance* (effects on this track). */

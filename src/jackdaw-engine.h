@@ -132,6 +132,15 @@ gchar **jackdaw_engine_list_midi_sources (void);
  * jack_disconnect as needed.  Also updates track->audio_src_port /
  * midi_src_port.  Returns FALSE on success, TRUE on failure. */
 gboolean jackdaw_engine_set_audio_source(JackDawTrack *t, const gchar *port_name);
+/* Switch a track between mono (default) and stereo input. Stereo registers the
+ * track's right capture port (in_NR) so it shows in the patchbay; mono drops it
+ * and disconnects any right source. Updates t->mono_record. FALSE on success. */
+gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo);
+/* Stereo track input: connect/disconnect the left or right channel source
+ * independently. The left port is in_N, the right is in_NR. A track with only
+ * a left source records/monitors mono; with both it is true stereo. */
+gboolean jackdaw_engine_set_audio_source_l(JackDawTrack *t, const gchar *port_name);
+gboolean jackdaw_engine_set_audio_source_r(JackDawTrack *t, const gchar *port_name);
 gboolean jackdaw_engine_set_midi_source (JackDawTrack *t, const gchar *port_name);
 
 G_END_DECLS

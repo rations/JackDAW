@@ -80,13 +80,19 @@ static void on_track_state_changed(JackDawTrack *t, gpointer data)
     strip->suppress_update = FALSE;
 }
 
+/* Input modes for the routing popover. */
+enum { TS_MODE_MONO = 0, TS_MODE_STEREO = 1, TS_MODE_MIDI = 2 };
+
+static void ts_update_input_label(JackDawTrackStrip *strip);
+static void ts_set_mode(JackDawTrackStrip *strip, int mode);
+
+/* The control-row St toggle mirrors the popover mode: Mo↔Mono, St↔Stereo. */
 static void on_mono_toggled(GtkToggleButton *btn, gpointer data)
 {
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
-    gboolean stereo = gtk_toggle_button_get_active(btn);
-    strip->track->mono_record = !stereo;
-    gtk_button_set_label(GTK_BUTTON(btn), stereo ? "St" : "Mo");
+    ts_set_mode(strip, gtk_toggle_button_get_active(btn)
+                       ? TS_MODE_STEREO : TS_MODE_MONO);
 }
 
 static void on_fx_clicked(GtkButton *btn, gpointer data)
@@ -167,65 +173,235 @@ static gboolean vu_timer_cb(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-/* ---- Input combo -------------------------------------------------------- */
+/* ---- Input source selectors -------------------------------------------- */
 
-static gboolean input_row_sep_func(GtkTreeModel *model, GtkTreeIter *iter,
-                                    gpointer data)
+/* The trailing "port" half of a JACK "client:port" name, for compact labels. */
+static const char *port_short(const char *full)
 {
-    (void)data;
-    gboolean is_sep = FALSE;
-    gtk_tree_model_get(model, iter, ICOL_IS_SEP, &is_sep, -1);
-    return is_sep;
+    if (!full) return NULL;
+    const char *colon = strchr(full, ':');
+    return (colon && colon[1]) ? colon + 1 : full;
 }
 
-static void on_input_combo_changed(GtkComboBox *combo, gpointer data)
+/* Refresh the menu button's label/tooltip from the track's current sources. */
+static void ts_update_input_label(JackDawTrackStrip *strip)
+{
+    const char *l = strip->track->audio_src_port;
+    const char *r = strip->track->audio_src_port_r;
+    const char *m = strip->track->midi_src_port;
+
+    gchar *summary;
+    if (!l && !r && !m) {
+        summary = g_strdup("In: None");
+    } else if (l && r) {
+        summary = g_strdup_printf("In: %s+%s", port_short(l), port_short(r));
+    } else if (l || r) {
+        summary = g_strdup_printf("In: %s", port_short(l ? l : r));
+    } else {
+        summary = g_strdup_printf("In: MIDI %s", port_short(m));
+    }
+    /* When both audio and MIDI are set, flag the MIDI presence too. */
+    if ((l || r) && m) {
+        gchar *both = g_strdup_printf("%s +MIDI", summary);
+        g_free(summary);
+        summary = both;
+    }
+    gtk_button_set_label(GTK_BUTTON(strip->input_button), summary);
+
+    gchar *tip = g_strdup_printf("Left: %s\nRight: %s\nMIDI: %s",
+                                 l ? l : "None", r ? r : "None", m ? m : "None");
+    gtk_widget_set_tooltip_text(strip->input_button, tip);
+    g_free(tip);
+    g_free(summary);
+}
+
+/* Selected JACK port name from a source combo, or NULL for the "None" row. */
+static gchar *combo_selected_port(GtkComboBox *combo)
+{
+    GtkTreeIter iter;
+    if (!gtk_combo_box_get_active_iter(combo, &iter)) return NULL;
+    gchar *port = NULL;
+    gtk_tree_model_get(gtk_combo_box_get_model(combo), &iter,
+                       PCOL_PORT, &port, -1);
+    return port;   /* caller frees */
+}
+
+/* Show only the source rows relevant to the active mode. */
+static void ts_apply_mode_visibility(JackDawTrackStrip *strip, int mode)
+{
+    gboolean audio  = (mode != TS_MODE_MIDI);
+    gboolean stereo = (mode == TS_MODE_STEREO);
+    gboolean midi   = (mode == TS_MODE_MIDI);
+
+    gtk_label_set_text(GTK_LABEL(strip->lbl_src), stereo ? "Left" : "Source");
+    gtk_widget_set_visible(strip->lbl_src,        audio);
+    gtk_widget_set_visible(strip->in_combo_l,     audio);
+    gtk_widget_set_visible(strip->lbl_right,      stereo);
+    gtk_widget_set_visible(strip->in_combo_r,     stereo);
+    gtk_widget_set_visible(strip->lbl_midi,       midi);
+    gtk_widget_set_visible(strip->in_combo_midi,  midi);
+}
+
+/* Apply an input mode: sync the radios + St button, show the right rows, and
+ * (re)wire the engine from the current combo selections. */
+static void ts_set_mode(JackDawTrackStrip *strip, int mode)
+{
+    JackDawTrack *t = strip->track;
+    gboolean was = strip->suppress_update;
+    strip->suppress_update = TRUE;
+
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_mono),
+                                 mode == TS_MODE_MONO);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_stereo),
+                                 mode == TS_MODE_STEREO);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_midi),
+                                 mode == TS_MODE_MIDI);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_mono),
+                                 mode == TS_MODE_STEREO);
+    gtk_button_set_label(GTK_BUTTON(strip->btn_mono),
+                         mode == TS_MODE_STEREO ? "St" : "Mo");
+
+    ts_apply_mode_visibility(strip, mode);
+
+    if (mode == TS_MODE_MIDI) {
+        jackdaw_engine_set_track_stereo(t, FALSE);   /* drops right port */
+        jackdaw_engine_set_audio_source_l(t, NULL);
+        gchar *mp = combo_selected_port(GTK_COMBO_BOX(strip->in_combo_midi));
+        jackdaw_engine_set_midi_source(t, mp);
+        g_free(mp);
+        gtk_combo_box_set_active(GTK_COMBO_BOX(strip->in_combo_l), 0);
+        gtk_combo_box_set_active(GTK_COMBO_BOX(strip->in_combo_r), 0);
+    } else {
+        gboolean stereo = (mode == TS_MODE_STEREO);
+        jackdaw_engine_set_midi_source(t, NULL);
+        gtk_combo_box_set_active(GTK_COMBO_BOX(strip->in_combo_midi), 0);
+        /* Register/unregister the right port before wiring its source. */
+        jackdaw_engine_set_track_stereo(t, stereo);
+        gchar *lp = combo_selected_port(GTK_COMBO_BOX(strip->in_combo_l));
+        jackdaw_engine_set_audio_source_l(t, lp);
+        g_free(lp);
+        if (stereo) {
+            gchar *rp = combo_selected_port(GTK_COMBO_BOX(strip->in_combo_r));
+            jackdaw_engine_set_audio_source_r(t, rp);
+            g_free(rp);
+        } else {
+            gtk_combo_box_set_active(GTK_COMBO_BOX(strip->in_combo_r), 0);
+        }
+    }
+
+    strip->suppress_update = was;
+    ts_update_input_label(strip);
+}
+
+static void on_mode_mono(GtkToggleButton *b, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update || !gtk_toggle_button_get_active(b)) return;
+    ts_set_mode(strip, TS_MODE_MONO);
+}
+
+static void on_mode_stereo(GtkToggleButton *b, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update || !gtk_toggle_button_get_active(b)) return;
+    ts_set_mode(strip, TS_MODE_STEREO);
+}
+
+static void on_mode_midi(GtkToggleButton *b, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update || !gtk_toggle_button_get_active(b)) return;
+    ts_set_mode(strip, TS_MODE_MIDI);
+}
+
+static void on_in_l_changed(GtkComboBox *combo, gpointer data)
 {
     JackDawTrackStrip *strip = data;
     if (strip->suppress_update) return;
-
-    GtkTreeIter iter;
-    if (!gtk_combo_box_get_active_iter(combo, &iter)) return;
-
-    GtkTreeModel *model = gtk_combo_box_get_model(combo);
-    gchar    *port      = NULL;
-    gboolean  is_audio  = FALSE;
-    gboolean  sensitive = FALSE;
-    gboolean  is_sep    = FALSE;
-
-    gtk_tree_model_get(model, &iter,
-        ICOL_PORT,      &port,
-        ICOL_IS_AUDIO,  &is_audio,
-        ICOL_SENSITIVE, &sensitive,
-        ICOL_IS_SEP,    &is_sep,
-        -1);
-
-    if (is_sep || !sensitive) {
-        /* Header or separator — bounce back to None */
-        strip->suppress_update = TRUE;
-        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
-        strip->suppress_update = FALSE;
-        g_free(port);
-        return;
-    }
-
-    if (!port) {
-        /* "None" selected */
-        jackdaw_engine_set_audio_source(strip->track, NULL);
-        jackdaw_engine_set_midi_source(strip->track,  NULL);
-    } else if (is_audio) {
-        jackdaw_engine_set_audio_source(strip->track, port);
-        jackdaw_engine_set_midi_source(strip->track,  NULL);
-    } else {
-        jackdaw_engine_set_midi_source(strip->track,  port);
-        jackdaw_engine_set_audio_source(strip->track, NULL);
-    }
+    gchar *port = combo_selected_port(combo);
+    jackdaw_engine_set_audio_source_l(strip->track, port);
+    gboolean stereo = gtk_toggle_button_get_active(
+        GTK_TOGGLE_BUTTON(strip->rb_stereo));
+    gboolean cleared = (port == NULL);
     g_free(port);
+    /* Clearing a channel of a stereo pair drops the track back to mono. */
+    if (stereo && cleared) { ts_set_mode(strip, TS_MODE_MONO); return; }
+    ts_update_input_label(strip);
+}
+
+static void on_in_r_changed(GtkComboBox *combo, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update) return;
+    gchar *port = combo_selected_port(combo);
+    jackdaw_engine_set_audio_source_r(strip->track, port);
+    gboolean cleared = (port == NULL);
+    g_free(port);
+    /* Removing the right source ends stereo — revert to mono (left kept). */
+    if (cleared) { ts_set_mode(strip, TS_MODE_MONO); return; }
+    ts_update_input_label(strip);
+}
+
+static void on_in_midi_changed(GtkComboBox *combo, gpointer data)
+{
+    JackDawTrackStrip *strip = data;
+    if (strip->suppress_update) return;
+    gchar *port = combo_selected_port(combo);
+    jackdaw_engine_set_midi_source(strip->track, port);
+    g_free(port);
+    ts_update_input_label(strip);
 }
 
 static void on_ports_changed(JackDawProject *project, gpointer data)
 {
     (void)project;
     jackdaw_track_strip_refresh_ports(JACKDAW_TRACK_STRIP(data));
+}
+
+/* Fill a source store with a "None" row plus the given NULL-terminated ports. */
+static void source_store_fill(GtkListStore *store, gchar **ports)
+{
+    GtkTreeIter iter;
+    gtk_list_store_clear(store);
+    gtk_list_store_append(store, &iter);
+    gtk_list_store_set(store, &iter, PCOL_TEXT, "None", PCOL_PORT, NULL, -1);
+    if (ports) {
+        for (gchar **p = ports; *p; p++) {
+            gtk_list_store_append(store, &iter);
+            gtk_list_store_set(store, &iter, PCOL_TEXT, *p, PCOL_PORT, *p, -1);
+        }
+    }
+}
+
+/* Set a combo's active row to the one whose PCOL_PORT matches `want`, else the
+ * "None" row (index 0). */
+static void source_combo_select(GtkComboBox *combo, const char *want)
+{
+    GtkTreeModel *model = gtk_combo_box_get_model(combo);
+    GtkTreeIter   it;
+    gint active = 0, row = 0;
+    if (want && gtk_tree_model_get_iter_first(model, &it)) {
+        do {
+            gchar *port = NULL;
+            gtk_tree_model_get(model, &it, PCOL_PORT, &port, -1);
+            if (port && strcmp(port, want) == 0) { active = row; g_free(port); break; }
+            g_free(port);
+            row++;
+        } while (gtk_tree_model_iter_next(model, &it));
+    }
+    gtk_combo_box_set_active(combo, active);
+}
+
+/* A source-selector combo: text-rendered, ellipsized, backed by `model`. */
+static GtkWidget *ts_make_source_combo(GtkTreeModel *model)
+{
+    GtkWidget *combo = gtk_combo_box_new_with_model(model);
+    GtkCellRenderer *cr = gtk_cell_renderer_text_new();
+    g_object_set(cr, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
+    gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(combo), cr, TRUE);
+    gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(combo), cr,
+        "text", PCOL_TEXT, NULL);
+    return combo;
 }
 
 /* ---- Port combo refresh ------------------------------------------------- */
@@ -236,106 +412,46 @@ void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip)
 
     strip->suppress_update = TRUE;
 
-    GtkListStore *store = strip->input_store;
-    GtkTreeIter   iter;
-
-    gtk_list_store_clear(store);
-
-    /* "None" row */
-    gtk_list_store_append(store, &iter);
-    gtk_list_store_set(store, &iter,
-        ICOL_TEXT,      "None",
-        ICOL_PORT,      NULL,
-        ICOL_IS_AUDIO,  FALSE,
-        ICOL_IS_SEP,    FALSE,
-        ICOL_SENSITIVE, TRUE,
-        -1);
-
-    /* Audio section */
+    /* Audio sources feed both the Left and Right combos (shared store). */
     gchar **audio_ports = jackdaw_engine_list_audio_sources();
-    if (audio_ports && audio_ports[0]) {
-        /* Separator line */
-        gtk_list_store_append(store, &iter);
-        gtk_list_store_set(store, &iter,
-            ICOL_TEXT, "", ICOL_PORT, NULL,
-            ICOL_IS_AUDIO, FALSE, ICOL_IS_SEP, TRUE, ICOL_SENSITIVE, FALSE, -1);
-        /* "— Audio —" header */
-        gtk_list_store_append(store, &iter);
-        gtk_list_store_set(store, &iter,
-            ICOL_TEXT,      "\342\200\224 Audio \342\200\224",
-            ICOL_PORT,      NULL,
-            ICOL_IS_AUDIO,  TRUE,
-            ICOL_IS_SEP,    FALSE,
-            ICOL_SENSITIVE, FALSE,
-            -1);
-        for (gchar **p = audio_ports; *p; p++) {
-            gtk_list_store_append(store, &iter);
-            gtk_list_store_set(store, &iter,
-                ICOL_TEXT,      *p,
-                ICOL_PORT,      *p,
-                ICOL_IS_AUDIO,  TRUE,
-                ICOL_IS_SEP,    FALSE,
-                ICOL_SENSITIVE, TRUE,
-                -1);
-        }
-    }
+    source_store_fill(strip->audio_store, audio_ports);
     g_strfreev(audio_ports);
 
-    /* MIDI section */
     gchar **midi_ports = jackdaw_engine_list_midi_sources();
-    if (midi_ports && midi_ports[0]) {
-        gtk_list_store_append(store, &iter);
-        gtk_list_store_set(store, &iter,
-            ICOL_TEXT, "", ICOL_PORT, NULL,
-            ICOL_IS_AUDIO, FALSE, ICOL_IS_SEP, TRUE, ICOL_SENSITIVE, FALSE, -1);
-        gtk_list_store_append(store, &iter);
-        gtk_list_store_set(store, &iter,
-            ICOL_TEXT,      "\342\200\224 MIDI \342\200\224",
-            ICOL_PORT,      NULL,
-            ICOL_IS_AUDIO,  FALSE,
-            ICOL_IS_SEP,    FALSE,
-            ICOL_SENSITIVE, FALSE,
-            -1);
-        for (gchar **p = midi_ports; *p; p++) {
-            gtk_list_store_append(store, &iter);
-            gtk_list_store_set(store, &iter,
-                ICOL_TEXT,      *p,
-                ICOL_PORT,      *p,
-                ICOL_IS_AUDIO,  FALSE,
-                ICOL_IS_SEP,    FALSE,
-                ICOL_SENSITIVE, TRUE,
-                -1);
-        }
-    }
+    source_store_fill(strip->midi_store, midi_ports);
     g_strfreev(midi_ports);
 
-    /* Restore active selection: prefer audio_src_port, then midi_src_port */
-    const gchar *want_audio = strip->track->audio_src_port;
-    const gchar *want_midi  = strip->track->midi_src_port;
-    gint active_row = 0;
-    gint row = 0;
+    source_combo_select(GTK_COMBO_BOX(strip->in_combo_l),
+                        strip->track->audio_src_port);
+    source_combo_select(GTK_COMBO_BOX(strip->in_combo_r),
+                        strip->track->audio_src_port_r);
+    source_combo_select(GTK_COMBO_BOX(strip->in_combo_midi),
+                        strip->track->midi_src_port);
 
-    GtkTreeModel *model = GTK_TREE_MODEL(store);
-    GtkTreeIter  it;
-    if (gtk_tree_model_get_iter_first(model, &it)) {
-        do {
-            gchar    *port     = NULL;
-            gboolean  is_audio = FALSE;
-            gtk_tree_model_get(model, &it,
-                ICOL_PORT,     &port,
-                ICOL_IS_AUDIO, &is_audio,
-                -1);
-            if (port) {
-                if (is_audio && want_audio && strcmp(port, want_audio) == 0)
-                    active_row = row;
-                else if (!is_audio && want_midi && strcmp(port, want_midi) == 0)
-                    active_row = row;
-            }
-            g_free(port);
-            row++;
-        } while (gtk_tree_model_iter_next(model, &it));
-    }
-    gtk_combo_box_set_active(GTK_COMBO_BOX(strip->input_combo), active_row);
+    /* Reflect (not change) the track's current input mode in the UI. */
+    int mode;
+    if (strip->track->midi_src_port ||
+        (jackdaw_track_is_instrument(strip->track) &&
+         !strip->track->audio_src_port))
+        mode = TS_MODE_MIDI;
+    else if (!strip->track->mono_record)
+        mode = TS_MODE_STEREO;
+    else
+        mode = TS_MODE_MONO;
+
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_mono),
+                                 mode == TS_MODE_MONO);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_stereo),
+                                 mode == TS_MODE_STEREO);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->rb_midi),
+                                 mode == TS_MODE_MIDI);
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(strip->btn_mono),
+                                 mode == TS_MODE_STEREO);
+    gtk_button_set_label(GTK_BUTTON(strip->btn_mono),
+                         mode == TS_MODE_STEREO ? "St" : "Mo");
+    ts_apply_mode_visibility(strip, mode);
+
+    ts_update_input_label(strip);
 
     strip->suppress_update = FALSE;
 }
@@ -361,7 +477,8 @@ static void jackdaw_track_strip_finalize(GObject *obj)
     }
     g_object_unref(strip->track);
     g_object_unref(strip->project);
-    if (strip->input_store) g_object_unref(strip->input_store);
+    if (strip->audio_store) g_object_unref(strip->audio_store);
+    if (strip->midi_store)  g_object_unref(strip->midi_store);
     G_OBJECT_CLASS(jackdaw_track_strip_parent_class)->finalize(obj);
 }
 
@@ -385,8 +502,18 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->ctrl_row        = NULL;
     strip->vol_knob        = NULL;
     strip->pan_knob        = NULL;
-    strip->input_combo     = NULL;
-    strip->input_store     = NULL;
+    strip->input_button    = NULL;
+    strip->rb_mono         = NULL;
+    strip->rb_stereo       = NULL;
+    strip->rb_midi         = NULL;
+    strip->lbl_src         = NULL;
+    strip->lbl_right       = NULL;
+    strip->lbl_midi        = NULL;
+    strip->in_combo_l      = NULL;
+    strip->in_combo_r      = NULL;
+    strip->in_combo_midi   = NULL;
+    strip->audio_store     = NULL;
+    strip->midi_store      = NULL;
     strip->vu_meter        = NULL;
     strip->vu_peak_L       = 0.0f;
     strip->vu_peak_R       = 0.0f;
@@ -491,31 +618,70 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->pan_knob, FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(left_box), ctrl_row, FALSE, FALSE, 0);
 
-    /* Row 3: Single input combo (audio + MIDI grouped) */
-    strip->input_store = gtk_list_store_new(ICOL_COUNT,
-        G_TYPE_STRING,   /* ICOL_TEXT      */
-        G_TYPE_STRING,   /* ICOL_PORT      */
-        G_TYPE_BOOLEAN,  /* ICOL_IS_AUDIO  */
-        G_TYPE_BOOLEAN,  /* ICOL_IS_SEP    */
-        G_TYPE_BOOLEAN); /* ICOL_SENSITIVE */
+    /* Row 3: input-source menu button. Its popover offers an input mode —
+     * Mono / Stereo / MIDI — and the source combo(s) for that mode. */
+    strip->audio_store = gtk_list_store_new(PCOL_COUNT,
+        G_TYPE_STRING, G_TYPE_STRING);
+    strip->midi_store  = gtk_list_store_new(PCOL_COUNT,
+        G_TYPE_STRING, G_TYPE_STRING);
 
-    strip->input_combo = gtk_combo_box_new_with_model(
-        GTK_TREE_MODEL(strip->input_store));
-    gtk_combo_box_set_row_separator_func(GTK_COMBO_BOX(strip->input_combo),
-        input_row_sep_func, NULL, NULL);
-    gtk_widget_set_size_request(strip->input_combo, 1, -1);
-    gtk_widget_set_tooltip_text(strip->input_combo,
-        "Input source: audio or MIDI port");
+    strip->in_combo_l    = ts_make_source_combo(GTK_TREE_MODEL(strip->audio_store));
+    strip->in_combo_r    = ts_make_source_combo(GTK_TREE_MODEL(strip->audio_store));
+    strip->in_combo_midi = ts_make_source_combo(GTK_TREE_MODEL(strip->midi_store));
 
-    GtkCellRenderer *cr = gtk_cell_renderer_text_new();
-    g_object_set(cr, "ellipsize", PANGO_ELLIPSIZE_MIDDLE, NULL);
-    gtk_cell_layout_pack_start(GTK_CELL_LAYOUT(strip->input_combo), cr, TRUE);
-    gtk_cell_layout_set_attributes(GTK_CELL_LAYOUT(strip->input_combo), cr,
-        "text",      ICOL_TEXT,
-        "sensitive", ICOL_SENSITIVE,
-        NULL);
+    /* Mode radios (grouped) */
+    strip->rb_mono   = gtk_radio_button_new_with_label(NULL, "Mono");
+    strip->rb_stereo = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(strip->rb_mono), "Stereo");
+    strip->rb_midi   = gtk_radio_button_new_with_label_from_widget(
+        GTK_RADIO_BUTTON(strip->rb_mono), "MIDI");
 
-    gtk_box_pack_start(GTK_BOX(left_box), strip->input_combo, FALSE, FALSE, 0);
+    GtkWidget *mode_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(mode_row), strip->rb_mono,   FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(mode_row), strip->rb_stereo, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(mode_row), strip->rb_midi,   FALSE, FALSE, 0);
+
+    strip->lbl_src   = gtk_label_new("Source");
+    strip->lbl_right = gtk_label_new("Right");
+    strip->lbl_midi  = gtk_label_new("MIDI");
+    gtk_widget_set_halign(strip->lbl_src,   GTK_ALIGN_START);
+    gtk_widget_set_halign(strip->lbl_right, GTK_ALIGN_START);
+    gtk_widget_set_halign(strip->lbl_midi,  GTK_ALIGN_START);
+    gtk_widget_set_hexpand(strip->in_combo_l, TRUE);
+    gtk_widget_set_hexpand(strip->in_combo_r, TRUE);
+    gtk_widget_set_hexpand(strip->in_combo_midi, TRUE);
+
+    /* Visibility is driven by the active mode, so keep these out of show_all. */
+    gtk_widget_set_no_show_all(strip->lbl_src,       TRUE);
+    gtk_widget_set_no_show_all(strip->in_combo_l,    TRUE);
+    gtk_widget_set_no_show_all(strip->lbl_right,     TRUE);
+    gtk_widget_set_no_show_all(strip->in_combo_r,    TRUE);
+    gtk_widget_set_no_show_all(strip->lbl_midi,      TRUE);
+    gtk_widget_set_no_show_all(strip->in_combo_midi, TRUE);
+
+    GtkWidget *pop_grid = gtk_grid_new();
+    gtk_container_set_border_width(GTK_CONTAINER(pop_grid), 8);
+    gtk_grid_set_row_spacing(GTK_GRID(pop_grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(pop_grid), 8);
+
+    gtk_grid_attach(GTK_GRID(pop_grid), mode_row,             0, 0, 2, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->lbl_src,       0, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->in_combo_l,    1, 1, 1, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->lbl_right,     0, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->in_combo_r,    1, 2, 1, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->lbl_midi,      0, 3, 1, 1);
+    gtk_grid_attach(GTK_GRID(pop_grid), strip->in_combo_midi, 1, 3, 1, 1);
+    gtk_widget_show_all(pop_grid);
+
+    GtkWidget *popover = gtk_popover_new(NULL);
+    gtk_container_add(GTK_CONTAINER(popover), pop_grid);
+
+    strip->input_button = gtk_menu_button_new();
+    gtk_button_set_label(GTK_BUTTON(strip->input_button), "In: None");
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(strip->input_button), popover);
+    gtk_widget_set_size_request(strip->input_button, 1, -1);
+
+    gtk_box_pack_start(GTK_BOX(left_box), strip->input_button, FALSE, FALSE, 0);
 
     /* ---- VU meter (right side, 20px wide) ---- */
     strip->vu_meter = gtk_drawing_area_new();
@@ -551,8 +717,18 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
                      G_CALLBACK(on_solo_toggled), strip);
     g_signal_connect(strip->btn_mono, "toggled",
                      G_CALLBACK(on_mono_toggled), strip);
-    g_signal_connect(strip->input_combo, "changed",
-                     G_CALLBACK(on_input_combo_changed), strip);
+    g_signal_connect(strip->rb_mono,   "toggled",
+                     G_CALLBACK(on_mode_mono),   strip);
+    g_signal_connect(strip->rb_stereo, "toggled",
+                     G_CALLBACK(on_mode_stereo), strip);
+    g_signal_connect(strip->rb_midi,   "toggled",
+                     G_CALLBACK(on_mode_midi),   strip);
+    g_signal_connect(strip->in_combo_l, "changed",
+                     G_CALLBACK(on_in_l_changed), strip);
+    g_signal_connect(strip->in_combo_r, "changed",
+                     G_CALLBACK(on_in_r_changed), strip);
+    g_signal_connect(strip->in_combo_midi, "changed",
+                     G_CALLBACK(on_in_midi_changed), strip);
 
     /* Auto-disconnect when strip is finalized */
     g_signal_connect_object(project, "ports-changed",
@@ -588,8 +764,8 @@ void jackdaw_track_strip_set_height(JackDawTrackStrip *strip, gint content_h)
     gboolean show_input = content_h >= TS_FULL_MIN;
     gboolean show_ctrl  = content_h >= TS_CTRL_MIN;
 
-    if (strip->input_combo)
-        gtk_widget_set_visible(strip->input_combo, show_input);
+    if (strip->input_button)
+        gtk_widget_set_visible(strip->input_button, show_input);
     if (strip->ctrl_row)
         gtk_widget_set_visible(strip->ctrl_row, show_ctrl);
     if (strip->vu_meter)
