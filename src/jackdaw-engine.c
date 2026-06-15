@@ -925,6 +925,16 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             live_in = jack_port_get_buffer(
                 engine.audio_in[(guint)t->audio_in_idx], nframes);
         }
+        /* While this armed track is actively recording its input, replace its
+         * existing playback with the live input (input monitoring): mute the old
+         * audio under the punch/record region so only the new part being recorded
+         * is heard. The playback ringbuffer was still drained above so playback
+         * stays in sync once recording disengages (e.g. after punch-out). */
+        if (live_in && (flags & ENGINE_RECORDING)) {
+            memset(engine.tmp_L, 0, want);
+            memset(engine.tmp_R, 0, want);
+        }
+
         if (live_in) {
             gfloat wf_mn = 0.0f, wf_mx = 0.0f;
             for (k = 0; k < nframes; k++) {
