@@ -1380,23 +1380,9 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     jack_set_port_registration_callback(engine.client, engine_port_reg_cb, project);
     jack_set_port_connect_callback(engine.client, engine_port_connect_cb, project);
 
-    /* Register audio input ports: in_1 .. in_N */
-    engine.audio_in = g_new0(jack_port_t *, engine.audio_in_count);
-    for (i = 0; i < engine.audio_in_count; i++) {
-        g_snprintf(name, sizeof(name), "in_%u", i + 1);
-        engine.audio_in[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-        if (!engine.audio_in[i]) goto fail;
-    }
-
-    /* Register audio output ports: out_1 .. out_N */
-    engine.audio_out = g_new0(jack_port_t *, engine.audio_out_count);
-    for (i = 0; i < engine.audio_out_count; i++) {
-        g_snprintf(name, sizeof(name), "out_%u", i + 1);
-        engine.audio_out[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
-        if (!engine.audio_out[i]) goto fail;
-    }
+    /* Register MIDI ports before audio so they sort to the top in patchbays
+     * (JACK lists ports by registration order). Audio ports — which the user
+     * can grow at runtime — then always appear below the MIDI ports. */
 
     /* Register MIDI input ports: midi_in_1 .. midi_in_M */
     engine.midi_in = g_new0(jack_port_t *, engine.midi_in_count);
@@ -1414,6 +1400,24 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.midi_out[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
         if (!engine.midi_out[i]) goto fail;
+    }
+
+    /* Register audio input ports: in_1 .. in_N */
+    engine.audio_in = g_new0(jack_port_t *, engine.audio_in_count);
+    for (i = 0; i < engine.audio_in_count; i++) {
+        g_snprintf(name, sizeof(name), "in_%u", i + 1);
+        engine.audio_in[i] = jack_port_register(engine.client, name,
+            JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+        if (!engine.audio_in[i]) goto fail;
+    }
+
+    /* Register audio output ports: out_1 .. out_N */
+    engine.audio_out = g_new0(jack_port_t *, engine.audio_out_count);
+    for (i = 0; i < engine.audio_out_count; i++) {
+        g_snprintf(name, sizeof(name), "out_%u", i + 1);
+        engine.audio_out[i] = jack_port_register(engine.client, name,
+            JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+        if (!engine.audio_out[i]) goto fail;
     }
 
     /* Activate — after this the process callback can be called at any time */
