@@ -7,7 +7,12 @@
 
 G_BEGIN_DECLS
 
-#define TIMELINE_HEADER_WIDTH      180  /* px: fixed-width track name column */
+#define TIMELINE_HEADER_WIDTH      235  /* px: header column width. Must be >= a
+                                         * track strip's content width (controls
+                                         * row + VU) so the ruler/timeline sit at
+                                         * the same x with or without tracks
+                                         * loaded — no jump when the first track
+                                         * is added. Measured strip width = 235. */
 #define TIMELINE_TRACK_HEIGHT       80  /* px: default height per track row  */
 #define TIMELINE_RULER_HEIGHT       28  /* px: time ruler                    */
 #define TIMELINE_TRACK_MIN_HEIGHT   22  /* px: minimum resizable height (name-only) */
