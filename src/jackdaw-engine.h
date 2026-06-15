@@ -87,6 +87,14 @@ void     jackdaw_engine_set_loop_enabled(gboolean on);
 gboolean jackdaw_engine_get_loop_enabled(void);
 gboolean jackdaw_engine_has_loop_region (void); /* TRUE when loop_end > loop_start */
 
+/* --- Record mode (punch in/out) ---
+ * In RECORD_MODE_PUNCH, pressing Play auto-records armed audio tracks over the
+ * yellow-tab region [loop_start, loop_end) and stops at loop_end while playback
+ * continues. Independent of looping; reuses only the tab positions. */
+enum { RECORD_MODE_NORMAL = 0, RECORD_MODE_PUNCH = 1 };
+void jackdaw_engine_set_record_mode(int mode);
+int  jackdaw_engine_get_record_mode(void);
+
 /* Sample rate reported by JACK (valid after jackdaw_engine_init) */
 jack_nframes_t jackdaw_engine_get_sample_rate(void);
 jack_nframes_t jackdaw_engine_get_buffer_size(void);

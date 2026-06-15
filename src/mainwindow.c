@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <config.h>
 #include <string.h>
+#include <math.h>
 
 #include "mainwindow.h"
 #include "jackdaw-engine.h"
@@ -389,6 +390,19 @@ static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
 {
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
+
+    /* In punch mode the Record button is only a mode indicator — punch is driven
+     * by Play (auto-records over the tab region). Ignore manual toggles; the
+     * transport timer reflects the live recording state on the glyph. */
+    if (jackdaw_engine_get_record_mode() == RECORD_MODE_PUNCH) {
+        if (on) {
+            g_signal_handlers_block_by_func(widget, mw_transport_record_cb, win);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(widget), FALSE);
+            g_signal_handlers_unblock_by_func(widget, mw_transport_record_cb, win);
+        }
+        return;
+    }
+
     if (on) {
         jackdaw_engine_start_recording();
         /* start_recording sets ENGINE_PLAYING; keep the play button in sync */
@@ -398,6 +412,80 @@ static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
         jackdaw_engine_stop_recording();
     }
     mw_set_class(widget, "transport-rec", on);
+    if (win->record_glyph) gtk_widget_queue_draw(win->record_glyph);
+}
+
+/* Record glyph: a hollow ring "O" (record), plus a filled centre dot in punch
+ * mode "◉". Drawn white over the red recording background, red otherwise. */
+static gboolean mw_record_glyph_draw_cb(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    (void)data;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+    double cx = a.width / 2.0, cy = a.height / 2.0;
+    double r  = (MIN(a.width, a.height) / 2.0) - 2.0;
+    if (r < 3.0) r = 3.0;
+
+    gboolean rec   = jackdaw_engine_is_recording();
+    gboolean punch = jackdaw_engine_get_record_mode() == RECORD_MODE_PUNCH;
+
+    if (rec) cairo_set_source_rgb(cr, 1.0, 1.0, 1.0);
+    else     cairo_set_source_rgb(cr, 0.80, 0.20, 0.17);
+
+    cairo_set_line_width(cr, 2.0);
+    cairo_arc(cr, cx, cy, r, 0.0, 2.0 * M_PI);
+    cairo_stroke(cr);
+
+    if (punch) {
+        cairo_arc(cr, cx, cy, r * 0.42, 0.0, 2.0 * M_PI);
+        cairo_fill(cr);
+    }
+    return FALSE;
+}
+
+static void mw_record_set_mode(JackDawMainWindow *win, int mode)
+{
+    jackdaw_engine_set_record_mode(mode);
+    gtk_widget_set_tooltip_text(win->record_button,
+        mode == RECORD_MODE_PUNCH ? "Record — Punch In/Out (Play to punch)"
+                                  : "Record");
+    if (win->record_glyph) gtk_widget_queue_draw(win->record_glyph);
+}
+
+static void mw_record_mode_normal_cb(GtkMenuItem *m, gpointer data)
+{
+    if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(m)))
+        mw_record_set_mode(JACKDAW_MAIN_WINDOW(data), RECORD_MODE_NORMAL);
+}
+
+static void mw_record_mode_punch_cb(GtkMenuItem *m, gpointer data)
+{
+    if (gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(m)))
+        mw_record_set_mode(JACKDAW_MAIN_WINDOW(data), RECORD_MODE_PUNCH);
+}
+
+/* Right-click on the Record button: choose Normal / Punch In/Out. */
+static gboolean mw_record_button_press_cb(GtkWidget *w, GdkEventButton *ev,
+                                          gpointer data)
+{
+    (void)w;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3) return FALSE;
+
+    int mode = jackdaw_engine_get_record_mode();
+    GtkWidget *menu = gtk_menu_new();
+    GtkWidget *mi_n = gtk_radio_menu_item_new_with_label(NULL, "Normal");
+    GtkWidget *mi_p = gtk_radio_menu_item_new_with_label_from_widget(
+                          GTK_RADIO_MENU_ITEM(mi_n), "Punch In/Out");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(
+        mode == RECORD_MODE_PUNCH ? mi_p : mi_n), TRUE);
+    g_signal_connect(mi_n, "toggled", G_CALLBACK(mw_record_mode_normal_cb), win);
+    g_signal_connect(mi_p, "toggled", G_CALLBACK(mw_record_mode_punch_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_n);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_p);
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE; /* don't toggle recording on right-click */
 }
 
 /* ---- Function toolbar callbacks ---- */
@@ -790,6 +878,19 @@ static gboolean mw_transport_timer(gpointer data)
                                               mw_transport_loop_cb, win);
         }
     }
+
+    /* Reflect live recording state on the Record button. In punch mode the button
+     * is never toggled by hand, so the engine drives its red highlight + glyph as
+     * the playhead crosses the tab region. Only act on a transition. */
+    if (win->record_button) {
+        gboolean rec = jackdaw_engine_is_recording();
+        GtkStyleContext *ctx = gtk_widget_get_style_context(win->record_button);
+        gboolean had = gtk_style_context_has_class(ctx, "transport-rec");
+        if (rec != had) {
+            mw_set_class(win->record_button, "transport-rec", rec);
+            if (win->record_glyph) gtk_widget_queue_draw(win->record_glyph);
+        }
+    }
     return G_SOURCE_CONTINUE;
 }
 
@@ -896,6 +997,7 @@ static void jackdaw_main_window_init(JackDawMainWindow *win)
     win->timeline        = NULL;
     win->play_button     = NULL;
     win->record_button   = NULL;
+    win->record_glyph    = NULL;
     win->loop_button     = NULL;
     win->time_label      = NULL;
     win->mixer           = NULL;
@@ -1080,9 +1182,17 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                      G_CALLBACK(mw_transport_stop_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_stop, FALSE, FALSE, 0);
 
-    win->record_button = gtk_toggle_button_new_with_label("⏺");
+    win->record_button = gtk_toggle_button_new();
+    win->record_glyph  = gtk_drawing_area_new();
+    gtk_widget_set_size_request(win->record_glyph, 20, 20);
+    gtk_container_add(GTK_CONTAINER(win->record_button), win->record_glyph);
+    g_signal_connect(win->record_glyph, "draw",
+                     G_CALLBACK(mw_record_glyph_draw_cb), win);
+    gtk_widget_set_tooltip_text(win->record_button, "Record");
     g_signal_connect(win->record_button, "toggled",
                      G_CALLBACK(mw_transport_record_cb), win);
+    g_signal_connect(win->record_button, "button-press-event",
+                     G_CALLBACK(mw_record_button_press_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), win->record_button, FALSE, FALSE, 0);
 
     win->time_label = gtk_label_new("00:00.0");

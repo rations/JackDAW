@@ -26,6 +26,7 @@ struct _JackDawMainWindow {
     /* Transport toolbar widgets */
     GtkWidget *play_button;
     GtkWidget *record_button;
+    GtkWidget *record_glyph;    /* GtkDrawingArea child of record_button (Cairo glyph) */
     GtkWidget *loop_button;
     GtkWidget *time_label;
 
