@@ -60,6 +60,11 @@ typedef struct {
     guint8   *grp_vel;
     guint     grp_cap;
 
+    /* clipboard: copied notes, start times normalized so the earliest copied
+     * note begins at tick 0; paste offsets them by the playhead position. */
+    MidiNote *clip_notes;
+    guint     clip_count;
+
     /* right-drag rubber-band selection box */
     gboolean  sel_dragging;     /* right button held down on the roll */
     gboolean  sel_moved;        /* pointer moved enough to be a box, not a menu */
@@ -654,6 +659,60 @@ static void mw_ctx_quantize_all(GtkMenuItem *item, gpointer data)
     quantize_notes((MidiWindow *)data);
 }
 
+/* Copy the selected notes into the clipboard, normalizing their start ticks so
+ * the earliest selected note sits at tick 0.  Paste re-anchors them at the
+ * playhead, preserving the notes' relative timing, pitch, length and velocity. */
+static void mw_ctx_copy(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    MidiWindow *mw = data;
+    guint nc = midi_clip_note_count(mw->clip);
+    guint sc = sel_count(mw);
+    if (sc == 0) return;
+
+    guint32 minstart = G_MAXUINT32;
+    for (guint i = 0; i < nc; i++)
+        if (sel_is(mw, i)) {
+            guint32 s = midi_clip_note(mw->clip, i)->start;
+            if (s < minstart) minstart = s;
+        }
+
+    g_free(mw->clip_notes);
+    mw->clip_notes = g_new(MidiNote, sc);
+    mw->clip_count = 0;
+    for (guint i = 0; i < nc; i++)
+        if (sel_is(mw, i)) {
+            MidiNote n = *midi_clip_note(mw->clip, i);
+            n.start -= minstart;             /* relative to selection start */
+            mw->clip_notes[mw->clip_count++] = n;
+        }
+}
+
+/* Paste the clipboard so its first note begins at the playhead (falling back to
+ * the left edge of the view when the playhead is off).  The pasted notes become
+ * the new selection. */
+static void mw_ctx_paste(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    MidiWindow *mw = data;
+    if (mw->clip_count == 0) return;
+
+    double base = (mw->play_tick >= 0.0)
+                ? mw->play_tick : gtk_adjustment_get_value(mw->h_adj);
+    guint32 origin = snap_tick(mw, base);    /* snaps to grid when Snap is on */
+
+    sel_clear(mw);
+    for (guint i = 0; i < mw->clip_count; i++) {
+        MidiNote n = mw->clip_notes[i];
+        n.start = origin + n.start;          /* both unsigned; no overflow in range */
+        guint idx = midi_clip_add_note(mw->clip, n);
+        sel_ensure(mw);
+        if (idx < mw->sel_cap) mw->sel[idx] = TRUE;
+    }
+    mw_commit(mw);
+    sel_redraw(mw);
+}
+
 static void mw_ctx_select_all(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -680,6 +739,18 @@ static void roll_show_context_menu(MidiWindow *mw, GdkEventButton *ev, int note_
     mi = gtk_menu_item_new_with_label(sc > 0 ? "Delete Selected" : "Delete Note");
     gtk_widget_set_sensitive(mi, note_idx >= 0 || sc > 0);
     g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_delete_note), mw);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+
+    mi = gtk_menu_item_new_with_label("Copy  [Ctrl+C]");
+    gtk_widget_set_sensitive(mi, sc > 0);
+    g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_copy), mw);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+
+    mi = gtk_menu_item_new_with_label("Paste  [Ctrl+V]");
+    gtk_widget_set_sensitive(mi, mw->clip_count > 0);
+    g_signal_connect(mi, "activate", G_CALLBACK(mw_ctx_paste), mw);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
@@ -1139,6 +1210,14 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
     case GDK_KEY_A:
         if (e->state & GDK_CONTROL_MASK) { sel_all(mw); return TRUE; }
         break;
+    case GDK_KEY_c:
+    case GDK_KEY_C:
+        if (e->state & GDK_CONTROL_MASK) { mw_ctx_copy(NULL, mw); return TRUE; }
+        break;
+    case GDK_KEY_v:
+    case GDK_KEY_V:
+        if (e->state & GDK_CONTROL_MASK) { mw_ctx_paste(NULL, mw); return TRUE; }
+        break;
     case GDK_KEY_Escape:
         sel_clear(mw);
         sel_redraw(mw);
@@ -1171,6 +1250,7 @@ static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
     g_free(mw->grp_start);
     g_free(mw->grp_pitch);
     g_free(mw->grp_vel);
+    g_free(mw->clip_notes);
     g_free(mw);
     return TRUE;
 }
