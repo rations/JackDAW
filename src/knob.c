@@ -22,6 +22,7 @@ typedef struct {
     GtkWidget *popup;       /* floating value read-out, shown while adjusting */
     GtkWidget *popup_lbl;
     guint      hide_id;     /* auto-hide timeout source */
+    char       center[4];   /* optional 1-char id drawn in the dial ("V"/"P") */
     void     (*on_change)(double val, gpointer user_data);
     gpointer   user_data;
 } KnobData;
@@ -65,6 +66,41 @@ static void knob_format_popup(KnobData *kd, char *buf, size_t n)
         g_snprintf(buf, n, "%.2f", kd->value);
         break;
     }
+}
+
+/* Compact value text for an always-visible strip label (no unit suffix, no
+ * percent sign) so the read-out column stays narrow: "+10.2" / "-inf" /
+ * "L100" / "C" / "R37". */
+void knob_format_compact(GtkWidget *knob, char *buf, gsize n)
+{
+    KnobData *kd = g_object_get_data(G_OBJECT(knob), "knob-data");
+    if (!kd || n == 0) { if (n) buf[0] = '\0'; return; }
+    switch (kd->kind) {
+    case KNOB_DB:
+        if (kd->value <= kd->min + 0.01) g_snprintf(buf, n, "-inf");
+        else                             g_snprintf(buf, n, "%+.1f", kd->value);
+        break;
+    case KNOB_PAN: {
+        int p = (int)lround(fabs(kd->value) * 100.0);
+        if (p == 0)             g_snprintf(buf, n, "C");
+        else if (kd->value < 0) g_snprintf(buf, n, "L%d", p);
+        else                    g_snprintf(buf, n, "R%d", p);
+        break;
+    }
+    default:
+        g_snprintf(buf, n, "%.2f", kd->value);
+        break;
+    }
+}
+
+/* Set a 1-character identifier drawn in the centre of the dial face. */
+void knob_set_center_label(GtkWidget *knob, const char *label)
+{
+    KnobData *kd = g_object_get_data(G_OBJECT(knob), "knob-data");
+    if (!kd) return;
+    if (label) g_strlcpy(kd->center, label, sizeof kd->center);
+    else       kd->center[0] = '\0';
+    gtk_widget_queue_draw(knob);
 }
 
 static gboolean knob_popup_hide_cb(gpointer data)
@@ -149,6 +185,20 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
     cairo_arc(cr, px, py, 2.0, 0.0, 2.0 * M_PI);
     cairo_fill(cr);
+
+    /* Optional identifier letter ("V"/"P") centered in the dial face, so the
+     * host doesn't need a separate label widget eating horizontal space. */
+    if (kd->center[0]) {
+        cairo_text_extents_t te;
+        cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL,
+                               CAIRO_FONT_WEIGHT_BOLD);
+        cairo_set_font_size(cr, 9.0);
+        cairo_text_extents(cr, kd->center, &te);
+        cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+        cairo_move_to(cr, cx - te.width / 2.0 - te.x_bearing,
+                          cy - te.height / 2.0 - te.y_bearing);
+        cairo_show_text(cr, kd->center);
+    }
 
     /* The numeric value is shown in a floating popup while the knob is being
      * adjusted (see knob_popup_show) rather than drawn inline — an inline

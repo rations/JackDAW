@@ -17,11 +17,11 @@ static void ts_update_knob_labels(JackDawTrackStrip *strip)
 {
     char buf[32];
     if (strip->vol_knob && strip->vol_val_lbl) {
-        knob_format_value(strip->vol_knob, buf, sizeof buf);
+        knob_format_compact(strip->vol_knob, buf, sizeof buf);
         gtk_label_set_text(GTK_LABEL(strip->vol_val_lbl), buf);
     }
     if (strip->pan_knob && strip->pan_val_lbl) {
-        knob_format_value(strip->pan_knob, buf, sizeof buf);
+        knob_format_compact(strip->pan_knob, buf, sizeof buf);
         gtk_label_set_text(GTK_LABEL(strip->pan_val_lbl), buf);
     }
 }
@@ -477,20 +477,26 @@ void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip)
     strip->suppress_update = FALSE;
 }
 
-/* ---- Width: fit the controls, with TIMELINE_HEADER_WIDTH as a floor --------
- * Report the strip's real content width (so the [A][M][S][Mo][Fx] + knobs row
- * and the VU meter are never clipped) but never narrower than the design floor.
- * The timeline puts every strip and the ruler's left spacer in one horizontal
- * GtkSizeGroup, so whatever width we ask for here becomes the shared header
- * column width — the ruler and waveform area line up just to its right. */
+/* ---- Width: every strip is exactly TIMELINE_HEADER_WIDTH -------------------
+ * The header column is a fixed design width. We report it as both the minimum
+ * and the natural width and ignore the child row's own preferred width, so the
+ * strip never grows or shrinks as control contents change (e.g. the volume
+ * read-out widening from "+5.0 dB" to "+10.2 dB"). That kept the ruler and
+ * waveform area — which share one horizontal GtkSizeGroup with the strips —
+ * pinned in place instead of being shoved right by a wider label.
+ *
+ * Internal alignment (knob columns lining up across tracks) is the value
+ * labels' job: they reserve a fixed width-chars below, so digit count no
+ * longer shifts the layout inside this fixed envelope either. */
 static void jackdaw_track_strip_get_preferred_width(GtkWidget *widget,
                                                      gint *minimum,
                                                      gint *natural)
 {
+    gint cmin = 0, cnat = 0;
     GTK_WIDGET_CLASS(jackdaw_track_strip_parent_class)
-        ->get_preferred_width(widget, minimum, natural);
-    if (*minimum < TIMELINE_HEADER_WIDTH) *minimum = TIMELINE_HEADER_WIDTH;
-    if (*natural < *minimum)              *natural = *minimum;
+        ->get_preferred_width(widget, &cmin, &cnat);
+    (void)cmin; (void)cnat;
+    *minimum = *natural = TIMELINE_HEADER_WIDTH;
 }
 
 /* ---- GObject boilerplate ------------------------------------------------ */
@@ -618,14 +624,25 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_widget_set_tooltip_text(strip->pan_knob,
         "Pan: drag up/down or scroll. Centre = C");
 
-    GtkWidget *vol_lbl = gtk_label_new("V");
-    GtkWidget *pan_lbl = gtk_label_new("P");
+    /* Identify each dial by a letter drawn in its face — no separate label
+     * widget, which reclaims the horizontal room the VU meter needs. */
+    knob_set_center_label(strip->vol_knob, "V");
+    knob_set_center_label(strip->pan_knob, "P");
 
     /* Permanent value read-out centered under each dial. */
     strip->vol_val_lbl = gtk_label_new("");
     strip->pan_val_lbl = gtk_label_new("");
     gtk_label_set_xalign(GTK_LABEL(strip->vol_val_lbl), 0.5);
     gtk_label_set_xalign(GTK_LABEL(strip->pan_val_lbl), 0.5);
+    /* Reserve a fixed (compact) text width so the read-out neither widens the
+     * column as the value swings between one and two digits ("+5.0" vs
+     * "+10.2", "C" vs "L100") nor shrinks below it. width == max pins it. */
+    gtk_label_set_width_chars(GTK_LABEL(strip->vol_val_lbl), 5);
+    gtk_label_set_max_width_chars(GTK_LABEL(strip->vol_val_lbl), 5);
+    gtk_label_set_width_chars(GTK_LABEL(strip->pan_val_lbl), 5);
+    gtk_label_set_max_width_chars(GTK_LABEL(strip->pan_val_lbl), 5);
+    gtk_label_set_single_line_mode(GTK_LABEL(strip->vol_val_lbl), TRUE);
+    gtk_label_set_single_line_mode(GTK_LABEL(strip->pan_val_lbl), TRUE);
     gtk_style_context_add_class(
         gtk_widget_get_style_context(strip->vol_val_lbl), "ts-knob-val");
     gtk_style_context_add_class(
@@ -660,10 +677,17 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_box_pack_start(GTK_BOX(pan_col), strip->pan_knob,    FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(pan_col), strip->pan_val_lbl, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,  FALSE, FALSE, 2);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_col,  FALSE, FALSE, 1);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,  FALSE, FALSE, 2);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_col,  FALSE, FALSE, 1);
+    /* Distribute the two dials evenly across the gap between the Fx button and
+     * the VU meter: three equal expanding spacers put one before V, one
+     * between V and P, and one after P. */
+    GtkWidget *sp1 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    GtkWidget *sp2 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    GtkWidget *sp3 = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), sp1,     TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_col, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), sp2,     TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_col, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), sp3,     TRUE,  TRUE,  0);
     gtk_box_pack_start(GTK_BOX(left_box), ctrl_row, FALSE, FALSE, 0);
 
     ts_update_knob_labels(strip);   /* seed the read-outs with current values */

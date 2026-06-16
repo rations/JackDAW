@@ -33,6 +33,13 @@ double knob_get_value(GtkWidget *knob);
  * Lets a host place a permanent value label next to/under the knob. */
 void   knob_format_value(GtkWidget *knob, char *buf, gsize n);
 
+/* Compact value text for an always-visible label (no unit/percent suffix),
+ * keeping the read-out column narrow: "+10.2" / "-inf" / "L100" / "C". */
+void   knob_format_compact(GtkWidget *knob, char *buf, gsize n);
+
+/* Draw a 1-character identifier ("V"/"P") in the centre of the dial face. */
+void   knob_set_center_label(GtkWidget *knob, const char *label);
+
 G_END_DECLS
 
 #endif /* KNOB_H_INCLUDED */
