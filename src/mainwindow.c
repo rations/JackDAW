@@ -188,12 +188,13 @@ static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
     gtk_widget_destroy(dlg);
 }
 
-static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
+/* Save As… — always prompts for a name/location. */
+static void mw_save_as_project_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     GtkWidget *dlg = gtk_file_chooser_dialog_new(
-        "Save Project", GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_SAVE,
+        "Save Project As", GTK_WINDOW(win), GTK_FILE_CHOOSER_ACTION_SAVE,
         "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
     gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
     const gchar *cur = jackdaw_project_get_file(win->project);
@@ -217,6 +218,20 @@ static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
         }
     }
     gtk_widget_destroy(dlg);
+}
+
+/* Save — writes straight to the current file once the project has one; for a
+ * never-saved project it falls back to Save As… to get a name. */
+static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    const gchar *cur = jackdaw_project_get_file(win->project);
+    if (cur) {
+        if (jackdaw_project_save(win->project, cur))   /* TRUE = failure */
+            user_error("Could not save project.");
+    } else {
+        mw_save_as_project_cb(item, data);
+    }
 }
 
 static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
@@ -1181,9 +1196,12 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "_Open Project…",
               G_CALLBACK(mw_open_project_cb), win,
               GDK_KEY_o, GDK_CONTROL_MASK, ag);
-    menu_item(m, "_Save Project…",
+    menu_item(m, "_Save Project",
               G_CALLBACK(mw_save_project_cb), win,
               GDK_KEY_s, GDK_CONTROL_MASK, ag);
+    menu_item(m, "Save Project _As…",
+              G_CALLBACK(mw_save_as_project_cb), win,
+              GDK_KEY_s, GDK_CONTROL_MASK | GDK_SHIFT_MASK, ag);
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "_New Session",
               G_CALLBACK(mw_new_project_cb), win,
