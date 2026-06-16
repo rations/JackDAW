@@ -119,6 +119,15 @@ typedef struct {
  * call, with *count set; NULL/0 if nothing is being recorded. */
 const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count);
 
+/* --- Preview note (main thread only) ---
+ * Inject a single live note-on (on=TRUE) or note-off (on=FALSE) onto a track's
+ * instrument, played immediately regardless of transport state. Lock-free: the
+ * request is queued to the RT thread via a ringbuffer. Used by the piano-roll
+ * keyboard so the user can audition pitches by clicking a key. No-op if the
+ * track has no instrument loaded or is not registered with the engine. */
+void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
+                                 guint8 velocity, gboolean on);
+
 /* --- Input port enumeration (main thread only) ---
  * Returns NULL-terminated array of available external JACK audio/MIDI output
  * port names (i.e. sources jackdaw can record from), excluding jackdaw's own

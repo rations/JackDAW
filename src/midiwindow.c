@@ -71,6 +71,10 @@ typedef struct {
     double    sel_x0, sel_y0;   /* anchor (button-press point) */
     double    sel_x1, sel_y1;   /* current pointer point */
 
+    /* piano keyboard (left column) */
+    int      hl_pitch;          /* highlighted lane pitch (0..127), -1 = none */
+    int      key_playing;       /* pitch currently auditioned via mouse, -1 = none */
+
     /* playhead */
     double   play_tick;         /* clip-relative tick of playhead; -1 = off / before region */
     off_t    prev_play_pos;     /* last seen engine position (for auto-scroll) */
@@ -114,6 +118,16 @@ static void vel_color(int v, double *r, double *g, double *b)
 }
 
 static gboolean is_black_key(int p) { int n = p % 12; return n==1||n==3||n==6||n==8||n==10; }
+
+/* Human-readable note name, e.g. pitch 60 -> "C4" (matches the C-row octave
+ * labels drawn on the keyboard: octave = pitch/12 - 1). */
+static void note_name(int pitch, char *buf, gsize n)
+{
+    static const char *names[12] =
+        { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+    pitch = CLAMP(pitch, 0, 127);
+    g_snprintf(buf, n, "%s%d", names[pitch % 12], pitch / 12 - 1);
+}
 
 /* GTK CSS class add/remove (same helper as mainwindow). */
 static void mw_set_class(GtkWidget *w, const char *cls, gboolean add)
@@ -260,6 +274,16 @@ static gboolean roll_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         }
     }
 
+    /* highlighted lane (selected piano key) — faint amber band behind notes */
+    if (mw->hl_pitch >= 0) {
+        double y = pitch_to_y(mw, mw->hl_pitch);
+        if (y + mw->key_h >= 0 && y <= a.height) {
+            cairo_set_source_rgba(cr, 0.95, 0.80, 0.20, 0.14);
+            cairo_rectangle(cr, 0, y, a.width, mw->key_h);
+            cairo_fill(cr);
+        }
+    }
+
     /* vertical beat / bar grid */
     guint bpb = (mw->project && mw->project->beats_per_bar) ? mw->project->beats_per_bar : 4;
     double tick0 = gtk_adjustment_get_value(mw->h_adj);
@@ -365,6 +389,11 @@ static gboolean keys_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         else                     cairo_set_source_rgb(cr, 0.85, 0.85, 0.85);
         cairo_rectangle(cr, 0, y, a.width, mw->key_h);
         cairo_fill(cr);
+        if (pitch == mw->hl_pitch) {           /* selected key: amber overlay */
+            cairo_set_source_rgba(cr, 0.95, 0.72, 0.10, 0.60);
+            cairo_rectangle(cr, 0, y, a.width, mw->key_h);
+            cairo_fill(cr);
+        }
         cairo_set_source_rgba(cr, 0, 0, 0, 0.3);
         cairo_set_line_width(cr, 1.0);
         cairo_rectangle(cr, 0, y, a.width, mw->key_h);
@@ -377,6 +406,68 @@ static gboolean keys_draw(GtkWidget *w, cairo_t *cr, gpointer data)
         }
     }
     return FALSE;
+}
+
+/* ---- piano keyboard interaction ---- */
+
+/* Light up `pitch`'s lane and audition it on the track's instrument. */
+static void keys_play(MidiWindow *mw, int pitch)
+{
+    if (mw->key_playing == pitch) return;
+    if (mw->key_playing >= 0)
+        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0, FALSE);
+    mw->key_playing = pitch;
+    mw->hl_pitch    = pitch;
+    jackdaw_engine_preview_note(mw->track, (guint8)pitch, DEFAULT_VEL, TRUE);
+    gtk_widget_queue_draw(mw->keys);
+    gtk_widget_queue_draw(mw->roll);
+}
+
+static void keys_stop(MidiWindow *mw)
+{
+    if (mw->key_playing >= 0) {
+        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0, FALSE);
+        mw->key_playing = -1;
+    }
+}
+
+static gboolean keys_press(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w;
+    MidiWindow *mw = data;
+    if (e->button != 1) return FALSE;
+    keys_play(mw, y_to_pitch(mw, e->y));
+    return TRUE;
+}
+
+static gboolean keys_motion(GtkWidget *w, GdkEventMotion *e, gpointer data)
+{
+    (void)w;
+    MidiWindow *mw = data;
+    if (e->state & GDK_BUTTON1_MASK)         /* drag across keys: glissando */
+        keys_play(mw, y_to_pitch(mw, e->y));
+    return TRUE;
+}
+
+static gboolean keys_release(GtkWidget *w, GdkEventButton *e, gpointer data)
+{
+    (void)w;
+    MidiWindow *mw = data;
+    if (e->button != 1) return FALSE;
+    keys_stop(mw);                           /* highlight persists; sound stops */
+    return TRUE;
+}
+
+/* Note name popup on hover. */
+static gboolean keys_tooltip(GtkWidget *w, gint x, gint y, gboolean kb,
+                             GtkTooltip *tip, gpointer data)
+{
+    (void)w; (void)x; (void)kb;
+    MidiWindow *mw = data;
+    char buf[16];
+    note_name(y_to_pitch(mw, y), buf, sizeof buf);
+    gtk_tooltip_set_text(tip, buf);
+    return TRUE;
 }
 
 static gboolean vel_draw(GtkWidget *w, cairo_t *cr, gpointer data)
@@ -1243,6 +1334,7 @@ static gboolean mw_delete(GtkWidget *w, GdkEvent *e, gpointer data)
 {
     (void)w; (void)e;
     MidiWindow *mw = data;
+    keys_stop(mw);                       /* release any auditioned note */
     if (mw->update_timer) { g_source_remove(mw->update_timer); mw->update_timer = 0; }
     g_object_set_data(G_OBJECT(mw->track), "midi-window", NULL);
     gtk_widget_destroy(mw->window);
@@ -1271,6 +1363,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->project = project;
     mw->tpx = 20.0; mw->key_h = DEFAULT_KEYH;
     mw->drag_note = -1; mw->ctx_note_idx = -1;
+    mw->hl_pitch = -1; mw->key_playing = -1;
     mw->play_tick = -1.0; mw->prev_play_pos = -1;
 
     mw->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -1374,6 +1467,9 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->keys = gtk_drawing_area_new();
     gtk_widget_set_size_request(mw->keys, KEY_W, -1);
     gtk_widget_set_vexpand(mw->keys, TRUE);
+    gtk_widget_add_events(mw->keys, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK);
+    gtk_widget_set_has_tooltip(mw->keys, TRUE);
 
     mw->roll = gtk_drawing_area_new();
     gtk_widget_set_hexpand(mw->roll, TRUE);
@@ -1399,6 +1495,10 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
 
     g_signal_connect(mw->roll,  "draw",                 G_CALLBACK(roll_draw),    mw);
     g_signal_connect(mw->keys,  "draw",                 G_CALLBACK(keys_draw),    mw);
+    g_signal_connect(mw->keys,  "button-press-event",   G_CALLBACK(keys_press),   mw);
+    g_signal_connect(mw->keys,  "button-release-event", G_CALLBACK(keys_release), mw);
+    g_signal_connect(mw->keys,  "motion-notify-event",  G_CALLBACK(keys_motion),  mw);
+    g_signal_connect(mw->keys,  "query-tooltip",        G_CALLBACK(keys_tooltip), mw);
     g_signal_connect(mw->vel,   "draw",                 G_CALLBACK(vel_draw),     mw);
     g_signal_connect(mw->ruler, "draw",                 G_CALLBACK(ruler_draw),   mw);
     g_signal_connect(mw->ruler, "button-press-event",   G_CALLBACK(ruler_press),  mw);

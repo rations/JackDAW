@@ -722,6 +722,16 @@ static void recorder_stop(void)
 static guint8        eng_active_notes[JACKDAW_MAX_TRACKS][16][128];
 static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS];   /* 1 = all-notes-off */
 
+/* ---- Preview-note injection (main thread -> RT) ----
+ * The main thread queues short MIDI messages tagged with a track slot; the RT
+ * thread drains the ring once per cycle into per-slot scratch, and the gather
+ * function emits them at block offset 0. Lock-free SPSC via jack_ringbuffer. */
+#define ENG_PREVIEW_MAX 32                    /* per-slot events drained per cycle */
+typedef struct { gint32 slot; guint8 data[3]; } EngPrevMsg;
+static jack_ringbuffer_t *eng_preview_rb;     /* SPSC: main -> RT */
+static guint8 eng_preview_data[JACKDAW_MAX_TRACKS][ENG_PREVIEW_MAX][3];
+static int    eng_preview_n[JACKDAW_MAX_TRACKS];
+
 /* One recorded MIDI event: absolute timeline frame + up to 3 bytes. Written by
  * the RT thread to t->midi_rec_buf, drained on the main thread when recording
  * stops (midi_finalize_idle) and turned into clip notes. */
@@ -799,6 +809,20 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
         }
     }
 
+    /* Preview notes queued from the main thread (piano-roll keyboard) — emitted
+     * at block start and tracked so a later flush releases them. */
+    if (slot >= 0 && slot < JACKDAW_MAX_TRACKS) {
+        for (int pi = 0; pi < eng_preview_n[slot] && nev < cap; pi++) {
+            guint8 *d = eng_preview_data[slot][pi];
+            mev[nev].time = 0; mev[nev].size = 3;
+            mev[nev].data[0] = d[0]; mev[nev].data[1] = d[1]; mev[nev].data[2] = d[2];
+            int st = d[0] & 0xF0, ch = d[0] & 0x0F, p = d[1] & 0x7F;
+            if (st == 0x90 && d[2] > 0) eng_active_notes[slot][ch][p] = 1;
+            else if (st == 0x80)        eng_active_notes[slot][ch][p] = 0;
+            nev++;
+        }
+    }
+
     if (nev > 1) qsort(mev, nev, sizeof(PhMidiEvent), eng_midi_cmp);
     return nev;
 }
@@ -820,6 +844,21 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     if (flags & ENGINE_PLAYING)
         engine.play_pos += nframes;
+
+    /* Drain main-thread preview-note requests into per-slot scratch for this
+     * cycle (reset counts first; each event is delivered exactly once). */
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++) eng_preview_n[i] = 0;
+    if (eng_preview_rb) {
+        EngPrevMsg msg;
+        while (jack_ringbuffer_read_space(eng_preview_rb) >= sizeof msg) {
+            jack_ringbuffer_read(eng_preview_rb, (char *)&msg, sizeof msg);
+            if (msg.slot >= 0 && msg.slot < JACKDAW_MAX_TRACKS &&
+                eng_preview_n[msg.slot] < ENG_PREVIEW_MAX) {
+                guint8 *d = eng_preview_data[msg.slot][eng_preview_n[msg.slot]++];
+                d[0] = msg.data[0]; d[1] = msg.data[1]; d[2] = msg.data[2];
+            }
+        }
+    }
 
     /* Loop wrap (master clock — drives MIDI scheduling, metronome, plugin
      * transport and the UI playhead). Only engages when this block started
@@ -1451,6 +1490,10 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         if (!engine.audio_out[i]) goto fail;
     }
 
+    /* Preview-note queue (main thread -> RT). Sized for many in-flight clicks. */
+    eng_preview_rb = jack_ringbuffer_create(256 * sizeof(EngPrevMsg));
+    if (eng_preview_rb) jack_ringbuffer_mlock(eng_preview_rb);
+
     /* Activate — after this the process callback can be called at any time */
     if (jack_activate(engine.client) != 0) {
         user_error("jackdaw: jack_activate() failed");
@@ -1516,6 +1559,24 @@ void jackdaw_engine_quit(void)
     g_free(engine.audio_out); engine.audio_out = NULL;
     g_free(engine.midi_in);   engine.midi_in   = NULL;
     g_free(engine.midi_out);  engine.midi_out  = NULL;
+
+    if (eng_preview_rb) { jack_ringbuffer_free(eng_preview_rb); eng_preview_rb = NULL; }
+}
+
+void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
+                                 guint8 velocity, gboolean on)
+{
+    if (!engine.active || !eng_preview_rb || !t) return;
+    if (t->slot >= JACKDAW_MAX_TRACKS) return;   /* not registered with engine */
+
+    EngPrevMsg msg;
+    msg.slot    = (gint32)t->slot;
+    msg.data[0] = on ? 0x90 : 0x80;              /* note-on / note-off, channel 0 */
+    msg.data[1] = (guint8)(pitch & 0x7F);
+    msg.data[2] = on ? (velocity ? velocity : 1) : 0;
+
+    if (jack_ringbuffer_write_space(eng_preview_rb) >= sizeof msg)
+        jack_ringbuffer_write(eng_preview_rb, (const char *)&msg, sizeof msg);
 }
 
 gboolean jackdaw_engine_is_running(void)
