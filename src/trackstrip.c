@@ -236,6 +236,15 @@ static void ts_update_input_label(JackDawTrackStrip *strip)
     g_free(summary);
 }
 
+/* Dismiss the input-routing popover once a source has been chosen. */
+static void ts_close_input_popover(JackDawTrackStrip *strip)
+{
+    if (!strip->input_button) return;
+    GtkPopover *pop = gtk_menu_button_get_popover(
+        GTK_MENU_BUTTON(strip->input_button));
+    if (pop) gtk_popover_popdown(pop);
+}
+
 /* Selected JACK port name from a source combo, or NULL for the "None" row. */
 static gchar *combo_selected_port(GtkComboBox *combo)
 {
@@ -348,6 +357,9 @@ static void on_in_l_changed(GtkComboBox *combo, gpointer data)
     /* Clearing a channel of a stereo pair drops the track back to mono. */
     if (stereo && cleared) { ts_set_mode(strip, TS_MODE_MONO); return; }
     ts_update_input_label(strip);
+    /* Mono needs only this one source — confirm by closing. Stereo still
+     * needs the Right source, so keep the popover open in that case. */
+    if (!stereo) ts_close_input_popover(strip);
 }
 
 static void on_in_r_changed(GtkComboBox *combo, gpointer data)
@@ -361,6 +373,7 @@ static void on_in_r_changed(GtkComboBox *combo, gpointer data)
     /* Removing the right source ends stereo — revert to mono (left kept). */
     if (cleared) { ts_set_mode(strip, TS_MODE_MONO); return; }
     ts_update_input_label(strip);
+    ts_close_input_popover(strip);   /* both channels set — confirm */
 }
 
 static void on_in_midi_changed(GtkComboBox *combo, gpointer data)
@@ -371,6 +384,7 @@ static void on_in_midi_changed(GtkComboBox *combo, gpointer data)
     jackdaw_engine_set_midi_source(strip->track, port);
     g_free(port);
     ts_update_input_label(strip);
+    ts_close_input_popover(strip);
 }
 
 static void on_ports_changed(JackDawProject *project, gpointer data)
