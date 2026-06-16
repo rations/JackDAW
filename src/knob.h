@@ -28,6 +28,11 @@ GtkWidget *knob_new(double min, double max, double value, double default_val,
 void   knob_set_value(GtkWidget *knob, double value);
 double knob_get_value(GtkWidget *knob);
 
+/* Format the knob's current value as it appears in the read-out
+ * (e.g. "+3.0 dB" / "-inf" / "L37" / "C"), into the caller's buffer.
+ * Lets a host place a permanent value label next to/under the knob. */
+void   knob_format_value(GtkWidget *knob, char *buf, gsize n);
+
 G_END_DECLS
 
 #endif /* KNOB_H_INCLUDED */

@@ -35,6 +35,16 @@ static double knob_angle(KnobData *kd)
 }
 
 /* Value text for the floating read-out: dB with unit, pan as L/R percent. */
+static void knob_format_popup(KnobData *kd, char *buf, size_t n);
+
+/* Public wrapper: format the current value using the knob's kind. */
+void knob_format_value(GtkWidget *knob, char *buf, gsize n)
+{
+    KnobData *kd = g_object_get_data(G_OBJECT(knob), "knob-data");
+    if (!kd || n == 0) { if (n) buf[0] = '\0'; return; }
+    knob_format_popup(kd, buf, n);
+}
+
 static void knob_format_popup(KnobData *kd, char *buf, size_t n)
 {
     switch (kd->kind) {

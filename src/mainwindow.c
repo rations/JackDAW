@@ -72,6 +72,9 @@ static const char MW_CSS_SHARED[] =
     "  min-width:24px; min-height:12px; margin:-7px -10px;"
     "  border-radius:2px; border:1px solid #2a2a2e;"
     "  background-image:none; background-color:#d2d2d6; }"
+    /* Permanent value read-out centered under each track-strip dial. */
+    "label.ts-knob-val {"
+    "  font-size:9px; font-family:monospace; color:#ffffff; }"
     /* Floating real-time dB read-out shown beside the fader. */
     "label.mix-db-pop {"
     "  font-size:11px; font-family:monospace; color:#ffffff;"

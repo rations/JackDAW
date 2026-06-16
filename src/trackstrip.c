@@ -12,9 +12,24 @@ G_DEFINE_TYPE(JackDawTrackStrip, jackdaw_track_strip, GTK_TYPE_BOX)
 
 /* ---- Strip signal callbacks --------------------------------------------- */
 
+/* Refresh the permanent value read-outs shown under each dial. */
+static void ts_update_knob_labels(JackDawTrackStrip *strip)
+{
+    char buf[32];
+    if (strip->vol_knob && strip->vol_val_lbl) {
+        knob_format_value(strip->vol_knob, buf, sizeof buf);
+        gtk_label_set_text(GTK_LABEL(strip->vol_val_lbl), buf);
+    }
+    if (strip->pan_knob && strip->pan_val_lbl) {
+        knob_format_value(strip->pan_knob, buf, sizeof buf);
+        gtk_label_set_text(GTK_LABEL(strip->pan_val_lbl), buf);
+    }
+}
+
 static void on_vol_changed(double db, gpointer data)
 {
     JackDawTrackStrip *strip = data;
+    ts_update_knob_labels(strip);
     if (strip->suppress_update) return;
     gfloat linear = (gfloat)pow(10.0, db / 20.0);
     strip->self_update = TRUE;
@@ -25,6 +40,7 @@ static void on_vol_changed(double db, gpointer data)
 static void on_pan_changed(double pan, gpointer data)
 {
     JackDawTrackStrip *strip = data;
+    ts_update_knob_labels(strip);
     if (strip->suppress_update) return;
     strip->self_update = TRUE;
     jackdaw_track_set_pan(strip->track, (gfloat)pan);
@@ -77,6 +93,7 @@ static void on_track_state_changed(JackDawTrack *t, gpointer data)
                                  jackdaw_track_is_soloed(t));
     if (strip->pan_knob)
         knob_set_value(strip->pan_knob, (double)jackdaw_track_get_pan(t));
+    ts_update_knob_labels(strip);
     strip->suppress_update = FALSE;
 }
 
@@ -512,6 +529,8 @@ static void jackdaw_track_strip_init(JackDawTrackStrip *strip)
     strip->ctrl_row        = NULL;
     strip->vol_knob        = NULL;
     strip->pan_knob        = NULL;
+    strip->vol_val_lbl     = NULL;
+    strip->pan_val_lbl     = NULL;
     strip->input_button    = NULL;
     strip->rb_mono         = NULL;
     strip->rb_stereo       = NULL;
@@ -602,6 +621,16 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     GtkWidget *vol_lbl = gtk_label_new("V");
     GtkWidget *pan_lbl = gtk_label_new("P");
 
+    /* Permanent value read-out centered under each dial. */
+    strip->vol_val_lbl = gtk_label_new("");
+    strip->pan_val_lbl = gtk_label_new("");
+    gtk_label_set_xalign(GTK_LABEL(strip->vol_val_lbl), 0.5);
+    gtk_label_set_xalign(GTK_LABEL(strip->pan_val_lbl), 0.5);
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(strip->vol_val_lbl), "ts-knob-val");
+    gtk_style_context_add_class(
+        gtk_widget_get_style_context(strip->pan_val_lbl), "ts-knob-val");
+
     gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_arm),
                                 "ts-arm");
     gtk_style_context_add_class(gtk_widget_get_style_context(strip->btn_mute),
@@ -622,11 +651,22 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_solo, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_mono, FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(ctrl_row), strip->btn_fx,   FALSE, FALSE, 1);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,         FALSE, FALSE, 2);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->vol_knob, FALSE, FALSE, 1);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,         FALSE, FALSE, 2);
-    gtk_box_pack_start(GTK_BOX(ctrl_row), strip->pan_knob, FALSE, FALSE, 1);
+    /* Each dial sits above its value read-out in a vertical box, so the
+     * value text is centered directly under the knob. */
+    GtkWidget *vol_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    GtkWidget *pan_col = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_box_pack_start(GTK_BOX(vol_col), strip->vol_knob,    FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vol_col), strip->vol_val_lbl, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pan_col), strip->pan_knob,    FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(pan_col), strip->pan_val_lbl, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_lbl,  FALSE, FALSE, 2);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), vol_col,  FALSE, FALSE, 1);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_lbl,  FALSE, FALSE, 2);
+    gtk_box_pack_start(GTK_BOX(ctrl_row), pan_col,  FALSE, FALSE, 1);
     gtk_box_pack_start(GTK_BOX(left_box), ctrl_row, FALSE, FALSE, 0);
+
+    ts_update_knob_labels(strip);   /* seed the read-outs with current values */
 
     /* Row 3: input-source menu button. Its popover offers an input mode —
      * Mono / Stereo / MIDI — and the source combo(s) for that mode. */

@@ -49,6 +49,8 @@ struct _JackDawTrackStrip {
     GtkWidget    *ctrl_row;      /* [A][M][S][Mo][Fx] + vol/pan row */
     GtkWidget    *vol_knob;      /* GtkDrawingArea; KnobData via g_object_set_data */
     GtkWidget    *pan_knob;
+    GtkWidget    *vol_val_lbl;   /* permanent value read-out under the vol dial */
+    GtkWidget    *pan_val_lbl;   /* permanent value read-out under the pan dial */
 
     /* Input routing selector: a menu button (row 3) whose popover offers an
      * input MODE — Mono / Stereo / MIDI. Mono shows one audio source combo;
