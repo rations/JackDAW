@@ -10,8 +10,6 @@
 #include <jack/jack.h>
 #include <jack/midiport.h>
 #include <jack/ringbuffer.h>
-#include <jack/metadata.h>
-#include <jack/uuid.h>
 #ifdef HAVE_SAMPLERATE
 #  include <samplerate.h>
 #endif
@@ -88,26 +86,6 @@ typedef struct {
 } JackDawEngine;
 
 static JackDawEngine engine;
-
-/* Order bases for the JACK "order" metadata so metadata-aware patchbays
- * (qjackctl, Catia, RaySession, …) display ports in a sensible, stable order
- * regardless of registration time: MIDI on top, then audio input pairs (each
- * in_NR immediately after its in_N), then audio outputs. */
-#define PORT_ORDER_MIDI_IN   0
-#define PORT_ORDER_MIDI_OUT  100
-#define PORT_ORDER_AUDIO_IN  1000   /* left = base + slot*10, right = +1 */
-#define PORT_ORDER_AUDIO_OUT 100000
-
-/* Tag a port with its display order (no-op if metadata is unsupported). */
-static void engine_set_port_order(jack_port_t *p, int order)
-{
-    if (!p || !engine.client) return;
-    char buf[16];
-    g_snprintf(buf, sizeof(buf), "%d", order);
-    jack_set_property(engine.client, jack_port_uuid(p),
-                      JACK_METADATA_ORDER, buf,
-                      "http://www.w3.org/2001/XMLSchema#int");
-}
 
 /* -----------------------------------------------------------------------
  * Phase 2.5: Playback feeder thread
@@ -1440,7 +1418,6 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.midi_in[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
         if (!engine.midi_in[i]) goto fail;
-        engine_set_port_order(engine.midi_in[i], PORT_ORDER_MIDI_IN + (int)i);
     }
 
     /* Register MIDI output ports: midi_out_1 .. midi_out_M */
@@ -1450,7 +1427,6 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.midi_out[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
         if (!engine.midi_out[i]) goto fail;
-        engine_set_port_order(engine.midi_out[i], PORT_ORDER_MIDI_OUT + (int)i);
     }
 
     /* Register audio input ports: in_1 .. in_N (mono by default). The matching
@@ -1464,8 +1440,6 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.audio_in[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
         if (!engine.audio_in[i]) goto fail;
-        engine_set_port_order(engine.audio_in[i],
-                              PORT_ORDER_AUDIO_IN + (int)i * 10);
     }
 
     /* Register audio output ports: out_1 .. out_N */
@@ -1475,8 +1449,6 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         engine.audio_out[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
         if (!engine.audio_out[i]) goto fail;
-        engine_set_port_order(engine.audio_out[i],
-                              PORT_ORDER_AUDIO_OUT + (int)i);
     }
 
     /* Activate — after this the process callback can be called at any time */
@@ -1484,6 +1456,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         user_error("jackdaw: jack_activate() failed");
         goto fail;
     }
+
 
     /* Auto-connect midi_out_N → physical MIDI playback ports.
      * Audio outputs are handled by the system JACK auto-connect mechanism;
@@ -1584,8 +1557,6 @@ gboolean jackdaw_engine_set_audio_in_count(guint n)
         engine.audio_in[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
         if (!engine.audio_in[i]) return TRUE;
-        engine_set_port_order(engine.audio_in[i],
-                              PORT_ORDER_AUDIO_IN + (int)i * 10);
         engine.audio_in_r[i] = NULL;
     }
     engine.audio_in_count = n;
@@ -1612,8 +1583,6 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
         engine.audio_out[i] = jack_port_register(engine.client, name,
             JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
         if (!engine.audio_out[i]) return TRUE;
-        engine_set_port_order(engine.audio_out[i],
-                              PORT_ORDER_AUDIO_OUT + (int)i);
     }
     engine.audio_out_count = n;
     settings_set_uint32("jackAudioOutCount", n);
@@ -2258,10 +2227,6 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
             engine.audio_in_r[(guint)ai] = jack_port_register(engine.client,
                 name, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
             if (!engine.audio_in_r[(guint)ai]) return TRUE;
-            /* +1 so the right port sorts immediately after its left (in_NR
-             * directly below in_N) in metadata-aware patchbays. */
-            engine_set_port_order(engine.audio_in_r[(guint)ai],
-                                  PORT_ORDER_AUDIO_IN + ai * 10 + 1);
         }
     } else {
         /* Clear the right source first so the RT callback stops reading it,
