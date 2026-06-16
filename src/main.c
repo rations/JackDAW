@@ -10,6 +10,7 @@
 #include "jackdaw-engine.h"
 #include "mainwindow.h"
 #include "pluginhost.h"
+#include "fxwindow.h"
 
 /* ---- Globals ---- */
 
@@ -263,7 +264,10 @@ int main(int argc, char **argv)
 
     GtkWidget *win = jackdaw_main_window_new(project);
     g_object_unref(project);  /* main window holds its own ref */
-    (void)win;
+
+    /* Scan plugin paths at launch (progress dialog), announce plugins added
+     * since last run. */
+    jackdaw_fx_startup_scan(GTK_WINDOW(win));
 
     gtk_main();
 

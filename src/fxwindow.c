@@ -149,11 +149,75 @@ static void paths_remove_clicked(GtkButton *b, gpointer data)
     }
 }
 
+/* ----------------------------------------------------------------------
+ * Scan progress dialog — shown while plugins are (re)scanned. Scanning runs
+ * synchronously on the main thread, so the per-plugin progress callback pulses
+ * the bar and pumps the GTK loop to keep this window painted and responsive.
+ * ---------------------------------------------------------------------- */
+
+typedef struct {
+    GtkWidget *win;
+    GtkWidget *bar;
+    GtkWidget *lbl;
+} ScanProg;
+
+static void scan_prog_cb(const char *plugin, void *user)
+{
+    ScanProg *sp = user;
+    const char *base = strrchr(plugin, '/');
+    base = base ? base + 1 : plugin;
+    gtk_label_set_text(GTK_LABEL(sp->lbl), base);   /* external string: set_text */
+    gtk_progress_bar_pulse(GTK_PROGRESS_BAR(sp->bar));
+    while (gtk_events_pending()) gtk_main_iteration();
+}
+
+static ScanProg *scan_prog_begin(GtkWindow *parent)
+{
+    ScanProg *sp = g_new0(ScanProg, 1);
+    sp->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(sp->win), "Scanning Plugins");
+    gtk_window_set_modal(GTK_WINDOW(sp->win), TRUE);
+    gtk_window_set_deletable(GTK_WINDOW(sp->win), FALSE);
+    gtk_window_set_position(GTK_WINDOW(sp->win),
+                            parent ? GTK_WIN_POS_CENTER_ON_PARENT
+                                   : GTK_WIN_POS_CENTER);
+    if (parent) gtk_window_set_transient_for(GTK_WINDOW(sp->win), parent);
+    gtk_window_set_default_size(GTK_WINDOW(sp->win), 360, -1);
+    gtk_container_set_border_width(GTK_CONTAINER(sp->win), 12);
+
+    GtkWidget *box  = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    GtkWidget *head = gtk_label_new("Scanning for plugins\342\200\246");
+    gtk_widget_set_halign(head, GTK_ALIGN_START);
+    sp->bar = gtk_progress_bar_new();
+    sp->lbl = gtk_label_new("");
+    gtk_label_set_ellipsize(GTK_LABEL(sp->lbl), PANGO_ELLIPSIZE_MIDDLE);
+    gtk_widget_set_halign(sp->lbl, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), head,    FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), sp->bar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), sp->lbl, FALSE, FALSE, 0);
+    gtk_container_add(GTK_CONTAINER(sp->win), box);
+    gtk_widget_show_all(sp->win);
+
+    pluginhost_set_scan_progress(scan_prog_cb, sp);
+    while (gtk_events_pending()) gtk_main_iteration();
+    return sp;
+}
+
+static void scan_prog_end(ScanProg *sp)
+{
+    pluginhost_set_scan_progress(NULL, NULL);
+    gtk_widget_destroy(sp->win);
+    g_free(sp);
+}
+
 static void paths_rescan_clicked(GtkButton *b, gpointer data)
 {
     (void)b;
     PathsUI *ui = data;
+
+    ScanProg *sp = scan_prog_begin(GTK_WINDOW(ui->dialog));
     pluginhost_rescan();
+    scan_prog_end(sp);
 
     guint n[PH_NFORMATS] = {0}, total = 0;
     for (const GList *l = pluginhost_catalog(); l; l = l->next) {
@@ -213,6 +277,53 @@ void jackdaw_fx_paths_dialog(GtkWindow *parent)
 
     gtk_dialog_run(GTK_DIALOG(dlg));   /* helper buttons act via their callbacks */
     gtk_widget_destroy(dlg);
+}
+
+void jackdaw_fx_startup_scan(GtkWindow *parent)
+{
+    ScanProg *sp = scan_prog_begin(parent);
+    GList *added = pluginhost_scan_report_new();
+    scan_prog_end(sp);
+    if (!added) return;
+
+    guint n = g_list_length(added);
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        "New Plugins", parent,
+        GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+        "_OK", GTK_RESPONSE_OK, NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 380, 320);
+    GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    gtk_container_set_border_width(GTK_CONTAINER(box), 8);
+
+    GtkWidget *head = gtk_label_new(NULL);
+    char *t = g_strdup_printf("%u new plugin%s found:", n, n == 1 ? "" : "s");
+    gtk_label_set_text(GTK_LABEL(head), t);
+    g_free(t);
+    gtk_widget_set_halign(head, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(box), head, FALSE, FALSE, 4);
+
+    GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_vexpand(scroll, TRUE);
+
+    GtkWidget *list = gtk_list_box_new();
+    gtk_list_box_set_selection_mode(GTK_LIST_BOX(list), GTK_SELECTION_NONE);
+    for (GList *l = added; l; l = l->next) {
+        GtkWidget *row = gtk_label_new(NULL);
+        gtk_label_set_text(GTK_LABEL(row), (const char *)l->data);  /* external */
+        gtk_label_set_xalign(GTK_LABEL(row), 0.0);
+        gtk_widget_set_margin_start(row, 6);
+        gtk_widget_set_margin_end(row, 6);
+        gtk_list_box_insert(GTK_LIST_BOX(list), row, -1);
+    }
+    gtk_container_add(GTK_CONTAINER(scroll), list);
+    gtk_box_pack_start(GTK_BOX(box), scroll, TRUE, TRUE, 4);
+
+    gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+    g_list_free_full(added, g_free);
 }
 
 /* ======================================================================

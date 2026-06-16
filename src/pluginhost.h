@@ -51,6 +51,13 @@ void          pluginhost_shutdown(void);
 const GList  *pluginhost_catalog(void);
 void          pluginhost_rescan(void);
 
+/* Rescan, then report plugins newly discovered since the previous call (or
+ * since the last run — the baseline persists in ~/.jackdaw/pluginindex).
+ * Returns a newly-allocated GList of g_strdup'd display names; free with
+ * g_list_free_full(list, g_free). Empty list means nothing new. The first run
+ * has no baseline, so it reports every plugin found. */
+GList        *pluginhost_scan_report_new(void);
+
 /* Optional progress callback, fired with each plugin path as it is scanned
  * out-of-process (used to drive a scan-progress dialog). */
 void          pluginhost_set_scan_progress(void (*cb)(const char *plugin,

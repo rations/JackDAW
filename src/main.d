@@ -621,7 +621,7 @@ src/main.o: src/main.c src/config.h /usr/include/gtk-3.0/gtk/gtk.h \
  /usr/include/gtk-3.0/gtk/gtk-autocleanups.h src/main.h src/settings.h \
  src/project.h src/track.h src/audio_clip.h src/clipregion.h \
  src/midiclip.h src/jackdaw-engine.h src/mainwindow.h src/timeline.h \
- src/pluginhost.h
+ src/pluginhost.h src/fxwindow.h
 src/config.h:
 /usr/include/gtk-3.0/gtk/gtk.h:
 /usr/include/gtk-3.0/gdk/gdk.h:
@@ -1302,3 +1302,4 @@ src/jackdaw-engine.h:
 src/mainwindow.h:
 src/timeline.h:
 src/pluginhost.h:
+src/fxwindow.h:

@@ -390,6 +390,61 @@ void pluginhost_rescan(void)
     ph_do_scan();
 }
 
+/* Persisted baseline of every plugin identity seen on the previous scan, used
+ * to tell which plugins are newly added. Separate from plugincache because LV2
+ * is scanned in-process and never touches that cache. */
+static char *ph_index_path(void)
+{ return g_build_filename(g_get_home_dir(), ".jackdaw", "pluginindex", NULL); }
+
+/* Stable identity for diffing across runs: "<format>:<escaped key>". */
+static char *ph_identity(const PluginInfo *pi)
+{
+    GString *s = g_string_new("");
+    g_string_append_printf(s, "%d:", (int)pi->format);
+    ph_esc(s, pi->key);
+    return g_string_free(s, FALSE);
+}
+
+GList *pluginhost_scan_report_new(void)
+{
+    /* Load the previous identity set. On the very first run this stays empty,
+     * so every plugin found is reported as new (seeding the baseline too). */
+    GHashTable *prev = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                             g_free, NULL);
+    char *file = ph_index_path(), *data = NULL; gsize len = 0;
+    if (g_file_get_contents(file, &data, &len, NULL)) {
+        gchar **rows = g_strsplit(data, "\n", -1);
+        for (int i = 0; rows[i]; i++)
+            if (rows[i][0]) g_hash_table_add(prev, g_strdup(rows[i]));
+        g_strfreev(rows);
+        g_free(data);
+    }
+
+    ph_do_scan();
+
+    /* Diff the fresh catalog against the baseline; collect new names and
+     * rebuild the index to persist. */
+    GList *new_names = NULL;
+    GString *idx = g_string_new("");
+    for (const GList *l = ph_cat; l; l = l->next) {
+        const PluginInfo *pi = l->data;
+        char *id = ph_identity(pi);
+        g_string_append(idx, id);
+        g_string_append_c(idx, '\n');
+        if (!g_hash_table_contains(prev, id))
+            new_names = g_list_prepend(new_names, g_strdup(pi->name));
+        g_free(id);
+    }
+    new_names = g_list_reverse(new_names);
+
+    g_file_set_contents(file, idx->str, idx->len, NULL);
+
+    g_string_free(idx, TRUE);
+    g_free(file);
+    g_hash_table_destroy(prev);
+    return new_names;
+}
+
 void pluginhost_add_search_path(PluginFormat fmt, const char *dir)
 {
     if (fmt < 0 || fmt >= PH_NFORMATS || !dir || !*dir) return;
