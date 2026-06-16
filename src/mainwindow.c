@@ -1199,9 +1199,6 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
 
     /* File */
     GtkWidget *m = make_submenu_item(menubar, "_File");
-    menu_item(m, "_Load File as New Track…",
-              G_CALLBACK(mw_load_file_cb), win, 0, 0, ag);
-    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "_Open Project…",
               G_CALLBACK(mw_open_project_cb), win,
               GDK_KEY_o, GDK_CONTROL_MASK, ag);
@@ -1235,6 +1232,9 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
               G_CALLBACK(mw_add_track_cb), win, 0, 0, ag);
     menu_item(m, "Add _MIDI Track",
               G_CALLBACK(mw_add_instrument_track_cb), win, 0, 0, ag);
+    menu_item(m, "_Load File as New Track…",
+              G_CALLBACK(mw_load_file_cb), win, 0, 0, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "_Remove Focused Track",
               G_CALLBACK(mw_remove_track_cb), win, 0, 0, ag);
 
