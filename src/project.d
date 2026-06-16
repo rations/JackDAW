@@ -1,5 +1,6 @@
-src/project.o: src/project.c src/config.h src/project.h \
- /usr/include/glib-2.0/glib-object.h \
+src/project.o: src/project.c src/config.h /usr/include/glib-2.0/gio/gio.h \
+ /usr/include/glib-2.0/gio/giotypes.h \
+ /usr/include/glib-2.0/gio/gioenums.h /usr/include/glib-2.0/glib-object.h \
  /usr/include/glib-2.0/gobject/gbinding.h /usr/include/glib-2.0/glib.h \
  /usr/include/glib-2.0/glib/galloca.h /usr/include/glib-2.0/glib/gtypes.h \
  /usr/lib/x86_64-linux-gnu/glib-2.0/include/glibconfig.h \
@@ -92,14 +93,7 @@ src/project.o: src/project.c src/config.h src/project.h \
  /usr/include/glib-2.0/gobject/gtypeplugin.h \
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
- /usr/include/glib-2.0/gobject/gobject-autocleanups.h src/track.h \
- src/audio_clip.h src/clipregion.h src/midiclip.h src/settings.h \
- src/pluginhost.h /usr/include/gtk-3.0/gtk/gtk.h \
- /usr/include/gtk-3.0/gdk/gdk.h /usr/include/gtk-3.0/gdk/gdkconfig.h \
- /usr/include/gtk-3.0/gdk/gdkversionmacros.h \
- /usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h \
- /usr/include/glib-2.0/gio/gio.h /usr/include/glib-2.0/gio/giotypes.h \
- /usr/include/glib-2.0/gio/gioenums.h \
+ /usr/include/glib-2.0/gobject/gobject-autocleanups.h \
  /usr/include/glib-2.0/gio/gio-visibility.h \
  /usr/include/glib-2.0/gio/gaction.h \
  /usr/include/glib-2.0/gio/gactiongroup.h \
@@ -254,6 +248,13 @@ src/project.o: src/project.c src/config.h src/project.h \
  /usr/include/glib-2.0/gio/gzlibcompressor.h \
  /usr/include/glib-2.0/gio/gzlibdecompressor.h \
  /usr/include/glib-2.0/gio/gio-autocleanups.h \
+ /usr/include/glib-2.0/glib/gstdio.h /usr/include/glib-2.0/glib/gprintf.h \
+ src/project.h src/track.h src/audio_clip.h src/clipregion.h \
+ src/midiclip.h src/settings.h src/pluginhost.h \
+ /usr/include/gtk-3.0/gtk/gtk.h /usr/include/gtk-3.0/gdk/gdk.h \
+ /usr/include/gtk-3.0/gdk/gdkconfig.h \
+ /usr/include/gtk-3.0/gdk/gdkversionmacros.h \
+ /usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h \
  /usr/include/gtk-3.0/gdk/gdktypes.h /usr/include/pango-1.0/pango/pango.h \
  /usr/include/pango-1.0/pango/pango-attributes.h \
  /usr/include/pango-1.0/pango/pango-font.h \
@@ -622,7 +623,9 @@ src/project.o: src/project.c src/config.h src/project.h \
  /usr/include/gtk-3.0/gtk/deprecated/gtkvseparator.h \
  /usr/include/gtk-3.0/gtk/gtk-autocleanups.h src/jackdaw-engine.h
 src/config.h:
-src/project.h:
+/usr/include/glib-2.0/gio/gio.h:
+/usr/include/glib-2.0/gio/giotypes.h:
+/usr/include/glib-2.0/gio/gioenums.h:
 /usr/include/glib-2.0/glib-object.h:
 /usr/include/glib-2.0/gobject/gbinding.h:
 /usr/include/glib-2.0/glib.h:
@@ -733,20 +736,6 @@ src/project.h:
 /usr/include/glib-2.0/gobject/gvaluearray.h:
 /usr/include/glib-2.0/gobject/gvaluetypes.h:
 /usr/include/glib-2.0/gobject/gobject-autocleanups.h:
-src/track.h:
-src/audio_clip.h:
-src/clipregion.h:
-src/midiclip.h:
-src/settings.h:
-src/pluginhost.h:
-/usr/include/gtk-3.0/gtk/gtk.h:
-/usr/include/gtk-3.0/gdk/gdk.h:
-/usr/include/gtk-3.0/gdk/gdkconfig.h:
-/usr/include/gtk-3.0/gdk/gdkversionmacros.h:
-/usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h:
-/usr/include/glib-2.0/gio/gio.h:
-/usr/include/glib-2.0/gio/giotypes.h:
-/usr/include/glib-2.0/gio/gioenums.h:
 /usr/include/glib-2.0/gio/gio-visibility.h:
 /usr/include/glib-2.0/gio/gaction.h:
 /usr/include/glib-2.0/gio/gactiongroup.h:
@@ -905,6 +894,20 @@ src/pluginhost.h:
 /usr/include/glib-2.0/gio/gzlibcompressor.h:
 /usr/include/glib-2.0/gio/gzlibdecompressor.h:
 /usr/include/glib-2.0/gio/gio-autocleanups.h:
+/usr/include/glib-2.0/glib/gstdio.h:
+/usr/include/glib-2.0/glib/gprintf.h:
+src/project.h:
+src/track.h:
+src/audio_clip.h:
+src/clipregion.h:
+src/midiclip.h:
+src/settings.h:
+src/pluginhost.h:
+/usr/include/gtk-3.0/gtk/gtk.h:
+/usr/include/gtk-3.0/gdk/gdk.h:
+/usr/include/gtk-3.0/gdk/gdkconfig.h:
+/usr/include/gtk-3.0/gdk/gdkversionmacros.h:
+/usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h:
 /usr/include/gtk-3.0/gdk/gdktypes.h:
 /usr/include/pango-1.0/pango/pango.h:
 /usr/include/pango-1.0/pango/pango-attributes.h:

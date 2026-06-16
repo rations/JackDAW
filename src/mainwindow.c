@@ -197,8 +197,16 @@ static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
         "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
     gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
     const gchar *cur = jackdaw_project_get_file(win->project);
-    if (cur) gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dlg), cur);
-    else     gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "untitled.jdaw");
+    if (cur) {
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dlg), cur);
+    } else {
+        /* New project: default into ~/Music/JackDAW/Projects. The project name
+         * the user types becomes its own bundle directory (handled on save). */
+        gchar *dir = jackdaw_default_projects_dir();
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dlg), dir);
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dlg), "untitled.jdaw");
+        g_free(dir);
+    }
 
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
@@ -222,6 +230,16 @@ static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
     gtk_file_filter_set_name(ff, "JackDAW projects (*.jdaw)");
     gtk_file_filter_add_pattern(ff, "*.jdaw");
     gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(dlg), ff);
+
+    /* Start in the projects folder unless we have a current project to anchor to. */
+    const gchar *cur = jackdaw_project_get_file(win->project);
+    if (cur) {
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(dlg), cur);
+    } else {
+        gchar *dir = jackdaw_default_projects_dir();
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dlg), dir);
+        g_free(dir);
+    }
 
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));

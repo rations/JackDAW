@@ -1,6 +1,8 @@
 #include <config.h>
 #include <math.h>
 #include <string.h>
+#include <gio/gio.h>
+#include <glib/gstdio.h>
 
 #include "project.h"
 #include "settings.h"
@@ -379,10 +381,186 @@ static void project_load_fx(GKeyFile *kf, JackDawTrack *t, const char *grp)
     }
 }
 
+/* ---------------------- Project bundle directory ----------------------- */
+
+gchar *jackdaw_default_projects_dir(void)
+{
+    const gchar *music = g_get_user_special_dir(G_USER_DIRECTORY_MUSIC);
+    gchar *dir = (music && *music)
+        ? g_build_filename(music, "JackDAW", "Projects", NULL)
+        : g_build_filename(g_get_home_dir(), "Music", "JackDAW", "Projects", NULL);
+    g_mkdir_with_parents(dir, 0755);
+    return dir;
+}
+
+/* Copy `src` to `dst`, skipping the copy when `dst` already holds a file of the
+ * same size (assumed identical — avoids rewriting large WAVs on every save).
+ * Boolean convention: FALSE = success, TRUE = failure. */
+static gboolean project_copy_asset(const char *src, const char *dst)
+{
+    GStatBuf ss, ds;
+    if (g_stat(src, &ss) == 0 && g_stat(dst, &ds) == 0 && ss.st_size == ds.st_size)
+        return FALSE;   /* already present, identical size -> nothing to do */
+    GFile *s = g_file_new_for_path(src);
+    GFile *d = g_file_new_for_path(dst);
+    gboolean ok = g_file_copy(s, d, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, NULL);
+    g_object_unref(s);
+    g_object_unref(d);
+    return ok ? FALSE : TRUE;
+}
+
+/* Move `src` onto `dst`, falling back to copy+unlink when rename() can't (e.g.
+ * the two live on different filesystems). Used for scratch recordings, which
+ * have a single home and should not be left behind. FALSE = success. */
+static gboolean project_move_asset(const char *src, const char *dst)
+{
+    if (g_rename(src, dst) == 0) return FALSE;
+    if (project_copy_asset(src, dst)) return TRUE;   /* copy failed -> give up */
+    g_unlink(src);
+    return FALSE;
+}
+
+/* Bring every referenced audio file into <audio_dir> and build a map from each
+ * source absolute path to its bundle-relative path ("audio/<name>"). Files
+ * already inside this bundle are referenced in place. Imported files are copied
+ * (the user's original is left untouched). Live takes still sitting in the
+ * scratch dir (~/.jackdaw/recordings) are *moved* in — they have a single home
+ * and should not pile up there — and their in-memory clips are repointed to the
+ * new location. Unsaved takes stay in the scratch dir for recovery. Differing
+ * sources that share a basename are disambiguated with a numeric prefix. The
+ * returned table is owned by the caller. */
+static GHashTable *project_collect_assets(JackDawProject *p, const char *audio_dir)
+{
+    GHashTable *relmap = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, g_free);
+    GHashTable *used   = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, NULL);
+    /* src path -> new absolute path, for clips whose scratch file we moved. */
+    GHashTable *moved  = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, g_free);
+    gchar *audio_prefix = g_strconcat(audio_dir, G_DIR_SEPARATOR_S, NULL);
+    gchar *rec_dir      = g_build_filename(g_get_home_dir(), ".jackdaw",
+                                           "recordings", NULL);
+    gchar *rec_prefix   = g_strconcat(rec_dir, G_DIR_SEPARATOR_S, NULL);
+    g_free(rec_dir);
+    /* Never move a file out from under the feeder thread, which reads paths only
+     * while the transport is playing; copy in that case and move on a later save. */
+    gboolean may_move = !jackdaw_engine_is_playing();
+
+    for (guint ti = 0; ti < p->tracks->len; ti++) {
+        JackDawTrack *t = JACKDAW_TRACK(g_ptr_array_index(p->tracks, ti));
+        GPtrArray *regs = jackdaw_track_get_regions(t);
+        for (guint ri = 0; regs && ri < regs->len; ri++) {
+            ClipRegion *r = g_ptr_array_index(regs, ri);
+            const char *src = (r->clip && r->clip->path) ? r->clip->path : NULL;
+            if (!src || !*src || g_hash_table_contains(relmap, src)) continue;
+
+            /* Already inside this bundle -> keep its existing relative path. */
+            if (g_str_has_prefix(src, audio_prefix)) {
+                gchar *rel = g_build_filename("audio",
+                                              src + strlen(audio_prefix), NULL);
+                g_hash_table_insert(relmap, g_strdup(src), rel);
+                continue;
+            }
+
+            gchar *bn = g_path_get_basename(src);
+            gchar *cand = g_strdup(bn);
+            for (guint n = 1; g_hash_table_contains(used, cand); n++) {
+                g_free(cand);
+                cand = g_strdup_printf("%u_%s", n, bn);
+            }
+            g_free(bn);
+
+            gchar *dst = g_build_filename(audio_dir, cand, NULL);
+            gboolean placed = FALSE, was_moved = FALSE;
+            if (may_move && g_str_has_prefix(src, rec_prefix)) {
+                if (!project_move_asset(src, dst)) {
+                    g_hash_table_insert(moved, g_strdup(src), g_strdup(dst));
+                    placed = was_moved = TRUE;
+                }
+            }
+            if (!placed && !project_copy_asset(src, dst))
+                placed = TRUE;
+
+            gchar *rel;
+            if (placed) {
+                rel = g_build_filename("audio", cand, NULL);
+                g_hash_table_add(used, g_strdup(cand));
+            } else {
+                rel = g_strdup(src);   /* move+copy failed -> reference original */
+            }
+            g_hash_table_insert(relmap, g_strdup(src), rel);
+            /* A moved clip is repointed to `dst` below, so the save loop will look
+             * it up by the new path — map that to the same relative path too. */
+            if (was_moved)
+                g_hash_table_insert(relmap, g_strdup(dst), g_strdup(rel));
+            g_free(cand);
+            g_free(dst);
+        }
+    }
+
+    /* Repoint clips whose scratch file we just moved into the bundle. Safe: we
+     * only move while stopped, so the feeder thread isn't reading these paths.
+     * Shared clips update once (the second region already sees the new path). */
+    if (g_hash_table_size(moved) > 0) {
+        for (guint ti = 0; ti < p->tracks->len; ti++) {
+            JackDawTrack *t = JACKDAW_TRACK(g_ptr_array_index(p->tracks, ti));
+            GPtrArray *regs = jackdaw_track_get_regions(t);
+            for (guint ri = 0; regs && ri < regs->len; ri++) {
+                ClipRegion *r = g_ptr_array_index(regs, ri);
+                if (!r->clip || !r->clip->path) continue;
+                const char *np = g_hash_table_lookup(moved, r->clip->path);
+                if (np) {
+                    gchar *old = r->clip->path;
+                    g_atomic_pointer_set(&r->clip->path, g_strdup(np));
+                    g_free(old);
+                }
+            }
+        }
+    }
+
+    g_free(audio_prefix);
+    g_free(rec_prefix);
+    g_hash_table_destroy(used);
+    g_hash_table_destroy(moved);
+    return relmap;
+}
+
 gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TRUE);
-    if (!path) return TRUE;
+    if (!path || !*path) return TRUE;
+
+    /* ---- Resolve the project bundle layout from `path`. ----
+     * A project is a self-contained directory <bundle>/ holding <name>.jdaw plus
+     * an audio/ subfolder with copies of every referenced sound file. If `path`
+     * already sits inside a directory named after the project (a re-save), reuse
+     * that directory rather than nesting a second level. */
+    gchar *raw = g_path_get_basename(path);
+    gchar *name = g_str_has_suffix(raw, ".jdaw")
+        ? g_strndup(raw, strlen(raw) - 5) : g_strdup(raw);
+    g_free(raw);
+    if (!*name) { g_free(name); return TRUE; }
+
+    gchar *parent = g_path_get_dirname(path);
+    gchar *pbase  = g_path_get_basename(parent);
+    gchar *bundle = (g_strcmp0(pbase, name) == 0)
+        ? g_strdup(parent) : g_build_filename(parent, name, NULL);
+    g_free(pbase);
+    g_free(parent);
+
+    gchar *audio_dir = g_build_filename(bundle, "audio", NULL);
+    if (g_mkdir_with_parents(audio_dir, 0755) != 0) {
+        g_free(name); g_free(bundle); g_free(audio_dir);
+        return TRUE;
+    }
+    gchar *jdaw_name = g_strconcat(name, ".jdaw", NULL);
+    gchar *jdaw_path = g_build_filename(bundle, jdaw_name, NULL);
+    g_free(jdaw_name);
+
+    /* Copy referenced audio into the bundle and map sources -> relative paths. */
+    GHashTable *relmap = project_collect_assets(p, audio_dir);
+    g_free(audio_dir);
 
     GKeyFile *kf = g_key_file_new();
     g_key_file_set_double (kf, "project", "bpm", p->bpm);
@@ -420,8 +598,10 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
         for (guint ri = 0; regs && ri < regs->len; ri++) {
             ClipRegion *r = g_ptr_array_index(regs, ri);
             char rg[48]; g_snprintf(rg, sizeof rg, "track%u.region%u", ti, ri);
+            const char *src = (r->clip && r->clip->path) ? r->clip->path : NULL;
+            const char *relp = src ? g_hash_table_lookup(relmap, src) : NULL;
             g_key_file_set_string(kf, rg, "path",
-                (r->clip && r->clip->path) ? r->clip->path : "");
+                relp ? relp : (src ? src : ""));
             g_key_file_set_int64 (kf, rg, "file_in", r->file_in);
             g_key_file_set_int64 (kf, rg, "length",  r->length);
             g_key_file_set_int64 (kf, rg, "tl_pos",  r->tl_pos);
@@ -457,9 +637,27 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
                            jackdaw_track_is_muted(p->master_track) ? 1 : 0);
     project_save_fx(kf, p->master_track, "master");
 
-    gboolean ok = g_key_file_save_to_file(kf, path, NULL);
+    /* Roll the previous save into a single backup, overwritten on each save so
+     * the project directory keeps exactly one <name>.jdaw.bak rather than a
+     * growing pile. Copy (not rename) so the live .jdaw survives if the new
+     * write below fails. */
+    if (g_file_test(jdaw_path, G_FILE_TEST_EXISTS)) {
+        gchar *bak = g_strconcat(jdaw_path, ".bak", NULL);
+        GFile *s = g_file_new_for_path(jdaw_path);
+        GFile *d = g_file_new_for_path(bak);
+        g_file_copy(s, d, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, NULL);
+        g_object_unref(s);
+        g_object_unref(d);
+        g_free(bak);
+    }
+
+    gboolean ok = g_key_file_save_to_file(kf, jdaw_path, NULL);
     g_key_file_free(kf);
-    if (ok) jackdaw_project_set_file(p, path);
+    g_hash_table_destroy(relmap);
+    if (ok) jackdaw_project_set_file(p, jdaw_path);
+    g_free(name);
+    g_free(bundle);
+    g_free(jdaw_path);
     return ok ? FALSE : TRUE;
 }
 
@@ -473,6 +671,9 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
         g_key_file_free(kf);
         return TRUE;
     }
+
+    /* Directory holding the .jdaw, used to resolve bundle-relative audio paths. */
+    gchar *projdir = g_path_get_dirname(path);
 
     /* Clear the current session (engine slots + project tracks). */
     guint cur = p->tracks->len;
@@ -533,8 +734,13 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
             char rg[48]; g_snprintf(rg, sizeof rg, "track%d.region%d", ti, ri);
             if (!g_key_file_has_group(kf, rg)) continue;
             gchar *rp = g_key_file_get_string(kf, rg, "path", NULL);
-            if (rp && rp[0] == '/' && !strstr(rp, "..") && strlen(rp) < 4096) {
-                AudioClip *clip = audio_clip_new(rp, NULL);
+            /* Bundle-relative paths (e.g. "audio/kick.wav") resolve against the
+             * .jdaw's directory; legacy absolute paths are used as-is. */
+            gchar *abs = NULL;
+            if (rp && rp[0] == '/')      abs = g_strdup(rp);
+            else if (rp && rp[0])        abs = g_build_filename(projdir, rp, NULL);
+            if (abs && abs[0] == '/' && !strstr(abs, "..") && strlen(abs) < 4096) {
+                AudioClip *clip = audio_clip_new(abs, NULL);
                 if (clip) {
                     ClipRegion *r = clip_region_new(clip,
                         kf_i64(kf, rg, "file_in", 0),
@@ -545,6 +751,7 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
                     audio_clip_free(clip);   /* region holds its own ref */
                 }
             }
+            g_free(abs);
             g_free(rp);
         }
         jackdaw_track_commit_regions(t);
@@ -587,6 +794,7 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     }
 
     g_key_file_free(kf);
+    g_free(projdir);
     jackdaw_project_set_file(p, path);
     jackdaw_project_emit_timing_changed(p);
     return FALSE;

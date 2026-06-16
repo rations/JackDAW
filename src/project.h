@@ -94,6 +94,11 @@ const gchar *jackdaw_project_get_file(JackDawProject *p);
 gboolean     jackdaw_project_save(JackDawProject *p, const gchar *path);
 gboolean     jackdaw_project_load(JackDawProject *p, const gchar *path);
 
+/* Default root directory for project bundles (~/Music/JackDAW/Projects),
+ * created if it does not exist. Use this as the save dialog's start folder.
+ * Caller frees the returned string. */
+gchar       *jackdaw_default_projects_dir(void);
+
 /* Signal to refresh port selectors after port count change */
 void jackdaw_project_emit_ports_changed(JackDawProject *p);
 
