@@ -11,6 +11,7 @@
 #include "main.h"
 #include "um.h"
 #include "settings.h"
+#include "fxwindow.h"
 
 G_DEFINE_TYPE(JackDawMainWindow, jackdaw_main_window, GTK_TYPE_WINDOW)
 
@@ -671,6 +672,14 @@ static void mw_io_menu_cb(GtkMenuItem *m, gpointer data)
     mw_open_io_window(JACKDAW_MAIN_WINDOW(data));
 }
 
+/* Open the global plugin paths / rescan dialog (add/remove scan folders,
+ * load the plugin cache). This manages where plugins live, not per-track FX. */
+static void mw_plugins_menu_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    jackdaw_fx_paths_dialog(GTK_WINDOW(data));
+}
+
 /* Open (creating lazily) the metronome settings window. */
 static void mw_open_metronome_window(JackDawMainWindow *win)
 {
@@ -1273,6 +1282,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     m = make_submenu_item(menubar, "_Options");
     menu_item(m, "_Inputs/Outputs…",
               G_CALLBACK(mw_io_menu_cb), win, 0, 0, ag);
+    menu_item(m, "_Plugins…",
+              G_CALLBACK(mw_plugins_menu_cb), win, 0, 0, ag);
 
     /* ---- Transport toolbar ---- */
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);

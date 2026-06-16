@@ -199,13 +199,13 @@ void jackdaw_fx_paths_dialog(GtkWindow *parent)
     GtkWidget *btns = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     GtkWidget *add  = gtk_button_new_with_label("Add Folder\342\200\246");
     GtkWidget *del  = gtk_button_new_with_label("Remove");
-    GtkWidget *resc = gtk_button_new_with_label("Rescan");
+    GtkWidget *scan = gtk_button_new_with_label("Scan");
     g_signal_connect(add,  "clicked", G_CALLBACK(paths_add_clicked),    &ui);
     g_signal_connect(del,  "clicked", G_CALLBACK(paths_remove_clicked), &ui);
-    g_signal_connect(resc, "clicked", G_CALLBACK(paths_rescan_clicked), &ui);
+    g_signal_connect(scan, "clicked", G_CALLBACK(paths_rescan_clicked), &ui);
     gtk_box_pack_start(GTK_BOX(btns), add,  FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(btns), del,  FALSE, FALSE, 0);
-    gtk_box_pack_end  (GTK_BOX(btns), resc, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(btns), scan, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), btns, FALSE, FALSE, 2);
 
     gtk_widget_show_all(dlg);
@@ -611,13 +611,6 @@ static void fxwin_add_clicked(GtkButton *b, gpointer data)
     fxwin_show_gui(fw, jackdaw_track_fx_count(fw->track) - 1);
 }
 
-static void fxwin_paths_clicked(GtkButton *b, gpointer data)
-{
-    (void)b;
-    FxWindow *fw = data;
-    jackdaw_fx_paths_dialog(GTK_WINDOW(fw->window));
-}
-
 static gboolean fxwin_delete(GtkWidget *w, GdkEvent *e, gpointer data)
 {
     (void)w; (void)e;
@@ -674,10 +667,6 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
                            G_CALLBACK(fxlist_draw_after), fw);
     gtk_container_add(GTK_CONTAINER(lscroll), fw->list_box);
     gtk_box_pack_start(GTK_BOX(left), lscroll, TRUE, TRUE, 0);
-
-    GtkWidget *paths = gtk_button_new_with_label("Plugins\342\200\246");
-    g_signal_connect(paths, "clicked", G_CALLBACK(fxwin_paths_clicked), fw);
-    gtk_box_pack_start(GTK_BOX(left), paths, FALSE, FALSE, 0);
 
     /* Right panel: wet/dry header above the selected effect's GUI. No forced
      * width — the panel fits the shown plugin's natural size (see fxwin_fit_*). */
