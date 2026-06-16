@@ -1040,6 +1040,108 @@ static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
     jackdaw_timeline_redraw_all(tl);
 }
 
+/* Replace the clipboard with `regs` (consumed): copies normalized so the
+ * earliest region starts at frame 0. */
+static void timeline_clipboard_set(JackDawTimeline *tl, GPtrArray *regs)
+{
+    g_ptr_array_set_size(tl->clipboard, 0);
+    if (regs->len == 0) return;
+    off_t origin = ((ClipRegion *)g_ptr_array_index(regs, 0))->tl_pos;
+    for (guint i = 1; i < regs->len; i++) {
+        off_t p = ((ClipRegion *)g_ptr_array_index(regs, i))->tl_pos;
+        if (p < origin) origin = p;
+    }
+    for (guint i = 0; i < regs->len; i++) {
+        ClipRegion *c = clip_region_copy(g_ptr_array_index(regs, i));
+        c->tl_pos -= origin;
+        g_ptr_array_add(tl->clipboard, c);
+    }
+}
+
+/* Copy the selected area to the clipboard.  Mirrors menu_delete_sel_cb's
+ * selection model: prefer the section selection, else the rubber-band range
+ * (sliced sample-rate-correctly out of `range_track`). */
+static void timeline_copy_selection(JackDawTimeline *tl, JackDawTrack *range_track)
+{
+    int sr = (int)timeline_jack_sr();
+
+    if (tl->sel_track && tl->sel_regions && tl->sel_regions->len > 0) {
+        timeline_clipboard_set(tl, tl->sel_regions);
+        return;
+    }
+
+    if (!range_track || !tl->sel_active) return;
+    off_t a = tl->sel_start, b = tl->sel_end;
+    if (b < a) { off_t tmp = a; a = b; b = tmp; }
+    if (b <= a) return;
+
+    /* Deep-copy the track, then trim everything outside [a,b] using the same
+     * sample-rate-aware delete used by Delete Selected Area. */
+    GPtrArray *tmp = clip_region_list_copy(jackdaw_track_get_regions(range_track));
+    off_t big = clip_region_list_total_frames(tmp) + 1;
+    if (a > 0)  clip_region_list_delete_range(tmp, 0, a, sr);
+    if (b < big) clip_region_list_delete_range(tmp, b, big, sr);
+    timeline_clipboard_set(tl, tmp);
+    g_ptr_array_unref(tmp);
+}
+
+/* Paste the clipboard onto `dest`, anchored at the playhead.  The paste span is
+ * cleared first (overwrite) so no regions overlap. */
+static void timeline_paste_to_track(JackDawTimeline *tl, JackDawTrack *dest)
+{
+    if (!dest || jackdaw_track_is_instrument(dest)) return;
+    if (!tl->clipboard || tl->clipboard->len == 0) return;
+
+    off_t at = (off_t)gtk_adjustment_get_value(tl->cursor_adj);
+    if (at < 0) at = 0;
+
+    off_t span = 0;                         /* normalized width of the clipboard */
+    for (guint i = 0; i < tl->clipboard->len; i++) {
+        off_t end = clip_region_end(g_ptr_array_index(tl->clipboard, i));
+        if (end > span) span = end;
+    }
+
+    int sr = (int)timeline_jack_sr();
+    GPtrArray *regs = jackdaw_track_get_regions(dest);
+    timeline_push_undo(tl, dest);
+    clip_region_list_delete_range(regs, at, at + span, sr);   /* clear the span */
+    for (guint i = 0; i < tl->clipboard->len; i++) {
+        ClipRegion *c = clip_region_copy(g_ptr_array_index(tl->clipboard, i));
+        c->tl_pos += at;
+        g_ptr_array_add(regs, c);
+    }
+    clip_region_list_sort(regs);
+    jackdaw_track_commit_regions(dest);
+    jackdaw_timeline_redraw_all(tl);
+}
+
+/* Public entry points: keyboard Ctrl+C / Ctrl+V act on the focused track. */
+void jackdaw_timeline_copy_selection(JackDawTimeline *tl)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    timeline_copy_selection(tl, tl->focused_track);
+}
+void jackdaw_timeline_paste_at_cursor(JackDawTimeline *tl)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    timeline_paste_to_track(tl, tl->focused_track);
+}
+
+/* Right-click menu: act on the track under the pointer. */
+static void menu_copy_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    timeline_copy_selection(tl, tl->menu_track);
+}
+
+static void menu_paste_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    timeline_paste_to_track(tl, tl->menu_track);
+}
+
 static void menu_group_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -1143,9 +1245,14 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
     gboolean have_sel = (tl->sel_regions && tl->sel_regions->len > 0) ||
                         tl->sel_active;
     gboolean can_group = tl->sel_regions && tl->sel_regions->len >= 2;
+    gboolean can_paste = tl->clipboard && tl->clipboard->len > 0 &&
+                         tl->menu_track &&
+                         !jackdaw_track_is_instrument(tl->menu_track);
     struct { const char *label; GCallback cb; gboolean sens; } items[] = {
         { "Split at Playhead",   G_CALLBACK(menu_split_cb),         TRUE },
         { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    have_sel },
+        { "Copy",                G_CALLBACK(menu_copy_cb),          have_sel },
+        { "Paste at Playhead",   G_CALLBACK(menu_paste_cb),         can_paste },
         { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          have_sel },
         { "Group Sections",      G_CALLBACK(menu_group_cb),         can_group },
         { "Delete Region",       G_CALLBACK(menu_delete_region_cb), TRUE },
@@ -1708,6 +1815,7 @@ static void jackdaw_timeline_finalize(GObject *obj)
     }
     g_hash_table_destroy(tl->wave_views);
     if (tl->sel_regions) g_ptr_array_unref(tl->sel_regions);
+    if (tl->clipboard) g_ptr_array_unref(tl->clipboard);
     g_free(tl->move_orig);
     if (tl->undo_stacks) g_hash_table_destroy(tl->undo_stacks);
     if (tl->redo_stacks) g_hash_table_destroy(tl->redo_stacks);
@@ -1769,6 +1877,8 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->move_orig     = NULL;
     tl->menu_track    = NULL;
     tl->menu_frame    = 0;
+    tl->clipboard     = g_ptr_array_new_with_free_func(
+                            (GDestroyNotify)clip_region_free);
     tl->hscroll       = NULL;
     tl->undo_stacks   = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                               NULL, undo_queue_free);

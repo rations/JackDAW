@@ -1024,6 +1024,21 @@ static gboolean mw_key_press(GtkWidget *widget, GdkEventKey *event,
             jackdaw_timeline_group_selection(tl);
         return TRUE;
     }
+    case GDK_KEY_c:
+    case GDK_KEY_C:
+    case GDK_KEY_v:
+    case GDK_KEY_V: {
+        if (!(event->state & GDK_CONTROL_MASK)) return FALSE;
+        /* Let text widgets keep their own clipboard behaviour. */
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
+        if (focus && GTK_IS_EDITABLE(focus)) return FALSE;
+        JackDawTimeline *tl = mw_timeline(GTK_WIDGET(win));
+        if (event->keyval == GDK_KEY_c || event->keyval == GDK_KEY_C)
+            jackdaw_timeline_copy_selection(tl);
+        else
+            jackdaw_timeline_paste_at_cursor(tl);
+        return TRUE;
+    }
     default:
         break;
     }

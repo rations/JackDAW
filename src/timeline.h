@@ -143,6 +143,11 @@ struct _JackDawTimeline {
     JackDawTrack     *menu_track;
     off_t             menu_frame;
 
+    /* Region clipboard: owned ClipRegion* copies whose tl_pos is normalized so
+     * the earliest copied region starts at frame 0.  Paste re-anchors the set at
+     * the playhead on the right-clicked track. */
+    GPtrArray        *clipboard;
+
     /* Per-track region-edit undo/redo stacks (GHashTable track→GQueue of
      * GPtrArray* region-list snapshots). */
     GHashTable       *undo_stacks;
@@ -205,6 +210,8 @@ void          jackdaw_timeline_set_cursor (JackDawTimeline *tl, off_t sample);
 /* Region editing (operate on the focused track / current selection) */
 void          jackdaw_timeline_split_at_cursor(JackDawTimeline *tl);
 void          jackdaw_timeline_group_selection(JackDawTimeline *tl);
+void          jackdaw_timeline_copy_selection (JackDawTimeline *tl);
+void          jackdaw_timeline_paste_at_cursor(JackDawTimeline *tl);
 void          jackdaw_timeline_undo           (JackDawTimeline *tl);
 void          jackdaw_timeline_redo           (JackDawTimeline *tl);
 
