@@ -20,6 +20,7 @@ enum {
     SIGNAL_TRACK_REMOVED,
     SIGNAL_PORTS_CHANGED,
     SIGNAL_TIMING_CHANGED,
+    SIGNAL_SELECTION_CHANGED,
     LAST_SIGNAL
 };
 
@@ -34,6 +35,10 @@ static void jackdaw_project_finalize(GObject *obj)
     if (p->tracks) {
         g_ptr_array_unref(p->tracks);
         p->tracks = NULL;
+    }
+    if (p->sel_tracks) {
+        g_ptr_array_unref(p->sel_tracks);
+        p->sel_tracks = NULL;
     }
     g_free(p->project_file);
     g_clear_object(&p->master_track);
@@ -69,11 +74,18 @@ static void jackdaw_project_class_init(JackDawProjectClass *klass)
         G_SIGNAL_RUN_FIRST,
         G_STRUCT_OFFSET(JackDawProjectClass, timing_changed),
         NULL, NULL, NULL, G_TYPE_NONE, 0);
+
+    project_signals[SIGNAL_SELECTION_CHANGED] = g_signal_new(
+        "selection-changed", G_TYPE_FROM_CLASS(klass),
+        G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, selection_changed),
+        NULL, NULL, NULL, G_TYPE_NONE, 0);
 }
 
 static void jackdaw_project_init(JackDawProject *p)
 {
     p->tracks          = g_ptr_array_new_with_free_func(g_object_unref);
+    p->sel_tracks      = g_ptr_array_new();   /* borrowed pointers, no free func */
     p->project_file    = NULL;
     p->master_volume   = 1.0f;
     p->master_rt_chain = NULL;
@@ -124,9 +136,54 @@ void jackdaw_project_remove_track(JackDawProject *p, JackDawTrack *t)
      * g_ptr_array_remove() calls the free_func (g_object_unref) on removal,
      * and the "track-removed" handler may destroy the last external ref. */
     g_object_ref(t);
+    /* Drop it from the multi-selection first so no dangling pointer remains. */
+    if (p->sel_tracks && g_ptr_array_remove(p->sel_tracks, t))
+        g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
     if (g_ptr_array_remove(p->tracks, t))
         g_signal_emit(p, project_signals[SIGNAL_TRACK_REMOVED], 0, t);
     g_object_unref(t);
+}
+
+/* ---- Track multi-selection ---- */
+
+GPtrArray *jackdaw_project_get_selected_tracks(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), NULL);
+    return p->sel_tracks;
+}
+
+gboolean jackdaw_project_is_selected(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), FALSE);
+    for (guint i = 0; i < p->sel_tracks->len; i++)
+        if (g_ptr_array_index(p->sel_tracks, i) == t) return TRUE;
+    return FALSE;
+}
+
+void jackdaw_project_select_single(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    g_ptr_array_set_size(p->sel_tracks, 0);
+    g_ptr_array_add(p->sel_tracks, t);
+    g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
+}
+
+void jackdaw_project_toggle_selected(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (!g_ptr_array_remove(p->sel_tracks, t))
+        g_ptr_array_add(p->sel_tracks, t);
+    g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
+}
+
+void jackdaw_project_clear_selection(JackDawProject *p)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    if (p->sel_tracks->len == 0) return;
+    g_ptr_array_set_size(p->sel_tracks, 0);
+    g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
 }
 
 guint jackdaw_project_track_count(JackDawProject *p)

@@ -106,6 +106,8 @@ SRCS_C := \
     $(SRCDIR)/mixer.c \
     $(SRCDIR)/fxwindow.c \
     $(SRCDIR)/midiwindow.c \
+    $(SRCDIR)/render.c \
+    $(SRCDIR)/render_dialog.c \
     $(SRCDIR)/mainwindow.c
 
 SRCS_CXX := \

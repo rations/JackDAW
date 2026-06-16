@@ -12,6 +12,8 @@
 #include "um.h"
 #include "settings.h"
 #include "fxwindow.h"
+#include "render.h"
+#include "render_dialog.h"
 
 G_DEFINE_TYPE(JackDawMainWindow, jackdaw_main_window, GTK_TYPE_WINDOW)
 
@@ -58,6 +60,10 @@ static const char MW_CSS_SHARED[] =
     "  background-image:none; background-color:#ffe000; color:#101010; }"
     "button.ts-fx.ts-fx-active {"
     "  background-image:none; background-color:#2980b9; color:#ffffff; }"
+    /* Track strip selected for render ("Selected tracks" source). */
+    "box.ts-selected {"
+    "  background-color:#2d4a6b;"
+    "  border:1px solid #5b9bd5; }"
     /* Mixer fader: flat horizontal cap (not the theme's round handle)
      * so its centre is a clear reference that lines up with the dB
      * labels. Trough margins = half the cap height so the cap centre
@@ -233,6 +239,20 @@ static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
     } else {
         mw_save_as_project_cb(item, data);
     }
+}
+
+static void mw_render_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    render_dialog_open(GTK_WINDOW(win), win->project, RENDER_SCOPE_PROJECT);
+}
+
+static void mw_render_region_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    render_dialog_open(GTK_WINDOW(win), win->project, RENDER_SCOPE_REGION);
 }
 
 static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
@@ -1250,6 +1270,11 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "Save Project _As…",
               G_CALLBACK(mw_save_as_project_cb), win,
               GDK_KEY_s, GDK_CONTROL_MASK | GDK_SHIFT_MASK, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
+    menu_item(m, "_Render…",
+              G_CALLBACK(mw_render_cb), win, 0, 0, ag);
+    menu_item(m, "Render Re_gion…",
+              G_CALLBACK(mw_render_region_cb), win, 0, 0, ag);
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "_New Session",
               G_CALLBACK(mw_new_project_cb), win,

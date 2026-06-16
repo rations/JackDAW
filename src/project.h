@@ -25,6 +25,7 @@ struct _JackDawProject {
     GObject parent_instance;
 
     GPtrArray   *tracks;          /* array of JackDawTrack* (strong refs) */
+    GPtrArray   *sel_tracks;      /* multi-selection: borrowed JackDawTrack* */
     gchar       *project_file;    /* NULL if unsaved */
 
     gfloat       master_volume;
@@ -59,6 +60,7 @@ struct _JackDawProjectClass {
     void (*track_removed)(JackDawProject *project, JackDawTrack *track);
     void (*ports_changed)(JackDawProject *project);
     void (*timing_changed)(JackDawProject *project);
+    void (*selection_changed)(JackDawProject *project);
 };
 
 GType          jackdaw_project_get_type(void);
@@ -75,6 +77,16 @@ gint          jackdaw_project_track_index (JackDawProject *p, JackDawTrack *t);
  * slot / JACK ports are unaffected (they follow track->slot, not array order);
  * this only changes display + save order. */
 void          jackdaw_project_move_track  (JackDawProject *p, guint from, guint to);
+
+/* ---- Track multi-selection (for render "selected tracks") ----
+ * A set of tracks the user has marked on the track strips, distinct from the
+ * timeline's keyboard focus. Emits "selection-changed" on every change. The
+ * returned array is borrowed (do not free/modify); pointers are not ref'd. */
+GPtrArray *jackdaw_project_get_selected_tracks(JackDawProject *p);
+void       jackdaw_project_select_single  (JackDawProject *p, JackDawTrack *t);
+void       jackdaw_project_toggle_selected(JackDawProject *p, JackDawTrack *t);
+gboolean   jackdaw_project_is_selected    (JackDawProject *p, JackDawTrack *t);
+void       jackdaw_project_clear_selection(JackDawProject *p);
 
 /* Master volume */
 void   jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);

@@ -107,6 +107,30 @@ off_t jackdaw_engine_get_play_pos(void);
 /* Post-master-fader peak levels (master VU). Resets the stored peak on read. */
 void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
 
+/* --- Render support (offline bounce / realtime tap) ---
+ * Never call from the RT thread; these run on the render worker / main thread.
+ *
+ * Offline suspend: while set, engine_process outputs silence and runs no
+ * plugins, giving an offline render worker exclusive use of every plugin. */
+void jackdaw_engine_render_suspend(gboolean on);
+
+/* Synchronous per-track timeline reader for the offline render loop. Reads a
+ * contiguous frame span, region gain applied, resampled clip→render_sr. */
+typedef struct EngTrackReader EngTrackReader;
+EngTrackReader *engine_track_reader_new (JackDawTrack *t, int render_sr);
+void            engine_track_reader_free(EngTrackReader *r);
+gboolean        engine_track_reader_read(EngTrackReader *r, JackDawTrack *t,
+                                         off_t start, jack_nframes_t n,
+                                         float *outL, float *outR);
+
+/* Realtime master tap: copies the final post-fader master into a ring for a
+ * writer thread. Caller locates to start, calls render_tap_start(end), then
+ * start_playback; polls render_tap_done(); drains via render_tap_read(). */
+void     jackdaw_engine_render_tap_start(off_t end_frame);
+void     jackdaw_engine_render_tap_stop (void);
+gboolean jackdaw_engine_render_tap_done (void);
+size_t   jackdaw_engine_render_tap_read (float *L, float *R, size_t max_frames);
+
 /* --- Live MIDI recording preview (main thread / draw only) ---
  * One in-progress recorded note, in ABSOLUTE timeline frames. Note-ons are
  * paired with note-offs; notes still held are extended to the current playhead. */

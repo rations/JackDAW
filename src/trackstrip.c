@@ -393,6 +393,38 @@ static void on_ports_changed(JackDawProject *project, gpointer data)
     jackdaw_track_strip_refresh_ports(JACKDAW_TRACK_STRIP(data));
 }
 
+/* ---- Track multi-selection (Ctrl+click) --------------------------------- */
+
+/* Reflect the project's selection set on this strip via the "ts-selected" CSS
+ * class (highlight border/background defined in the shared app CSS). */
+static void on_selection_changed(JackDawProject *project, gpointer data)
+{
+    JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
+    GtkStyleContext *ctx = gtk_widget_get_style_context(GTK_WIDGET(strip));
+    if (jackdaw_project_is_selected(project, strip->track))
+        gtk_style_context_add_class(ctx, "ts-selected");
+    else
+        gtk_style_context_remove_class(ctx, "ts-selected");
+}
+
+/* Click on the track name selects the track. Ctrl+click toggles it in/out of
+ * the multi-selection (and is consumed so it never starts text editing); a
+ * plain click selects just this track but still lets the entry take focus for
+ * renaming. Selection is independent of the timeline's keyboard focus. */
+static gboolean on_name_button_press(GtkWidget *w, GdkEventButton *ev,
+                                     gpointer data)
+{
+    (void)w;
+    JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 1) return FALSE;
+    if (ev->state & GDK_CONTROL_MASK) {
+        jackdaw_project_toggle_selected(strip->project, strip->track);
+        return TRUE;   /* consume: don't place a text cursor on Ctrl+click */
+    }
+    jackdaw_project_select_single(strip->project, strip->track);
+    return FALSE;      /* let the entry focus for renaming */
+}
+
 /* Fill a source store with a "None" row plus the given NULL-terminated ports. */
 static void source_store_fill(GtkListStore *store, gchar **ports)
 {
@@ -845,6 +877,12 @@ GtkWidget *jackdaw_track_strip_new(JackDawTrack   *track,
                      G_CALLBACK(on_in_r_changed), strip);
     g_signal_connect(strip->in_combo_midi, "changed",
                      G_CALLBACK(on_in_midi_changed), strip);
+
+    /* Track multi-selection: Ctrl/plain click on the name; reflect the set. */
+    g_signal_connect(strip->name_entry, "button-press-event",
+                     G_CALLBACK(on_name_button_press), strip);
+    g_signal_connect_object(project, "selection-changed",
+                            G_CALLBACK(on_selection_changed), strip, 0);
 
     /* Auto-disconnect when strip is finalized */
     g_signal_connect_object(project, "ports-changed",
