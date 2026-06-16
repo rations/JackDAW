@@ -423,6 +423,33 @@ static void mw_transport_stop_cb(GtkMenuItem *item, gpointer data)
     gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->record_button), FALSE);
 }
 
+/* Transport menu items drive the toolbar toggle buttons so that the play/loop/
+ * record callbacks (which read GtkToggleButton state from their widget) run with
+ * the correct widget and all UI stays in sync. */
+static void mw_menu_play_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkToggleButton *b = GTK_TOGGLE_BUTTON(win->play_button);
+    gtk_toggle_button_set_active(b, !gtk_toggle_button_get_active(b));
+}
+
+static void mw_menu_record_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkToggleButton *b = GTK_TOGGLE_BUTTON(win->record_button);
+    gtk_toggle_button_set_active(b, !gtk_toggle_button_get_active(b));
+}
+
+static void mw_menu_loop_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    GtkToggleButton *b = GTK_TOGGLE_BUTTON(win->loop_button);
+    gtk_toggle_button_set_active(b, !gtk_toggle_button_get_active(b));
+}
+
 static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
 {
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
@@ -1066,6 +1093,21 @@ static gboolean mw_key_press(GtkWidget *widget, GdkEventKey *event,
             jackdaw_timeline_group_selection(tl);
         return TRUE;
     }
+    case GDK_KEY_r:
+    case GDK_KEY_R:
+    case GDK_KEY_l:
+    case GDK_KEY_L: {
+        /* Plain-letter shortcuts must not fire while text is being edited. */
+        if (event->state & (GDK_CONTROL_MASK | GDK_MOD1_MASK)) return FALSE;
+        GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(widget));
+        if (focus && GTK_IS_EDITABLE(focus)) return FALSE;
+        GtkWidget *btn = (event->keyval == GDK_KEY_r || event->keyval == GDK_KEY_R)
+                             ? win->record_button : win->loop_button;
+        gtk_toggle_button_set_active(
+            GTK_TOGGLE_BUTTON(btn),
+            !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(btn)));
+        return TRUE;
+    }
     case GDK_KEY_c:
     case GDK_KEY_C:
     case GDK_KEY_v:
@@ -1241,9 +1283,12 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     /* Transport */
     m = make_submenu_item(menubar, "T_ransport");
     menu_item(m, "_Play / Stop  [Space]",
-              NULL, NULL, 0, 0, ag);
-    menu_item(m, "_Stop",
-              G_CALLBACK(mw_transport_stop_cb), win, 0, 0, ag);
+              G_CALLBACK(mw_menu_play_cb), win, 0, 0, ag);
+    menu_item(m, "_Record  [R]",
+              G_CALLBACK(mw_menu_record_cb), win, 0, 0, ag);
+    menu_item(m, "_Loop  [L]",
+              G_CALLBACK(mw_menu_loop_cb), win, 0, 0, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
     menu_item(m, "Locate to _Start  [Home]",
               G_CALLBACK(mw_locate_start_cb), win, 0, 0, ag);
 
