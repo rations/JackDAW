@@ -93,6 +93,14 @@ void            pluginhost_process_midi(PluginInstance *inst,
                                         const PhMidiEvent *ev, int n_ev,
                                         float *L, float *R, int nframes);
 
+/* Clear the plugin's internal DSP state — reverb/delay buffers and any held
+ * synth voices — without touching parameters. Used after an offline render so
+ * resuming the live engine doesn't flush the render's leftover tail (an audible
+ * pop). NOT RT-safe: call only when the live RT thread is not processing this
+ * instance (e.g. while the engine is render-suspended). No-op if the backend
+ * offers no reset. */
+void            pluginhost_reset(PluginInstance *inst);
+
 /* TRUE if this plugin is an instrument (synth) rather than an audio effect. */
 gboolean        pluginhost_is_instrument(PluginInstance *inst);
 

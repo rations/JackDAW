@@ -476,6 +476,17 @@ static void lv2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
 
 static void lv2_destroy_gui(PluginInstance *pi);   /* fwd (suil section below) */
 
+static void lv2_reset(PluginInstance *pi)
+{
+    Lv2Backend *b = pi->backend;
+    if (!b) return;
+    for (int i = 0; i < b->n_inst; i++) {
+        if (!b->inst[i]) continue;
+        lilv_instance_deactivate(b->inst[i]);
+        lilv_instance_activate(b->inst[i]);
+    }
+}
+
 static void lv2_destroy(PluginInstance *pi)
 {
     Lv2Backend *b = pi->backend;
@@ -767,6 +778,7 @@ static const PhOps lv2_ops = {
     .param_get   = lv2_param_get,
     .param_set   = lv2_param_set,
     .param_range = lv2_param_range,
+    .reset       = lv2_reset,
 };
 
 /* ---- Instantiate ---- */

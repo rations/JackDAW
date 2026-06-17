@@ -159,6 +159,13 @@ static void clap_process_cb(PluginInstance *pi, float *L, float *R, int n)
     memcpy(R, b->outR, (size_t)n * sizeof(float));
 }
 
+static void clap_reset(PluginInstance *pi)
+{
+    ClapBackend *b = (ClapBackend *)pi->backend;
+    if (b && b->plugin && b->plugin->reset)
+        b->plugin->reset(b->plugin);
+}
+
 static void clap_destroy(PluginInstance *pi)
 {
     ClapBackend *b = (ClapBackend *)pi->backend;
@@ -239,7 +246,7 @@ static void clap_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 static const PhOps clap_ops = {
     clap_process_cb, NULL /*process_midi*/, clap_destroy, NULL, NULL,
     clap_param_count, clap_param_name, clap_param_get, clap_param_set,
-    clap_param_range
+    clap_param_range, clap_reset
 };
 
 /* ---- Instantiate ---- */

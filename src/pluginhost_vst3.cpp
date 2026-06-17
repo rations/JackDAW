@@ -305,6 +305,17 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
 
 static void vst3_destroy_gui(PluginInstance *pi);   /* fwd */
 
+static void vst3_reset(PluginInstance *pi)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b) return;
+    /* Inactive→active cycle resets the processor's internal state. */
+    if (b->processor) b->processor->setProcessing(false);
+    if (b->component) b->component->setActive(false);
+    if (b->component) b->component->setActive(true);
+    if (b->processor) b->processor->setProcessing(true);
+}
+
 static void vst3_destroy(PluginInstance *pi)
 {
     Vst3Backend *b = (Vst3Backend *)pi->backend;
@@ -457,7 +468,7 @@ static const PhOps vst3_ops = {
     vst3_process, vst3_process_midi, vst3_destroy,
     vst3_make_gui, vst3_destroy_gui,
     vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
-    vst3_param_range
+    vst3_param_range, vst3_reset
 };
 
 /* ---- Instantiate ---- */

@@ -234,6 +234,17 @@ static void vst2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
     else             vst2_run(b, L, R, L, R, n);
 }
 
+static void vst2_reset(PluginInstance *pi)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (!b || !b->eff) return;
+    /* Toggle processing + power off/on: clears tails and held notes. */
+    b->eff->dispatcher(b->eff, EFF_STOP_PROCESS,  0, 0, NULL, 0.0f);
+    b->eff->dispatcher(b->eff, EFF_MAINS_CHANGED, 0, 0, NULL, 0.0f);
+    b->eff->dispatcher(b->eff, EFF_MAINS_CHANGED, 0, 1, NULL, 0.0f);
+    b->eff->dispatcher(b->eff, EFF_START_PROCESS, 0, 0, NULL, 0.0f);
+}
+
 static void vst2_destroy(PluginInstance *pi)
 {
     Vst2Backend *b = (Vst2Backend *)pi->backend;
@@ -365,7 +376,7 @@ static const PhOps vst2_ops = {
     vst2_process, vst2_process_midi, vst2_destroy,
     vst2_make_gui, vst2_destroy_gui,
     vst2_param_count, vst2_param_name, vst2_param_get, vst2_param_set,
-    vst2_param_range
+    vst2_param_range, vst2_reset
 };
 
 /* ---- Instantiate ---- */

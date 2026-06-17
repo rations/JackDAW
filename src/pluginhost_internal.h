@@ -19,6 +19,9 @@ typedef struct {
     float       (*param_get)  (PluginInstance *, guint);
     void        (*param_set)  (PluginInstance *, guint, float);
     void        (*param_range)(PluginInstance *, guint, float *, float *);
+    /* Optional: clear internal DSP state (reverb/delay buffers, synth voices)
+     * without changing parameters. NULL if the backend offers no reset. */
+    void        (*reset)      (PluginInstance *);
 } PhOps;
 
 struct PluginInstance {

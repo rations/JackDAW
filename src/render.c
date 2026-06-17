@@ -180,6 +180,27 @@ static void render_write_frames(SNDFILE *sf, int channels,
     }
 }
 
+/* Clear the internal DSP state (reverb/delay tails, held synth voices) of every
+ * plugin the offline render drove. Called while the engine is still suspended,
+ * so that when the live graph resumes it doesn't flush the render's leftover
+ * tail as an audible pop / meter jump. */
+static void render_reset_track_chain(JackDawTrack *t)
+{
+    if (!t) return;
+    JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+    if (!chain) return;
+    for (int i = 0; i < chain->n; i++)
+        pluginhost_reset((PluginInstance *)chain->fx[i]);
+}
+
+static void render_reset_all_plugins(JackDawProject *proj)
+{
+    guint n = jackdaw_project_track_count(proj);
+    for (guint i = 0; i < n; i++)
+        render_reset_track_chain(jackdaw_project_get_track(proj, i));
+    render_reset_track_chain(proj->master_track);
+}
+
 /* -----------------------------------------------------------------------
  * Offline render
  * ----------------------------------------------------------------------- */
@@ -239,8 +260,18 @@ static gpointer render_offline_thread(gpointer data)
             readers[i] = engine_track_reader_new(t, engine_sr);
     }
 
-    /* Take over the plugin graph for the duration of the render. */
+    /* Take over the plugin graph for the duration of the render. Wait out any
+     * RT block already in flight (which may still touch plugins this cycle)
+     * before the worker uses them, then clear any DSP state left by prior live
+     * monitoring so the render starts clean. */
     jackdaw_engine_render_suspend(TRUE);
+    {
+        int bs = (int)jackdaw_engine_get_buffer_size();
+        if (bs < 1) bs = 1024;
+        gulong settle_us = (gulong)((double)bs / engine_sr * 1e6 * 4.0) + 2000;
+        g_usleep(settle_us);
+    }
+    render_reset_all_plugins(proj);
 
     float *masterL = g_new(float, block);
     float *masterR = g_new(float, block);
@@ -379,6 +410,9 @@ static gpointer render_offline_thread(gpointer data)
     }
 #endif
 
+    /* Return the shared plugins to a clean state before the live graph resumes,
+     * otherwise their render-leftover tail flushes as a pop on the next block. */
+    render_reset_all_plugins(proj);
     jackdaw_engine_render_suspend(FALSE);
 
     sf_close(sf);

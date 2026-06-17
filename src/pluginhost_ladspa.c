@@ -158,6 +158,17 @@ static void lad_process(PluginInstance *pi, float *L, float *R, int n)
     }
 }
 
+static void lad_reset(PluginInstance *pi)
+{
+    LadBackend *b = pi->backend;
+    if (!b) return;
+    for (int i = 0; i < b->n_inst; i++) {
+        if (!b->h[i]) continue;
+        if (b->desc->deactivate) b->desc->deactivate(b->h[i]);
+        if (b->desc->activate)   b->desc->activate(b->h[i]);
+    }
+}
+
 static void lad_destroy(PluginInstance *pi)
 {
     LadBackend *b = pi->backend;
@@ -192,7 +203,8 @@ static void lad_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 
 static const PhOps lad_ops = {
     lad_process, NULL /*process_midi*/, lad_destroy, NULL, NULL,
-    lad_param_count, lad_param_name, lad_param_get, lad_param_set, lad_param_range
+    lad_param_count, lad_param_name, lad_param_get, lad_param_set, lad_param_range,
+    lad_reset
 };
 
 /* ---- Instantiate ---- */

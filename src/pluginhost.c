@@ -654,6 +654,12 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
     }
 }
 
+void pluginhost_reset(PluginInstance *inst)
+{
+    if (inst && inst->ops && inst->ops->reset)
+        inst->ops->reset(inst);
+}
+
 void pluginhost_set_active(PluginInstance *inst, gboolean on)
 {
     if (inst) g_atomic_int_set(&inst->active, on ? 1 : 0);
