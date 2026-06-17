@@ -961,10 +961,15 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         if (!t) continue;
 
         gint tflags = g_atomic_int_get(&t->state_flags);
-        gboolean skip = (tflags & TRACK_MUTED) ||
-                        (any_soloed && !(tflags & TRACK_SOLOED));
-
-        if (skip) continue;
+        /* A muted track — or a non-soloed track while any track is soloed — is
+         * silenced at the master sum below (gain forced to 0). It is NOT skipped
+         * here: we still drain its playback ringbuffer and run its FX/instrument
+         * every block so its read position stays locked to the playhead. Doing a
+         * `continue` would leave the feeder's audio piling up unread in the
+         * ringbuffer, so on unmute the track would resume from the mute point and
+         * play back out of sync with the rest of the timeline. */
+        gboolean muted = (tflags & TRACK_MUTED) ||
+                         (any_soloed && !(tflags & TRACK_SOLOED));
 
         gboolean instr = jackdaw_track_is_instrument(t);
         size_t want = nframes * sizeof(float);
@@ -1067,7 +1072,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         /* Constant-power pan law:
          *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] -> [0, pi/2]
          *   L gain = vol * cos(angle), R gain = vol * sin(angle) */
-        gfloat vol   = t->volume;
+        gfloat vol   = muted ? 0.0f : t->volume;
         gfloat pan   = t->pan;
         float angle  = (pan + 1.0f) * (float)M_PI_4;
         float gain_L = vol * cosf(angle);
