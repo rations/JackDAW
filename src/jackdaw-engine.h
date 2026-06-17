@@ -114,6 +114,11 @@ void jackdaw_engine_get_master_peaks(gfloat *out_L, gfloat *out_R);
  * plugins, giving an offline render worker exclusive use of every plugin. */
 void jackdaw_engine_render_suspend(gboolean on);
 
+/* Suspend the live graph while plugins are instantiated/freed on the main thread
+ * (project load, app teardown), so the heavy non-RT work cannot xrun the audio
+ * thread. Same underlying effect as render suspend. */
+void jackdaw_engine_set_suspended(gboolean on);
+
 /* Synchronous per-track timeline reader for the offline render loop. Reads a
  * contiguous frame span, region gain applied, resampled clip→render_sr. */
 typedef struct EngTrackReader EngTrackReader;

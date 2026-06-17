@@ -14,6 +14,16 @@
 #  include <samplerate.h>
 #endif
 
+/* SSE flush-to-zero / denormals-are-zero. JACK does not set this on a client's
+ * process thread, so plugins whose filter/reverb/feedback paths produce subnormal
+ * floats stall the CPU 10-100x and blow the RT deadline. We flush them to zero on
+ * every RT thread (see engine_rt_set_denormal_mode). */
+#if defined(__SSE__) || defined(__x86_64__)
+#  include <xmmintrin.h>
+#  include <pmmintrin.h>
+#  define JACKDAW_HAVE_SSE_DENORMAL 1
+#endif
+
 #include "jackdaw-engine.h"
 #include "pluginhost.h"
 #include "settings.h"
@@ -84,8 +94,10 @@ typedef struct {
 
     /* --- Render support ---
      * render_suspend: while set, engine_process outputs silence and runs NO
-     *   plugins, so an offline render worker has exclusive use of every
-     *   PluginInstance (no two threads in the same plugin).
+     *   plugins, so whoever set it has exclusive use of every PluginInstance
+     *   (no two threads in the same plugin). Used by the offline render worker
+     *   AND by project load / app teardown — periods when the main thread is
+     *   instantiating or freeing plugins and the RT graph must not touch them.
      * render_active: a realtime master tap — the final post-fader master block
      *   is copied to render_rb_L/R (lock-free) for a writer thread to drain.
      * render_tap_L/R are pre-allocated scratch sized to buf_size. */
@@ -843,6 +855,24 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
     return nev;
 }
 
+/* Enable flush-to-zero + denormals-are-zero on the calling thread's SSE unit.
+ * Cheap (two MXCSR register writes); safe to call every cycle. */
+static inline void engine_rt_set_denormal_mode(void)
+{
+#ifdef JACKDAW_HAVE_SSE_DENORMAL
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+#endif
+}
+
+/* JACK thread-init callback: runs once per RT thread JACK spawns, before any
+ * process cycle. Covers auxiliary RT worker threads as well as the main one. */
+static void engine_thread_init_cb(void *arg)
+{
+    (void)arg;
+    engine_rt_set_denormal_mode();
+}
+
 static int engine_process(jack_nframes_t nframes, void *arg)
 {
     (void)arg;
@@ -851,6 +881,10 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     gboolean any_soloed = FALSE;
     float *port_buf;
     jack_nframes_t k;
+
+    /* Flush denormals to zero on this RT thread (belt; thread-init cb is the
+     * suspenders). Guards against plugin-generated subnormals stalling the CPU. */
+    engine_rt_set_denormal_mode();
 
     /* Offline render in progress: the render worker owns every PluginInstance,
      * so the live graph must touch none of them. Output silence, freeze the
@@ -1526,6 +1560,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     engine.render_tap_R = g_malloc0(bs * sizeof(float));
 
     /* Register callbacks */
+    jack_set_thread_init_callback(engine.client, engine_thread_init_cb, NULL);
     jack_set_process_callback(engine.client, engine_process, NULL);
     jack_set_buffer_size_callback(engine.client, engine_buffer_size_cb, NULL);
     jack_on_shutdown(engine.client, engine_shutdown_cb, NULL);
@@ -2627,6 +2662,16 @@ int eng_gather_render_midi(JackDawTrack *t, off_t blk_start,
 }
 
 void jackdaw_engine_render_suspend(gboolean on)
+{
+    g_atomic_int_set(&engine.render_suspend, on ? 1 : 0);
+}
+
+/* Suspend the live audio graph while the main thread instantiates or frees
+ * plugins (project load, app teardown). Same effect as render_suspend: the RT
+ * callback outputs silence and runs no plugins, so heavy non-RT work (dlopen,
+ * setupProcessing, buffer allocation, dlclose) can't stall the audio thread
+ * into an xrun. There is nothing to play during a load/quit anyway. */
+void jackdaw_engine_set_suspended(gboolean on)
 {
     g_atomic_int_set(&engine.render_suspend, on ? 1 : 0);
 }

@@ -2,7 +2,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <locale.h>
+#include <errno.h>
 #include <gtk/gtk.h>
+#include <sys/mman.h>   /* mlockall */
+#include <malloc.h>     /* mallopt */
 
 #include "main.h"
 #include "settings.h"
@@ -243,6 +246,27 @@ int main(int argc, char **argv)
      * process during scanning. */
     if (argc >= 4 && !strcmp(argv[1], "--scan-plugin"))
         return pluginhost_scan_helper_main(argc, argv);
+
+    /* Real-time memory hardening (the main process only — never the throwaway
+     * scanner above). The JACK process thread must never take a major page fault
+     * or wait on the allocator returning memory to the kernel, or it misses its
+     * deadline and JACK reports an xrun. This is the standard pro-audio setup
+     * (Ardour/Reaper do the equivalent) and is the main thing JackDAW was missing.
+     *
+     *  - mlockall: keep all current + future pages resident, so RT reads never
+     *    fault on a paged-out page (GUI/plugin-editor activity won't evict audio).
+     *  - mallopt(M_TRIM_THRESHOLD,-1) + (M_MMAP_MAX,0): stop glibc handing freed
+     *    heap back to the kernel via munmap, which causes page-table churn / TLB
+     *    shootdowns that stall even an SCHED_FIFO thread.
+     *
+     * mlockall needs RLIMIT_MEMLOCK headroom (audio group / limits.conf); if the
+     * user lacks it we warn and continue rather than refuse to run. */
+    mallopt(M_TRIM_THRESHOLD, -1);
+    mallopt(M_MMAP_MAX, 0);
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0)
+        g_warning("mlockall() failed (%s) — RT memory not locked; expect xruns. "
+                  "Grant this user RLIMIT_MEMLOCK (e.g. audio group / "
+                  "limits.conf 'memlock unlimited').", g_strerror(errno));
 
     setlocale(LC_ALL, "");
     setlocale(LC_NUMERIC, "POSIX");

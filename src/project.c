@@ -732,6 +732,12 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     /* Directory holding the .jdaw, used to resolve bundle-relative audio paths. */
     gchar *projdir = g_path_get_dirname(path);
 
+    /* Hold the RT graph off the plugins while we tear down the old chain and
+     * instantiate the new one (dlopen / setupProcessing / buffer allocation are
+     * not RT-safe and would otherwise xrun the live audio thread). Resumed at the
+     * single success exit below. */
+    jackdaw_engine_set_suspended(TRUE);
+
     /* Clear the current session (engine slots + project tracks). */
     guint cur = p->tracks->len;
     while (cur-- > 0) {
@@ -854,5 +860,6 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     g_free(projdir);
     jackdaw_project_set_file(p, path);
     jackdaw_project_emit_timing_changed(p);
+    jackdaw_engine_set_suspended(FALSE);   /* graph rebuilt — resume the RT path */
     return FALSE;
 }

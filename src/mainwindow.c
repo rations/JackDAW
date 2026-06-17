@@ -1155,6 +1155,10 @@ static gboolean mw_delete_event(GtkWidget *widget, GdkEvent *event,
                                   gpointer data)
 {
     (void)widget; (void)event; (void)data;
+    /* Returning FALSE lets GTK destroy the window, which frees the project and
+     * every plugin instance — while JACK is still active. Suspend the graph first
+     * so the RT thread stops touching plugins before they are torn down. */
+    jackdaw_engine_set_suspended(TRUE);
     gtk_main_quit();
     return FALSE;
 }
