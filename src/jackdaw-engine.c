@@ -1243,7 +1243,12 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         jack_midi_clear_buffer(mbuf);
     }
 
-    /* MIDI thru: for each armed track, copy midi_in_N → midi_out_N */
+    /* MIDI thru: for each armed track, copy midi_in_N → midi_out_N. Several
+     * tracks may share one midi_in (same hardware source), so thru each input
+     * port at most once per block — otherwise its events would be written to the
+     * matching output multiple times. midi_in_count ≤ 16, so a u32 mask covers
+     * every index. */
+    guint32 thru_done = 0;
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
@@ -1252,6 +1257,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         gint mi = t->midi_in_idx;
         if (mi < 0 || (guint)mi >= engine.midi_in_count  || !engine.midi_in[mi])  continue;
         if (              (guint)mi >= engine.midi_out_count || !engine.midi_out[mi]) continue;
+        if (thru_done & (1u << mi)) continue;
+        thru_done |= (1u << mi);
 
         void *ibuf = jack_port_get_buffer(engine.midi_in[mi],  nframes);
         void *obuf = jack_port_get_buffer(engine.midi_out[mi], nframes);
@@ -1408,7 +1415,12 @@ static gboolean connection_changed_idle(gpointer data)
                     if (strcmp(*c, t->midi_src_port) == 0) { found = TRUE; break; }
                 jack_free(conns);
             }
-            if (!found) g_clear_pointer(&t->midi_src_port, g_free);
+            /* Source vanished (e.g. unplugged or re-patched away): detach the
+             * track from the now-dead input so it stops claiming that port. */
+            if (!found) {
+                g_clear_pointer(&t->midi_src_port, g_free);
+                t->midi_in_idx = -1;
+            }
         }
     }
     jackdaw_project_emit_ports_changed(p);
@@ -1590,6 +1602,25 @@ gboolean jackdaw_engine_init(JackDawProject *project)
                 (void)r; /* EEXIST is fine */
             }
             jack_free(phys_midi_in);
+        }
+    }
+
+    /* Auto-connect physical MIDI capture ports → midi_in_N by matching index, so
+     * capture_1→midi_in_1, capture_2→midi_in_2, ... This makes each midi_in port
+     * a stable mirror of the hardware input of the same number (the way a track's
+     * MIDI source maps in other DAWs). Tracks then just pick which midi_in to
+     * read; they no longer wire their own connection. EEXIST is fine. */
+    {
+        const char **phys_midi_out = jack_get_ports(engine.client, NULL,
+            JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput | JackPortIsPhysical);
+        if (phys_midi_out) {
+            guint pi;
+            for (pi = 0; pi < engine.midi_in_count && phys_midi_out[pi]; pi++) {
+                const char *dst = jack_port_name(engine.midi_in[pi]);
+                int r = jack_connect(engine.client, phys_midi_out[pi], dst);
+                (void)r; /* EEXIST is fine */
+            }
+            jack_free(phys_midi_out);
         }
     }
 
@@ -1805,6 +1836,58 @@ jack_port_t *jackdaw_engine_get_midi_out_port(guint idx)
 
 /* ---- Track management ---- */
 
+/* MIDI input ports are a shared pool claimed only by instrument (MIDI) tracks,
+ * independent of the track's slot index. This keeps audio tracks — which never
+ * use a MIDI input — from consuming MIDI port indices and starving MIDI tracks
+ * that are added later or at a higher slot. Returns the lowest midi_in index
+ * not held by another live track; if every current port is taken it grows the
+ * pool by one (up to the JACK MIDI-in ceiling). Returns -1 only when the pool
+ * is already at its maximum. Main thread only. */
+static gint engine_claim_free_midi_in(JackDawTrack *self)
+{
+    guint idx, s;
+    for (idx = 0; idx < engine.midi_in_count; idx++) {
+        gboolean used = FALSE;
+        for (s = 0; s < JACKDAW_MAX_TRACKS; s++) {
+            JackDawTrack *o = engine.slots[s];
+            if (o && o != self && o->midi_in_idx == (gint)idx) { used = TRUE; break; }
+        }
+        if (!used) return (gint)idx;
+    }
+    /* All current ports are spoken for — grow the pool by one if there's room.
+     * set_midi_in_count registers the new midi_in_N port and returns FALSE on
+     * success (TRUE == failure, per the project boolean convention). */
+    if (engine.midi_in_count < 16u) {
+        guint want = engine.midi_in_count + 1;
+        if (!jackdaw_engine_set_midi_in_count(want))
+            return (gint)(want - 1);
+    }
+    return -1;
+}
+
+/* Return the midi_in index currently wired to external source `src`, or -1 if
+ * none is. Physical captures are auto-connected by number at startup (capture_N
+ * → midi_in_N), so this resolves a chosen source to the matching port even when
+ * the user has re-patched things by hand. Main thread only. */
+static gint engine_midi_in_for_source(const char *src)
+{
+    guint k;
+    if (!src || !engine.client) return -1;
+    for (k = 0; k < engine.midi_in_count; k++) {
+        if (!engine.midi_in[k]) continue;
+        const char **conns =
+            jack_port_get_all_connections(engine.client, engine.midi_in[k]);
+        gint found = -1;
+        if (conns) {
+            for (int c = 0; conns[c]; c++)
+                if (strcmp(conns[c], src) == 0) { found = (gint)k; break; }
+            jack_free(conns);
+        }
+        if (found >= 0) return found;
+    }
+    return -1;
+}
+
 gboolean jackdaw_engine_add_track(JackDawTrack *track)
 {
     guint i;
@@ -1846,10 +1929,19 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
     track->slot   = i;
     engine.slots[i] = track; /* RT callback can see this now */
 
-    /* Auto-assign dedicated input ports: slot i maps to audio_in[i] / midi_in[i].
-     * If the slot index exceeds configured port counts the track has no input. */
-    track->audio_in_idx = ((guint)i < engine.audio_in_count) ? (gint)i : -1;
-    track->midi_in_idx  = ((guint)i < engine.midi_in_count)  ? (gint)i : -1;
+    /* Assign input ports by track kind, not by slot index. An audio track takes
+     * audio_in[slot] (its left/right capture). An instrument track gets no MIDI
+     * input until the user selects a source: midi_in ports mirror the hardware
+     * captures by number (wired at startup), and set_midi_source() resolves the
+     * chosen source to the matching port — so the track can be added at any slot,
+     * any time, and a source picked later maps to the right midi_in. */
+    if (jackdaw_track_is_instrument(track)) {
+        track->audio_in_idx = -1;
+        track->midi_in_idx  = -1;
+    } else {
+        track->audio_in_idx = ((guint)i < engine.audio_in_count) ? (gint)i : -1;
+        track->midi_in_idx  = -1;
+    }
 
     /* If playback is in progress, sync the new track to the current position
      * so it starts in the right place rather than always from frame 0. */
@@ -1885,12 +1977,9 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
             jack_disconnect(engine.client, track->audio_src_port_r,
                             jack_port_name(engine.audio_in_r[(guint)track->audio_in_idx]));
         }
-        if (track->midi_src_port && track->midi_in_idx >= 0 &&
-            (guint)track->midi_in_idx < engine.midi_in_count &&
-            engine.midi_in[(guint)track->midi_in_idx]) {
-            jack_disconnect(engine.client, track->midi_src_port,
-                            jack_port_name(engine.midi_in[(guint)track->midi_in_idx]));
-        }
+        /* MIDI: the capture→midi_in wiring is system-wide (auto-connected at
+         * startup, and possibly shared by other tracks), so removing a track
+         * must NOT tear it down — just detaching the slot is enough. */
     }
     g_clear_pointer(&track->audio_src_port,   g_free);
     g_clear_pointer(&track->audio_src_port_r, g_free);
@@ -2722,21 +2811,34 @@ gboolean jackdaw_engine_set_midi_source(JackDawTrack *t, const gchar *port_name)
     g_return_val_if_fail(JACKDAW_IS_TRACK(t), TRUE);
     if (!engine.active || !engine.client) return TRUE;
 
-    gint mi = t->midi_in_idx;
-    if (mi < 0 || (guint)mi >= engine.midi_in_count ||
-        !engine.midi_in[(guint)mi]) return TRUE;
-
-    const char *dst = jack_port_name(engine.midi_in[(guint)mi]);
-
-    if (t->midi_src_port) {
-        jack_disconnect(engine.client, t->midi_src_port, dst);
+    /* Clearing the source just detaches the track from its input port. The
+     * capture→midi_in connection itself is system-wide (set up at startup and
+     * possibly shared by other tracks), so we never tear it down here. */
+    if (!port_name || !*port_name) {
+        t->midi_in_idx = -1;
         g_clear_pointer(&t->midi_src_port, g_free);
+        return FALSE;
     }
 
-    if (port_name && *port_name) {
-        int r = jack_connect(engine.client, port_name, dst);
+    /* Point the track at whichever midi_in port the chosen source feeds. Physical
+     * captures are auto-connected by number at startup, so e.g. selecting
+     * midi:capture_3 resolves to midi_in_3. Tracks sharing a source share that
+     * port (read-only fan-out — fine for live input and instrument MIDI). */
+    gint mi = engine_midi_in_for_source(port_name);
+
+    /* A source that isn't a physical capture (e.g. a software synth's MIDI out)
+     * has no pre-wired port — claim a free midi_in and connect it on demand. */
+    if (mi < 0) {
+        mi = engine_claim_free_midi_in(t);
+        if (mi < 0 || (guint)mi >= engine.midi_in_count || !engine.midi_in[(guint)mi])
+            return TRUE;
+        int r = jack_connect(engine.client, port_name,
+                             jack_port_name(engine.midi_in[(guint)mi]));
         if (r != 0 && r != EEXIST) return TRUE;
-        t->midi_src_port = g_strdup(port_name);
     }
+
+    t->midi_in_idx = mi;
+    g_free(t->midi_src_port);
+    t->midi_src_port = g_strdup(port_name);
     return FALSE;
 }
