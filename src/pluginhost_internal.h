@@ -45,6 +45,10 @@ struct PluginInstance {
      * generic panel owned by the host. */
     GtkWidget    *gui;
     gboolean      gui_native;
+
+    /* Diagnostics (JACKDAW_DIAG): worst-case µs spent in process() this period,
+     * written on the RT thread, read by the diag reporter. Racy but single-writer. */
+    volatile gint64 diag_max_us;
 };
 
 /* Allocate a blank instance for a backend to populate. */

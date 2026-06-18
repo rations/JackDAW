@@ -5,6 +5,7 @@
 #include "fxwindow.h"
 #include "pluginhost.h"
 #include "settings.h"
+#include "jackdaw-engine.h"
 
 /* ======================================================================
  * Plugin browser — categorised picker, returns a chosen PluginInfo*.
@@ -580,7 +581,9 @@ static void fxrow_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
         gint final = (from < ins) ? ins - 1 : ins;   /* index after move */
         final = CLAMP(final, 0, (gint)n - 1);
         if (final != from) {
+            jackdaw_engine_set_suspended(TRUE);
             jackdaw_track_fx_move(fw->track, (guint)from, (guint)final);
+            jackdaw_engine_set_suspended(FALSE);
             fxwin_rebuild_list(fw);
             fxwin_show_gui(fw, (guint)final);
             GtkListBoxRow *r = gtk_list_box_get_row_at_index(
@@ -627,7 +630,10 @@ static void fxrow_remove_clicked(GtkButton *b, gpointer data)
      * is (deferred-)freed, so nothing lingers pointing at a dead widget. */
     pluginhost_release_gui(jackdaw_track_fx_get(fw->track, rl->index));
     fw->shown = NULL;
+    /* Suspend the RT graph around the chain swap + deferred plugin destroy. */
+    jackdaw_engine_set_suspended(TRUE);
     jackdaw_track_fx_remove(fw->track, rl->index);
+    jackdaw_engine_set_suspended(FALSE);
     fxwin_rebuild_list(fw);
     guint n = jackdaw_track_fx_count(fw->track);
     if (n) fxwin_show_gui(fw, n - 1);
@@ -708,8 +714,13 @@ static void fxwin_add_clicked(GtkButton *b, gpointer data)
     FxWindow *fw = data;
     PluginInfo *pi = fx_browse_for_plugin(GTK_WINDOW(fw->window));
     if (!pi) return;
+    /* Hold the RT graph off the plugins while we dlopen / setupProcessing /
+     * allocate buffers (not RT-safe) and swap in the new chain — otherwise the
+     * live audio thread xruns. Same pattern as project load. */
+    jackdaw_engine_set_suspended(TRUE);
     PluginInstance *inst = pluginhost_instantiate(pi);
     if (!inst) {
+        jackdaw_engine_set_suspended(FALSE);
         GtkWidget *e = gtk_message_dialog_new(GTK_WINDOW(fw->window),
             GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
             "Could not load plugin: %s", pi->name);
@@ -718,6 +729,7 @@ static void fxwin_add_clicked(GtkButton *b, gpointer data)
         return;
     }
     jackdaw_track_fx_add(fw->track, inst);
+    jackdaw_engine_set_suspended(FALSE);
     fxwin_rebuild_list(fw);
     fxwin_show_gui(fw, jackdaw_track_fx_count(fw->track) - 1);
 }

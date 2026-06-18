@@ -33,6 +33,22 @@
 using namespace Steinberg;
 using namespace Steinberg::Vst;
 
+/* Diagnostics (JACKDAW_DIAG): count IHostApplication::createInstance calls a
+ * plug-in makes while the JACK RT thread is inside the process callback. Those
+ * are heap allocations (new HostMessage / HostAttributeList) on the RT thread —
+ * the classic VST3 metering-message path that breaks the no-RT-malloc rule. */
+static volatile guint64 g_vst3_rt_alloc_calls = 0;
+extern "C" guint64 ph_vst3_rt_alloc_count(void) { return g_vst3_rt_alloc_calls; }
+
+class CountingHostApp : public HostApplication {
+public:
+    tresult PLUGIN_API createInstance(TUID cid, TUID _iid, void **obj) override
+    {
+        if (ph_rt_active()) g_vst3_rt_alloc_calls++;   /* RT thread = single writer */
+        return HostApplication::createInstance(cid, _iid, obj);
+    }
+};
+
 struct Vst3Backend;   /* fwd: the component handler holds a back-pointer */
 
 /* Host IComponentHandler — the plug-in's editor calls performEdit() when the
@@ -483,7 +499,7 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
      * PlugProvider passes this context to component+controller initialize(). */
     static Steinberg::Vst::HostApplication *gHostApp = nullptr;
     if (!gHostApp) {
-        gHostApp = new Steinberg::Vst::HostApplication();
+        gHostApp = new CountingHostApp();   /* counts RT-thread message allocs */
         PluginContextFactory::instance().setPluginContext(gHostApp);
     }
 

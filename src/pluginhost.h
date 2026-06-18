@@ -101,6 +101,18 @@ void            pluginhost_process_midi(PluginInstance *inst,
  * offers no reset. */
 void            pluginhost_reset(PluginInstance *inst);
 
+/* --- Diagnostics (JACKDAW_DIAG) --- */
+/* Mark the calling thread as inside/outside the JACK RT process callback, so the
+ * VST3 host context can detect plugins that allocate messages on the RT thread. */
+void            ph_rt_mark(int on);
+int             ph_rt_active(void);
+/* Read-and-reset the worst-case µs spent in this plugin's process() since the
+ * last call. */
+gint64          pluginhost_diag_take_max_us(PluginInstance *inst);
+/* Count of IHostApplication::createInstance calls made on the RT thread by VST3
+ * plugins (message/attribute-list allocations in the audio callback). */
+guint64         ph_vst3_rt_alloc_count(void);
+
 /* TRUE if this plugin is an instrument (synth) rather than an audio effect. */
 gboolean        pluginhost_is_instrument(PluginInstance *inst);
 

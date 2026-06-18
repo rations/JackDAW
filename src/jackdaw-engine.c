@@ -10,19 +10,13 @@
 #include <jack/jack.h>
 #include <jack/midiport.h>
 #include <jack/ringbuffer.h>
+#include <jack/thread.h>     /* jack_client_create_thread (RT-priority workers) */
+#include <semaphore.h>
 #ifdef HAVE_SAMPLERATE
 #  include <samplerate.h>
 #endif
 
-/* SSE flush-to-zero / denormals-are-zero. JACK does not set this on a client's
- * process thread, so plugins whose filter/reverb/feedback paths produce subnormal
- * floats stall the CPU 10-100x and blow the RT deadline. We flush them to zero on
- * every RT thread (see engine_rt_set_denormal_mode). */
-#if defined(__SSE__) || defined(__x86_64__)
-#  include <xmmintrin.h>
-#  include <pmmintrin.h>
-#  define JACKDAW_HAVE_SSE_DENORMAL 1
-#endif
+#include "rt_denormal.h"   /* FTZ/DAZ for the RT thread */
 
 #include "jackdaw-engine.h"
 #include "pluginhost.h"
@@ -37,6 +31,16 @@
  * Use g_atomic_int_* for all accesses. */
 #define ENGINE_PLAYING   (1 << 0)
 #define ENGINE_RECORDING (1 << 1)
+
+/* Diagnostics (JACKDAW_DIAG) — declared up here so engine_process() can write
+ * them; the xrun callback + reporter thread live near jackdaw_engine_init(). */
+static volatile gint   g_diag_xruns      = 0;
+static volatile gint64 g_diag_cb_last_us = 0;
+static volatile gint64 g_diag_cb_max_us  = 0;
+static volatile gint64 g_diag_period_us  = 0;
+static gboolean        g_diag_on         = FALSE;
+static GThread        *g_diag_thread     = NULL;
+static volatile gint   g_diag_quit       = 0;
 
 typedef struct {
     jack_client_t *client;
@@ -62,6 +66,13 @@ typedef struct {
     float *tmp_L;
     float *tmp_R;
     jack_nframes_t buf_size;    /* current buffer size */
+
+    /* Per-slot scratch for PARALLEL track processing: each track's worker writes
+     * its post-fader stereo contribution into slot_L[i]/slot_R[i]; the RT thread
+     * sums them into master after the barrier. Sized to buf_size (init +
+     * buffer_size_cb). Each slot is touched by at most one worker per cycle. */
+    float *slot_L[JACKDAW_MAX_TRACKS];
+    float *slot_R[JACKDAW_MAX_TRACKS];
 
     /* Weak refs to active tracks — slots populated by engine_add_track */
     JackDawTrack *slots[JACKDAW_MAX_TRACKS];
@@ -856,13 +867,11 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
 }
 
 /* Enable flush-to-zero + denormals-are-zero on the calling thread's SSE unit.
- * Cheap (two MXCSR register writes); safe to call every cycle. */
+ * Cheap (two MXCSR register writes); safe to call every cycle. Re-armed before
+ * every plugin in pluginhost_process() too, in case a plugin clears MXCSR. */
 static inline void engine_rt_set_denormal_mode(void)
 {
-#ifdef JACKDAW_HAVE_SSE_DENORMAL
-    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-#endif
+    rt_set_denormal_mode();
 }
 
 /* JACK thread-init callback: runs once per RT thread JACK spawns, before any
@@ -873,6 +882,205 @@ static void engine_thread_init_cb(void *arg)
     engine_rt_set_denormal_mode();
 }
 
+/* -----------------------------------------------------------------------
+ * Parallel track processing
+ *
+ * Track FX chains are independent of each other; only the master sum depends on
+ * all of them. So each cycle the JACK RT thread fans the tracks out across a
+ * pool of RT-priority worker threads (work-stealing), joins on a barrier, then
+ * sums each track's output into the master bus and runs the master chain. This
+ * is what lets two heavy amp-sims on two tracks run on two cores at once instead
+ * of serially on one (the difference between fitting the deadline and not).
+ *
+ * RT-safety: workers only ever touch ONE track's state at a time (its own
+ * ringbuffers, plugins, scratch and peak fields — never shared), so no locks are
+ * needed beyond the per-cycle go/done semaphores. jack_port_get_buffer() is
+ * called only on the JACK thread (the pre-fetch pass below); workers use the
+ * cached pointers. Denormal flush is re-armed per plugin in pluginhost_process.
+ * ----------------------------------------------------------------------- */
+#define RT_MAX_WORKERS 64
+static jack_native_thread_t g_rt_worker[RT_MAX_WORKERS];
+static int   g_rt_nworkers = 0;        /* 0 = serial (RT thread does all tracks) */
+static sem_t g_rt_sem_go;              /* main posts N; each worker waits one */
+static sem_t g_rt_sem_done;            /* each worker posts one; main waits N */
+static volatile gint g_rt_workers_quit = 0;
+
+/* Cycle parameters published to the workers (set before the barrier opens; the
+ * semaphores provide the memory barrier). */
+static volatile jack_nframes_t g_rt_nframes;
+static volatile gint   g_rt_flags;
+static volatile off_t  g_rt_blk_start;
+static volatile gint   g_rt_any_soloed;
+static volatile gint   g_rt_task_next;   /* work-stealing slot index */
+
+/* Port buffers pre-fetched on the JACK thread (only it may call
+ * jack_port_get_buffer); workers read these cached pointers. */
+static float *g_slot_live_L[JACKDAW_MAX_TRACKS];
+static float *g_slot_live_R[JACKDAW_MAX_TRACKS];
+static void  *g_slot_midi_buf[JACKDAW_MAX_TRACKS];
+
+/* Process one track fully (drain/instrument, live monitor, FX chain, fader/pan,
+ * metering, capture) into engine.slot_L[i]/slot_R[i]. Reads cycle params from
+ * the g_rt_* publish slots. Runs on the JACK thread or a worker. */
+static void engine_process_track(int i)
+{
+    JackDawTrack *t = engine.slots[i];
+    if (!t) return;
+
+    jack_nframes_t nframes = g_rt_nframes;
+    gint   flags     = g_rt_flags;
+    off_t  blk_start = g_rt_blk_start;
+    gboolean any_soloed = g_rt_any_soloed != 0;
+    jack_nframes_t k;
+    size_t want = nframes * sizeof(float);
+
+    float *bL = engine.slot_L[i];
+    float *bR = engine.slot_R[i];
+
+    gint tflags = g_atomic_int_get(&t->state_flags);
+    gboolean muted = (tflags & TRACK_MUTED) ||
+                     (any_soloed && !(tflags & TRACK_SOLOED));
+    gboolean instr = jackdaw_track_is_instrument(t);
+
+    if (instr) {
+        memset(bL, 0, want);
+        memset(bR, 0, want);
+    } else {
+        size_t got_L = 0, got_R = 0;
+        if (t->play_buf_L && (flags & ENGINE_PLAYING))
+            got_L = jack_ringbuffer_read(t->play_buf_L, (char *)bL, want);
+        if (t->play_buf_R && (flags & ENGINE_PLAYING))
+            got_R = jack_ringbuffer_read(t->play_buf_R, (char *)bR, want);
+        if (got_L < want) memset((char *)bL + got_L, 0, want - got_L);
+        if (got_R < want) memset((char *)bR + got_R, 0, want - got_R);
+    }
+
+    /* Live input monitor (pre-fetched pointers). */
+    float *live_L = g_slot_live_L[i];
+    float *live_R = g_slot_live_R[i];
+    if (live_L && !live_R) live_R = live_L;   /* mono input → duplicate */
+    if (live_L && (flags & ENGINE_RECORDING)) {
+        memset(bL, 0, want);
+        memset(bR, 0, want);
+    }
+    if (live_L) {
+        gfloat wf_mn = 0.0f, wf_mx = 0.0f;
+        for (k = 0; k < nframes; k++) {
+            float sl = live_L[k], sr = live_R[k];
+            bL[k] += sl;
+            bR[k] += sr;
+            if (sl < wf_mn) wf_mn = sl;
+            if (sl > wf_mx) wf_mx = sl;
+            if (sr < wf_mn) wf_mn = sr;
+            if (sr > wf_mx) wf_mx = sr;
+        }
+        if ((flags & ENGINE_RECORDING) && t->rec_peak_buf) {
+            gint pk = t->rec_peak_count;
+            if (pk < REC_PEAK_MAX_BUCKETS) {
+                t->rec_peak_buf[pk * 2]     = wf_mn;
+                t->rec_peak_buf[pk * 2 + 1] = wf_mx;
+                t->rec_peak_count = pk + 1;
+            }
+        }
+    }
+
+    /* Per-track FX chain (in place on bL/bR). */
+    JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+    if (instr) {
+        PhMidiEvent mev[ENG_MIDI_MAX_EV];
+        int nev = eng_gather_instrument_midi(i, t, blk_start, nframes,
+                                             (flags & ENGINE_PLAYING) != 0,
+                                             (tflags & TRACK_ARMED) != 0,
+                                             mev, ENG_MIDI_MAX_EV);
+        if (chain && chain->n > 0) {
+            pluginhost_process_midi((PluginInstance *)chain->fx[0], mev, nev,
+                                    bL, bR, (int)nframes);
+            for (int fi = 1; fi < chain->n; fi++)
+                pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR,
+                                   (int)nframes);
+        }
+    } else if (chain) {
+        for (int fi = 0; fi < chain->n; fi++)
+            pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR,
+                               (int)nframes);
+    }
+
+    /* Constant-power pan + fader, written in place; meter post-fader. */
+    gfloat vol   = muted ? 0.0f : t->volume;
+    float  angle = (t->pan + 1.0f) * (float)M_PI_4;
+    float  gain_L = vol * cosf(angle);
+    float  gain_R = vol * sinf(angle);
+    gfloat peak_L = 0.0f, peak_R = 0.0f;
+    for (k = 0; k < nframes; k++) {
+        float sL = bL[k] * gain_L;
+        float sR = bR[k] * gain_R;
+        bL[k] = sL;
+        bR[k] = sR;
+        if (sL < 0.0f) sL = -sL;
+        if (sR < 0.0f) sR = -sR;
+        if (sL > peak_L) peak_L = sL;
+        if (sR > peak_R) peak_R = sR;
+    }
+    t->peak_L = (peak_L > t->peak_L) ? peak_L : t->peak_L * 0.92f;
+    t->peak_R = (peak_R > t->peak_R) ? peak_R : t->peak_R * 0.92f;
+
+    /* Capture dry input to rec ringbuffers while recording. */
+    if (live_L && (flags & ENGINE_RECORDING)) {
+        if (t->rec_buf_L)
+            jack_ringbuffer_write(t->rec_buf_L, (const char *)live_L, want);
+        if (t->rec_buf_R)
+            jack_ringbuffer_write(t->rec_buf_R, (const char *)live_R, want);
+    }
+
+    /* Record MIDI with absolute timeline frames (instrument tracks). */
+    if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
+        g_slot_midi_buf[i] && t->midi_rec_buf) {
+        void *mbuf = g_slot_midi_buf[i];
+        uint32_t mc = jack_midi_get_event_count(mbuf);
+        for (uint32_t m = 0; m < mc; m++) {
+            jack_midi_event_t ev;
+            if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1) continue;
+            if (!(ev.buffer[0] & 0x80)) continue;
+            MidiRecEvent r;
+            r.frame   = (gint64)(blk_start + (off_t)ev.time);
+            r.size    = (guint8)(ev.size > 3 ? 3 : ev.size);
+            r.data[0] = ev.buffer[0];
+            r.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
+            r.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
+            if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
+                jack_ringbuffer_write(t->midi_rec_buf, (const char *)&r, sizeof r);
+        }
+    }
+}
+
+/* Work-stealing runner: claim the next slot index and process it until none
+ * remain. Called by both the JACK thread and every worker. */
+static void rt_run_tasks(void)
+{
+    int idx;
+    while ((idx = g_atomic_int_add(&g_rt_task_next, 1)) < JACKDAW_MAX_TRACKS) {
+        if (engine.slots[idx]) engine_process_track(idx);
+    }
+}
+
+static void rt_sem_wait(sem_t *s)
+{
+    while (sem_wait(s) != 0 && errno == EINTR) { /* retry */ }
+}
+
+static void *rt_worker_main(void *arg)
+{
+    (void)arg;
+    rt_set_denormal_mode();
+    for (;;) {
+        rt_sem_wait(&g_rt_sem_go);
+        if (g_atomic_int_get(&g_rt_workers_quit)) break;
+        rt_run_tasks();
+        sem_post(&g_rt_sem_done);
+    }
+    return NULL;
+}
+
 static int engine_process(jack_nframes_t nframes, void *arg)
 {
     (void)arg;
@@ -881,6 +1089,15 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     gboolean any_soloed = FALSE;
     float *port_buf;
     jack_nframes_t k;
+
+    /* Diagnostics: mark this thread as the RT callback (so the VST3 host context
+     * can flag plugins that allocate here) and time the whole cycle. */
+    ph_rt_mark(1);
+    gint64 _diag_t0 = 0;
+    if (g_diag_on) {
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        _diag_t0 = (gint64)_ts.tv_sec * 1000000 + _ts.tv_nsec / 1000;
+    }
 
     /* Flush denormals to zero on this RT thread (belt; thread-init cb is the
      * suspenders). Guards against plugin-generated subnormals stalling the CPU. */
@@ -900,6 +1117,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             jack_midi_clear_buffer(
                 jack_port_get_buffer(engine.midi_out[i], nframes));
         }
+        ph_rt_mark(0);
         return 0;
     }
 
@@ -989,189 +1207,66 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         }
     }
 
-    /* Second pass: process each track */
+    /* Second pass: pre-fetch each armed track's input port buffers on THIS (the
+     * JACK) thread — jack_port_get_buffer must not be called from the workers —
+     * then fan the tracks out across the worker pool and sum the results.
+     *
+     * Pre-fetch: live audio input (for monitoring + dry capture) and the MIDI
+     * input buffer (for MIDI recording). Mirrors the gating that used to live in
+     * the per-track loop. */
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        g_slot_live_L[i]   = NULL;
+        g_slot_live_R[i]   = NULL;
+        g_slot_midi_buf[i] = NULL;
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
-
         gint tflags = g_atomic_int_get(&t->state_flags);
-        /* A muted track — or a non-soloed track while any track is soloed — is
-         * silenced at the master sum below (gain forced to 0). It is NOT skipped
-         * here: we still drain its playback ringbuffer and run its FX/instrument
-         * every block so its read position stays locked to the playhead. Doing a
-         * `continue` would leave the feeder's audio piling up unread in the
-         * ringbuffer, so on unmute the track would resume from the mute point and
-         * play back out of sync with the rest of the timeline. */
-        gboolean muted = (tflags & TRACK_MUTED) ||
-                         (any_soloed && !(tflags & TRACK_SOLOED));
-
         gboolean instr = jackdaw_track_is_instrument(t);
-        size_t want = nframes * sizeof(float);
-
-        if (instr) {
-            /* Instrument track: the signal is generated by the instrument from
-             * MIDI, so start from silence (no playback ringbuffer). */
-            memset(engine.tmp_L, 0, want);
-            memset(engine.tmp_R, 0, want);
-        } else {
-            /* Drain playback ringbuffers */
-            size_t got_L = 0, got_R = 0;
-            if (t->play_buf_L && (flags & ENGINE_PLAYING))
-                got_L = jack_ringbuffer_read(t->play_buf_L,
-                                             (char *)engine.tmp_L, want);
-            if (t->play_buf_R && (flags & ENGINE_PLAYING))
-                got_R = jack_ringbuffer_read(t->play_buf_R,
-                                             (char *)engine.tmp_R, want);
-            /* Zero-pad if ringbuffer ran dry */
-            if (got_L < want)
-                memset((char *)engine.tmp_L + got_L, 0, want - got_L);
-            if (got_R < want)
-                memset((char *)engine.tmp_R + got_R, 0, want - got_R);
-        }
-
-        /* Live input monitoring: when armed, the input is summed into the
-         * track signal (so it is heard through the FX chain), and the dry input
-         * is captured to rec_buf when recording. Stereo: live_L from in_N and
-         * live_R from in_NR. If no right source is connected the track is mono,
-         * so live_R mirrors live_L. */
-        float *live_L = NULL, *live_R = NULL;
         if (!instr && (tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
             (guint)t->audio_in_idx < engine.audio_in_count &&
             engine.audio_in[(guint)t->audio_in_idx]) {
-            live_L = jack_port_get_buffer(
+            g_slot_live_L[i] = jack_port_get_buffer(
                 engine.audio_in[(guint)t->audio_in_idx], nframes);
             if (t->audio_src_port_r && engine.audio_in_r[(guint)t->audio_in_idx])
-                live_R = jack_port_get_buffer(
+                g_slot_live_R[i] = jack_port_get_buffer(
                     engine.audio_in_r[(guint)t->audio_in_idx], nframes);
         }
-        if (live_L && !live_R) live_R = live_L;   /* mono input → duplicate */
-        /* While this armed track is actively recording its input, replace its
-         * existing playback with the live input (input monitoring): mute the old
-         * audio under the punch/record region so only the new part being recorded
-         * is heard. The playback ringbuffer was still drained above so playback
-         * stays in sync once recording disengages (e.g. after punch-out). */
-        if (live_L && (flags & ENGINE_RECORDING)) {
-            memset(engine.tmp_L, 0, want);
-            memset(engine.tmp_R, 0, want);
-        }
-
-        if (live_L) {
-            gfloat wf_mn = 0.0f, wf_mx = 0.0f;
-            for (k = 0; k < nframes; k++) {
-                float sl = live_L[k], sr = live_R[k];
-                engine.tmp_L[k] += sl;   /* pre-FX, pre-fader stereo monitor */
-                engine.tmp_R[k] += sr;
-                if (sl < wf_mn) wf_mn = sl;
-                if (sl > wf_mx) wf_mx = sl;
-                if (sr < wf_mn) wf_mn = sr;
-                if (sr > wf_mx) wf_mx = sr;
-            }
-            /* Store one peak pair per JACK period for the real-time waveform */
-            if ((flags & ENGINE_RECORDING) && t->rec_peak_buf) {
-                gint pk = t->rec_peak_count;
-                if (pk < REC_PEAK_MAX_BUCKETS) {
-                    t->rec_peak_buf[pk * 2]     = wf_mn;
-                    t->rec_peak_buf[pk * 2 + 1] = wf_mx;
-                    t->rec_peak_count = pk + 1;
-                }
-            }
-        }
-
-        /* Run the per-track FX chain in place (pre-fader). The chain is an
-         * immutable snapshot published by the main thread; pluginhost_process
-         * is RT-safe and skips bypassed effects. */
-        JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
-        if (instr) {
-            /* Instrument track: fx[0] is the instrument — feed it this block's
-             * MIDI (sequenced + live + flush) to render audio; fx[1..] are audio
-             * effects applied after it. With no instrument loaded, stays silent. */
-            PhMidiEvent mev[ENG_MIDI_MAX_EV];
-            int nev = eng_gather_instrument_midi((int)i, t, blk_start, nframes,
-                                                 (flags & ENGINE_PLAYING) != 0,
-                                                 (tflags & TRACK_ARMED) != 0,
-                                                 mev, ENG_MIDI_MAX_EV);
-            if (chain && chain->n > 0) {
-                pluginhost_process_midi((PluginInstance *)chain->fx[0], mev, nev,
-                                        engine.tmp_L, engine.tmp_R, (int)nframes);
-                for (int fi = 1; fi < chain->n; fi++)
-                    pluginhost_process((PluginInstance *)chain->fx[fi],
-                                       engine.tmp_L, engine.tmp_R, (int)nframes);
-            }
-        } else if (chain) {
-            for (int fi = 0; fi < chain->n; fi++)
-                pluginhost_process((PluginInstance *)chain->fx[fi],
-                                   engine.tmp_L, engine.tmp_R, (int)nframes);
-        }
-
-        /* Constant-power pan law:
-         *   angle = (pan + 1.0) * M_PI_4  maps [-1,1] -> [0, pi/2]
-         *   L gain = vol * cos(angle), R gain = vol * sin(angle) */
-        gfloat vol   = muted ? 0.0f : t->volume;
-        gfloat pan   = t->pan;
-        float angle  = (pan + 1.0f) * (float)M_PI_4;
-        float gain_L = vol * cosf(angle);
-        float gain_R = vol * sinf(angle);
-
-        gfloat peak_L = 0.0f, peak_R = 0.0f;
-
-        /* Apply fader/pan into the master mix and meter post-FX/post-fader. */
-        for (k = 0; k < nframes; k++) {
-            float sL = engine.tmp_L[k] * gain_L;
-            float sR = engine.tmp_R[k] * gain_R;
-            engine.master_L[k] += sL;
-            engine.master_R[k] += sR;
-            if (sL < 0.0f) sL = -sL;
-            if (sR < 0.0f) sR = -sR;
-            if (sL > peak_L) peak_L = sL;
-            if (sR > peak_R) peak_R = sR;
-        }
-
-        /* Update peaks for VU — ballistic decay-hold applied here so the value
-         * can be read non-destructively by any number of meters (track strip
-         * AND mixer). Racy write/read is acceptable. */
-        t->peak_L = (peak_L > t->peak_L) ? peak_L : t->peak_L * 0.92f;
-        t->peak_R = (peak_R > t->peak_R) ? peak_R : t->peak_R * 0.92f;
-
-        /* Capture live input to rec ringbuffers when recording. Left source to
-         * rec_buf_L, right source to rec_buf_R (mono input duplicates L→R). */
-        if (live_L && (flags & ENGINE_RECORDING)) {
-            if (t->rec_buf_L)
-                jack_ringbuffer_write(t->rec_buf_L,
-                                      (const char *)live_L,
-                                      nframes * sizeof(float));
-            if (t->rec_buf_R)
-                jack_ringbuffer_write(t->rec_buf_R,
-                                      (const char *)live_R,
-                                      nframes * sizeof(float));
-        }
-
-        /* Record MIDI: capture each event with its ABSOLUTE timeline frame so
-         * the main thread can place it into a clip on stop. Instrument tracks
-         * only; the same JACK port also feeds the live monitor above. */
         if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
             t->midi_in_idx >= 0 &&
             (guint)t->midi_in_idx < engine.midi_in_count &&
-            engine.midi_in[t->midi_in_idx] && t->midi_rec_buf) {
-            void *mbuf = jack_port_get_buffer(
+            engine.midi_in[t->midi_in_idx] && t->midi_rec_buf)
+            g_slot_midi_buf[i] = jack_port_get_buffer(
                 engine.midi_in[t->midi_in_idx], nframes);
-            uint32_t mc = jack_midi_get_event_count(mbuf);
-            for (uint32_t m = 0; m < mc; m++) {
-                jack_midi_event_t ev;
-                if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1)
-                    continue;
-                if (!(ev.buffer[0] & 0x80)) continue;  /* status byte only */
-                MidiRecEvent r;
-                r.frame   = (gint64)(blk_start + (off_t)ev.time);
-                r.size    = (guint8)(ev.size > 3 ? 3 : ev.size);
-                r.data[0] = ev.buffer[0];
-                r.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
-                r.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
-                if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
-                    jack_ringbuffer_write(t->midi_rec_buf,
-                                          (const char *)&r, sizeof r);
-            }
+    }
+
+    /* Publish cycle params and dispatch. The JACK thread participates as a
+     * worker (work-stealing), so a single core still does all the work when no
+     * worker threads are configured. */
+    g_rt_nframes    = nframes;
+    g_rt_flags      = flags;
+    g_rt_blk_start  = blk_start;
+    g_rt_any_soloed = any_soloed ? 1 : 0;
+    g_atomic_int_set(&g_rt_task_next, 0);
+    if (g_rt_nworkers > 0) {
+        for (int w = 0; w < g_rt_nworkers; w++) sem_post(&g_rt_sem_go);
+        rt_run_tasks();
+        for (int w = 0; w < g_rt_nworkers; w++) rt_sem_wait(&g_rt_sem_done);
+    } else {
+        rt_run_tasks();
+    }
+
+    /* Sum each processed track's post-fader contribution into the master. */
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+        JackDawTrack *t = engine.slots[i];
+        if (!t) continue;
+        const float *sl = engine.slot_L[i];
+        const float *sr = engine.slot_R[i];
+        for (k = 0; k < nframes; k++) {
+            engine.master_L[k] += sl[k];
+            engine.master_R[k] += sr[k];
         }
     }
+
 
     /* Metronome click — mixed into the master before the master fader. */
     if ((flags & ENGINE_PLAYING) && engine.project &&
@@ -1305,6 +1400,14 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         }
     }
 
+    if (_diag_t0) {
+        struct timespec _ts; clock_gettime(CLOCK_MONOTONIC, &_ts);
+        gint64 _t1 = (gint64)_ts.tv_sec * 1000000 + _ts.tv_nsec / 1000;
+        gint64 _d = _t1 - _diag_t0;
+        g_diag_cb_last_us = _d;
+        if (_d > g_diag_cb_max_us) g_diag_cb_max_us = _d;
+    }
+    ph_rt_mark(0);
     return 0;
 }
 
@@ -1331,6 +1434,12 @@ static int engine_buffer_size_cb(jack_nframes_t nframes, void *arg)
     engine.tmp_R       = g_malloc0(nframes * sizeof(float));
     engine.render_tap_L = g_malloc0(nframes * sizeof(float));
     engine.render_tap_R = g_malloc0(nframes * sizeof(float));
+    for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
+        g_free(engine.slot_L[s]);
+        g_free(engine.slot_R[s]);
+        engine.slot_L[s] = g_malloc0(nframes * sizeof(float));
+        engine.slot_R[s] = g_malloc0(nframes * sizeof(float));
+    }
     engine.buf_size = nframes;
 
     /* Reallocate per-track ringbuffers sized to 2 seconds at current rate */
@@ -1480,6 +1589,62 @@ static void engine_port_connect_cb(jack_port_id_t a, jack_port_id_t b,
 }
 
 /* -----------------------------------------------------------------------
+ * Diagnostics (opt-in via JACKDAW_DIAG=1). RT-safe: the process callback only
+ * writes plain volatiles / atomics; a separate thread prints a summary once a
+ * second so we can see WHERE the RT cycle time goes (per-plugin process() µs),
+ * how it compares to the JACK period, and whether VST3 plugins allocate on the
+ * RT thread. Zero cost when JACKDAW_DIAG is unset (timing is gated per-cycle).
+ * State is declared near the top so engine_process() can write it.
+ * ----------------------------------------------------------------------- */
+static int engine_xrun_cb(void *arg)
+{
+    (void)arg;
+    g_atomic_int_inc(&g_diag_xruns);   /* RT-safe */
+    return 0;
+}
+
+static gpointer diag_thread_func(gpointer arg)
+{
+    (void)arg;
+    int last_xruns = 0;
+    guint64 last_alloc = 0;
+    while (!g_atomic_int_get(&g_diag_quit)) {
+        g_usleep(1000000);   /* 1 s */
+        int x = g_atomic_int_get(&g_diag_xruns);
+        int dx = x - last_xruns; last_xruns = x;
+        guint64 a = ph_vst3_rt_alloc_count();
+        guint64 da = a - last_alloc; last_alloc = a;
+        gint64 cb_max = g_diag_cb_max_us; g_diag_cb_max_us = 0;
+        gint64 period = g_diag_period_us;
+
+        GString *s = g_string_new(NULL);
+        g_string_printf(s,
+            "[diag] xruns +%d (total %d)  cb_last=%ldus cb_max=%ldus period=%ldus  "
+            "vst3_rt_allocs +%lu",
+            dx, x, (long)g_diag_cb_last_us, (long)cb_max, (long)period,
+            (unsigned long)da);
+
+        /* Per-plugin worst-case process() time this second. */
+        for (int i = 0; i < JACKDAW_MAX_TRACKS; i++) {
+            JackDawTrack *t = engine.slots[i];
+            if (!t) continue;
+            JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+            if (!chain) continue;
+            for (int fi = 0; fi < chain->n; fi++) {
+                PluginInstance *pi = (PluginInstance *)chain->fx[fi];
+                gint64 us = pluginhost_diag_take_max_us(pi);
+                if (us > 0)
+                    g_string_append_printf(s, "\n        track%d fx%d \"%s\": %ldus",
+                                           i, fi, pluginhost_name(pi), (long)us);
+            }
+        }
+        g_message("%s", s->str);
+        g_string_free(s, TRUE);
+    }
+    return NULL;
+}
+
+/* -----------------------------------------------------------------------
  * Public API
  * ----------------------------------------------------------------------- */
 
@@ -1559,10 +1724,18 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     engine.render_tap_L = g_malloc0(bs * sizeof(float));
     engine.render_tap_R = g_malloc0(bs * sizeof(float));
 
+    /* Per-slot scratch for parallel track processing (all slots, occupied or
+     * not, so a worker can always write its slot). */
+    for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
+        engine.slot_L[s] = g_malloc0(bs * sizeof(float));
+        engine.slot_R[s] = g_malloc0(bs * sizeof(float));
+    }
+
     /* Register callbacks */
     jack_set_thread_init_callback(engine.client, engine_thread_init_cb, NULL);
     jack_set_process_callback(engine.client, engine_process, NULL);
     jack_set_buffer_size_callback(engine.client, engine_buffer_size_cb, NULL);
+    jack_set_xrun_callback(engine.client, engine_xrun_cb, NULL);
     jack_on_shutdown(engine.client, engine_shutdown_cb, NULL);
     jack_set_port_registration_callback(engine.client, engine_port_reg_cb, project);
     jack_set_port_connect_callback(engine.client, engine_port_connect_cb, project);
@@ -1665,6 +1838,50 @@ gboolean jackdaw_engine_init(JackDawProject *project)
 
     engine.active = TRUE;
     (void)rb_bytes; /* suppress unused-variable warning */
+
+    /* Spawn the RT-priority worker pool for parallel track processing. Count
+     * defaults to (CPU cores − 1) so the JACK thread itself is the Nth worker;
+     * override with JACKDAW_RT_THREADS (0 = serial, for A/B comparison). Workers
+     * are created via jack_client_create_thread so they inherit JACK's real-time
+     * scheduling — a plain pthread would be preempted and make xruns worse. */
+    {
+        int want = (int)g_get_num_processors() - 1;
+        const char *env = g_getenv("JACKDAW_RT_THREADS");
+        if (env) want = atoi(env);
+        if (want < 0) want = 0;
+        if (want > RT_MAX_WORKERS) want = RT_MAX_WORKERS;
+
+        if (want > 0) {
+            int prio = jack_client_real_time_priority(engine.client);
+            int rt   = (prio > 0) ? 1 : 0;
+            sem_init(&g_rt_sem_go, 0, 0);
+            sem_init(&g_rt_sem_done, 0, 0);
+            g_atomic_int_set(&g_rt_workers_quit, 0);
+            int spawned = 0;
+            for (int w = 0; w < want; w++) {
+                if (jack_client_create_thread(engine.client, &g_rt_worker[w],
+                        prio, rt, rt_worker_main, NULL) != 0)
+                    break;
+                spawned++;
+            }
+            g_rt_nworkers = spawned;
+            if (spawned == 0) { sem_destroy(&g_rt_sem_go); sem_destroy(&g_rt_sem_done); }
+        }
+        g_message("jackdaw: %d RT worker thread(s) for parallel track processing "
+                  "(%d cores)", g_rt_nworkers, (int)g_get_num_processors());
+    }
+
+    /* Diagnostics: only when JACKDAW_DIAG is set. */
+    g_diag_on = (g_getenv("JACKDAW_DIAG") != NULL);
+    if (g_diag_on) {
+        jack_nframes_t sr = jack_get_sample_rate(engine.client);
+        g_diag_period_us = sr ? (gint64)engine.buf_size * 1000000 / sr : 0;
+        g_atomic_int_set(&g_diag_quit, 0);
+        g_diag_thread = g_thread_new("jackdaw-diag", diag_thread_func, NULL);
+        g_message("[diag] enabled: buf=%u period=%ldus — watching xruns / "
+                  "per-plugin process() time / VST3 RT allocations",
+                  engine.buf_size, (long)g_diag_period_us);
+    }
     return FALSE;   /* success */
 
 fail:
@@ -1684,6 +1901,19 @@ void jackdaw_engine_quit(void)
     /* Stop background threads before deactivating JACK */
     feeder_stop();
     recorder_stop();
+    if (g_rt_nworkers > 0) {
+        g_atomic_int_set(&g_rt_workers_quit, 1);
+        for (int w = 0; w < g_rt_nworkers; w++) sem_post(&g_rt_sem_go);
+        for (int w = 0; w < g_rt_nworkers; w++) pthread_join(g_rt_worker[w], NULL);
+        sem_destroy(&g_rt_sem_go);
+        sem_destroy(&g_rt_sem_done);
+        g_rt_nworkers = 0;
+    }
+    if (g_diag_thread) {
+        g_atomic_int_set(&g_diag_quit, 1);
+        g_thread_join(g_diag_thread);
+        g_diag_thread = NULL;
+    }
 
     jack_deactivate(engine.client);
     jack_client_close(engine.client);
@@ -1696,6 +1926,10 @@ void jackdaw_engine_quit(void)
     g_free(engine.tmp_R);    engine.tmp_R    = NULL;
     g_free(engine.render_tap_L); engine.render_tap_L = NULL;
     g_free(engine.render_tap_R); engine.render_tap_R = NULL;
+    for (guint s = 0; s < JACKDAW_MAX_TRACKS; s++) {
+        g_free(engine.slot_L[s]); engine.slot_L[s] = NULL;
+        g_free(engine.slot_R[s]); engine.slot_R[s] = NULL;
+    }
     if (engine.render_rb_L) { jack_ringbuffer_free(engine.render_rb_L); engine.render_rb_L = NULL; }
     if (engine.render_rb_R) { jack_ringbuffer_free(engine.render_rb_R); engine.render_rb_R = NULL; }
     g_free(engine.click_buf); engine.click_buf = NULL; engine.click_len = 0;

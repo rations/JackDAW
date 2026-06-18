@@ -4,11 +4,13 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "pluginhost.h"
 #include "pluginhost_internal.h"
 #include "lv2ui_bridge.h"
 #include "settings.h"
+#include "rt_denormal.h"
 
 #ifdef GDK_WINDOWING_X11
 #endif
@@ -578,16 +580,48 @@ const char *pluginhost_key(PluginInstance *inst)
 const char *pluginhost_category(PluginInstance *inst)
 { return inst ? inst->category : NULL; }
 
+/* --- Diagnostics (JACKDAW_DIAG) --- */
+static __thread int ph_rt_in_callback = 0;
+void ph_rt_mark(int on) { ph_rt_in_callback = on; }
+int  ph_rt_active(void) { return ph_rt_in_callback; }
+
+static gboolean ph_diag_enabled(void)
+{
+    static int e = -1;
+    if (e < 0) e = (g_getenv("JACKDAW_DIAG") != NULL) ? 1 : 0;
+    return e;
+}
+
+static inline gint64 ph_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (gint64)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+gint64 pluginhost_diag_take_max_us(PluginInstance *inst)
+{
+    if (!inst) return 0;
+    gint64 v = inst->diag_max_us;
+    inst->diag_max_us = 0;
+    return v;
+}
+
 void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev,
                              int n_ev, float *L, float *R, int nframes)
 {
     if (!inst || !inst->ops) return;
     if (!g_atomic_int_get(&inst->active)) return;   /* bypassed: leave L/R as-is */
 
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
+     * which would let denormals stall this plugin's process(). */
+    rt_set_denormal_mode();
+    gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     if (inst->ops->process_midi)
         inst->ops->process_midi(inst, ev, n_ev, L, R, nframes);
     else if (inst->ops->process)
         inst->ops->process(inst, L, R, nframes);    /* no MIDI path: audio only */
+    if (_t0) { gint64 d = ph_now_us() - _t0; if (d > inst->diag_max_us) inst->diag_max_us = d; }
 
     /* Same speaker-safety net as pluginhost_process. */
     for (int i = 0; i < nframes; i++) {
@@ -633,7 +667,12 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
         memcpy(inst->dry_R, R, (size_t)nframes * sizeof(float));
     }
 
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
+     * which would let denormals stall this plugin's process(). */
+    rt_set_denormal_mode();
+    gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     inst->ops->process(inst, L, R, nframes);
+    if (_t0) { gint64 d = ph_now_us() - _t0; if (d > inst->diag_max_us) inst->diag_max_us = d; }
 
     /* Safety net: a misbehaving plugin must never send NaN/inf or a runaway
      * level to the speakers. Replace non-finite samples and clamp magnitude. */

@@ -1,4 +1,4 @@
-src/jackdaw-engine.o: src/jackdaw-engine.c src/config.h \
+src/jackdaw-engine.o: src/jackdaw-engine.c src/config.h src/rt_denormal.h \
  src/jackdaw-engine.h src/project.h /usr/include/glib-2.0/glib-object.h \
  /usr/include/glib-2.0/gobject/gbinding.h /usr/include/glib-2.0/glib.h \
  /usr/include/glib-2.0/glib/galloca.h /usr/include/glib-2.0/glib/gtypes.h \
@@ -622,6 +622,7 @@ src/jackdaw-engine.o: src/jackdaw-engine.c src/config.h \
  /usr/include/gtk-3.0/gtk/deprecated/gtkvseparator.h \
  /usr/include/gtk-3.0/gtk/gtk-autocleanups.h src/settings.h src/um.h
 src/config.h:
+src/rt_denormal.h:
 src/jackdaw-engine.h:
 src/project.h:
 /usr/include/glib-2.0/glib-object.h:
