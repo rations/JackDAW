@@ -73,6 +73,15 @@ MidiRegion *midi_region_new(MidiClip *clip, guint32 clip_in,
     return r;
 }
 
+MidiRegion *midi_region_copy(const MidiRegion *r)
+{
+    if (!r) return NULL;
+    MidiRegion *c = g_new0(MidiRegion, 1);
+    *c = *r;
+    c->clip = midi_clip_ref(r->clip);
+    return c;
+}
+
 void midi_region_free(MidiRegion *r)
 {
     if (!r) return;
@@ -80,9 +89,86 @@ void midi_region_free(MidiRegion *r)
     g_free(r);
 }
 
+off_t midi_region_end(const MidiRegion *r, double frames_per_tick)
+{
+    if (!r) return 0;
+    return r->tl_pos + (off_t)((double)r->length * frames_per_tick + 0.5);
+}
+
 GPtrArray *midi_region_list_new(void)
 {
     return g_ptr_array_new_with_free_func((GDestroyNotify)midi_region_free);
+}
+
+static gint midi_region_cmp(gconstpointer a, gconstpointer b)
+{
+    const MidiRegion *ra = *(const MidiRegion * const *)a;
+    const MidiRegion *rb = *(const MidiRegion * const *)b;
+    if (ra->tl_pos < rb->tl_pos) return -1;
+    if (ra->tl_pos > rb->tl_pos) return  1;
+    return 0;
+}
+
+void midi_region_list_sort(GPtrArray *list)
+{
+    if (list) g_ptr_array_sort(list, midi_region_cmp);
+}
+
+GPtrArray *midi_region_list_copy(GPtrArray *list)
+{
+    GPtrArray *out = midi_region_list_new();
+    if (list)
+        for (guint i = 0; i < list->len; i++)
+            g_ptr_array_add(out, midi_region_copy(g_ptr_array_index(list, i)));
+    return out;
+}
+
+MidiRegion *midi_region_list_at(GPtrArray *list, off_t frame,
+                                double frames_per_tick)
+{
+    if (!list) return NULL;
+    for (guint i = 0; i < list->len; i++) {
+        MidiRegion *r = g_ptr_array_index(list, i);
+        if (frame >= r->tl_pos && frame < midi_region_end(r, frames_per_tick))
+            return r;
+    }
+    return NULL;
+}
+
+off_t midi_region_list_total_frames(GPtrArray *list, double frames_per_tick)
+{
+    off_t max = 0;
+    if (!list) return 0;
+    for (guint i = 0; i < list->len; i++) {
+        off_t e = midi_region_end(g_ptr_array_index(list, i), frames_per_tick);
+        if (e > max) max = e;
+    }
+    return max;
+}
+
+void midi_region_list_split_at(GPtrArray *list, off_t frame,
+                               double frames_per_tick)
+{
+    if (!list || frames_per_tick <= 0.0) return;
+    for (guint i = 0; i < list->len; i++) {
+        MidiRegion *r = g_ptr_array_index(list, i);
+        if (frame > r->tl_pos && frame < midi_region_end(r, frames_per_tick)) {
+            /* Tick offset of the split within the region (snap to tick grid). */
+            guint32 d = (guint32)((double)(frame - r->tl_pos) / frames_per_tick + 0.5);
+            if (d == 0 || d >= r->length) return;       /* lands on an edge */
+            MidiRegion *right = midi_region_copy(r);
+            right->clip_in = r->clip_in + d;
+            right->length  = r->length  - d;
+            right->tl_pos  = r->tl_pos +
+                             (off_t)((double)d * frames_per_tick + 0.5);
+            right->auto_grow = FALSE;
+            r->length      = d;
+            r->auto_grow   = FALSE;       /* both halves now deliberately sized */
+            g_ptr_array_add(list, right);
+            midi_region_list_sort(list);
+            return;
+        }
+    }
 }
 
 /* ---- Event snapshot ---- */
@@ -124,6 +210,53 @@ MidiEventSnapshot *midi_event_snapshot_new(MidiClip *clip,
                               (guint8)(0x80 | ch), nt->pitch, 0 };
         g_array_append_val(out, on);
         g_array_append_val(out, off);
+    }
+
+    s->n  = out->len;
+    s->ev = (MidiSnapEvent *)g_array_free(out, FALSE);
+    if (s->n > 1)
+        qsort(s->ev, s->n, sizeof(MidiSnapEvent), snap_ev_cmp);
+    return s;
+}
+
+MidiEventSnapshot *midi_event_snapshot_new_regions(GPtrArray *regions,
+                                                   double frames_per_beat)
+{
+    MidiEventSnapshot *s = g_new0(MidiEventSnapshot, 1);
+    if (!regions || regions->len == 0 || frames_per_beat <= 0.0) {
+        s->n = 0; s->ev = NULL;
+        return s;
+    }
+
+    GArray *out = g_array_new(FALSE, FALSE, sizeof(MidiSnapEvent));
+
+    for (guint ri = 0; ri < regions->len; ri++) {
+        MidiRegion *reg = g_ptr_array_index(regions, ri);
+        MidiClip   *clip = reg->clip;
+        if (!clip || !clip->notes) continue;
+        guint32 win0 = reg->clip_in;             /* window start tick */
+        guint32 win1 = reg->clip_in + reg->length;/* window end tick (exclusive) */
+
+        for (guint ni = 0; ni < clip->notes->len; ni++) {
+            MidiNote *nt = &g_array_index(clip->notes, MidiNote, ni);
+            if (nt->velocity == 0) continue;
+            if (nt->start < win0 || nt->start >= win1) continue;  /* outside window */
+
+            /* Clamp the note's tail to the region window so a split cuts it. */
+            guint32 note_end = nt->start + nt->length;
+            if (note_end > win1) note_end = win1;
+
+            guint8 ch = nt->channel & 0x0F;
+            /* tl_pos is the frame at which tick `clip_in` plays. */
+            off_t on_f  = reg->tl_pos +
+                          ticks_to_frames(nt->start  - win0, frames_per_beat);
+            off_t off_f = reg->tl_pos +
+                          ticks_to_frames(note_end   - win0, frames_per_beat);
+            MidiSnapEvent on  = { on_f,  (guint8)(0x90 | ch), nt->pitch, nt->velocity };
+            MidiSnapEvent off = { off_f, (guint8)(0x80 | ch), nt->pitch, 0 };
+            g_array_append_val(out, on);
+            g_array_append_val(out, off);
+        }
     }
 
     s->n  = out->len;

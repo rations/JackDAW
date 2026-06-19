@@ -38,6 +38,7 @@ static void jackdaw_track_finalize(GObject *obj)
             midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
         g_ptr_array_free(t->retire_midi, TRUE);
     }
+    if (t->midi_regions) g_ptr_array_unref(t->midi_regions);
     if (t->midi_clip) midi_clip_free(t->midi_clip);
 
     /* Tear down FX: drop the live chain, then free every instance/chain. */
@@ -93,6 +94,7 @@ static void jackdaw_track_init(JackDawTrack *t)
     t->slot          = G_MAXUINT;
     t->kind          = JACKDAW_TRACK_AUDIO;
     t->midi_clip     = midi_clip_new(JACKDAW_PPQ * 4 * 1000);
+    t->midi_regions  = midi_region_list_new();
     t->rt_midi       = NULL;
     t->retire_midi   = g_ptr_array_new();
     t->regions       = clip_region_list_new();
@@ -222,10 +224,27 @@ JackDawTrackKind jackdaw_track_get_kind(JackDawTrack *t)
     return t->kind;
 }
 
+static guint32 midi_content_end_ticks(MidiClip *c);
+
+/* Seed the default full-clip timeline region if the track has none, so the whole
+ * clip is grabbable/splittable. Not called from commit — a track legitimately
+ * emptied by a cross-track move must stay empty rather than resurrect a region. */
+void jackdaw_track_ensure_midi_region(JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (t->midi_regions->len > 0) return;
+    MidiRegion *r = midi_region_new(t->midi_clip, 0,
+                                    midi_content_end_ticks(t->midi_clip), 0);
+    r->auto_grow = TRUE;                 /* the full-clip default lane */
+    g_ptr_array_add(t->midi_regions, r);
+}
+
 void jackdaw_track_set_kind(JackDawTrack *t, JackDawTrackKind kind)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(t));
     t->kind = kind;
+    if (kind == JACKDAW_TRACK_INSTRUMENT)
+        jackdaw_track_ensure_midi_region(t);
     g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
 }
 
@@ -241,6 +260,44 @@ MidiClip *jackdaw_track_get_midi_clip(JackDawTrack *t)
     return t->midi_clip;
 }
 
+GPtrArray *jackdaw_track_get_midi_regions(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), NULL);
+    return t->midi_regions;
+}
+
+/* Tick position one past the last note (and at least the clip's nominal length),
+ * i.e. how far a single full-clip region must extend to cover all content. */
+static guint32 midi_content_end_ticks(MidiClip *c)
+{
+    guint32 end = c ? c->length : 0;
+    guint   n   = midi_clip_note_count(c);
+    for (guint i = 0; i < n; i++) {
+        MidiNote *nt = midi_clip_note(c, i);
+        guint32 e = nt->start + nt->length;
+        if (e > end) end = e;
+    }
+    return end;
+}
+
+/* Keep midi_regions consistent before publishing. A region carries its OWN clip
+ * ref (like an audio ClipRegion), so a region dragged in from another track keeps
+ * playing that track's notes — we do NOT force-repoint to t->midi_clip here.
+ * We only grow a lone untouched default region (one region at 0/0 windowing into
+ * this track's own clip) to cover newly added notes, so plain editing/recording
+ * keeps everything audible. An empty list is left empty (every section was moved
+ * off this track). */
+static void track_normalize_midi_regions(JackDawTrack *t)
+{
+    GPtrArray *regs = t->midi_regions;
+    guint32 content = midi_content_end_ticks(t->midi_clip);
+    for (guint i = 0; i < regs->len; i++) {
+        MidiRegion *r = g_ptr_array_index(regs, i);
+        if (r->auto_grow && r->clip == t->midi_clip && r->length < content)
+            r->length = content;       /* default lane keeps covering all notes */
+    }
+}
+
 /* Publish a fresh MIDI event snapshot for the RT thread. Mirrors
  * track_publish_chain: reclaim the PREVIOUS edit's retired snapshot (the RT
  * thread has moved past it), build the new one, atomic-swap, retire the old. */
@@ -252,8 +309,9 @@ void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat)
         midi_event_snapshot_free(g_ptr_array_index(t->retire_midi, i));
     g_ptr_array_set_size(t->retire_midi, 0);
 
-    MidiEventSnapshot *ns = midi_event_snapshot_new(t->midi_clip,
-                                                    frames_per_beat);
+    track_normalize_midi_regions(t);
+    MidiEventSnapshot *ns = midi_event_snapshot_new_regions(t->midi_regions,
+                                                            frames_per_beat);
     MidiEventSnapshot *old = t->rt_midi;
     g_atomic_pointer_set(&t->rt_midi, ns);
     if (old) g_ptr_array_add(t->retire_midi, old);
@@ -268,6 +326,16 @@ void jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip,
     if (clip == t->midi_clip) { midi_clip_free(clip); return; }
     MidiClip *old = t->midi_clip;
     t->midi_clip = clip;            /* take ownership */
+    /* Repoint this track's own regions (those windowing into the replaced clip)
+     * onto the new clip so editor undo/redo restores them in place. Regions that
+     * reference a different clip (dragged in from another track) are untouched. */
+    for (guint i = 0; i < t->midi_regions->len; i++) {
+        MidiRegion *r = g_ptr_array_index(t->midi_regions, i);
+        if (r->clip == old) {
+            r->clip = midi_clip_ref(clip);
+            midi_clip_free(old);
+        }
+    }
     if (old) midi_clip_free(old);
     jackdaw_track_commit_midi(t, frames_per_beat);
 }

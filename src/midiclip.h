@@ -58,14 +58,36 @@ typedef struct {
     guint32   clip_in;  /* in-point within the clip (ticks) */
     guint32   length;   /* window length (ticks) */
     off_t     tl_pos;   /* timeline start (frames) */
+    gboolean  auto_grow;/* TRUE only for the untouched full-clip default region:
+                         * it grows to cover newly added notes. Cleared by a
+                         * split so deliberately-sized sections keep their length. */
 } MidiRegion;
 
 MidiRegion *midi_region_new (MidiClip *clip, guint32 clip_in,
                              guint32 length, off_t tl_pos);
+MidiRegion *midi_region_copy(const MidiRegion *r);
 void        midi_region_free(MidiRegion *r);    /* GDestroyNotify-compatible */
 
+/* Region end on the timeline, in frames (tl_pos + length·frames_per_tick). */
+off_t       midi_region_end(const MidiRegion *r, double frames_per_tick);
+
 /* Region list = GPtrArray of MidiRegion*, free func = midi_region_free. */
-GPtrArray  *midi_region_list_new(void);
+GPtrArray  *midi_region_list_new (void);
+GPtrArray  *midi_region_list_copy(GPtrArray *list);     /* deep copy */
+void        midi_region_list_sort(GPtrArray *list);     /* by tl_pos ascending */
+
+/* Region covering timeline `frame` (frames), or NULL if in a gap / past end.
+ * frames_per_tick converts each region's tick length to a frame span. */
+MidiRegion *midi_region_list_at(GPtrArray *list, off_t frame,
+                                double frames_per_tick);
+
+/* Last timeline frame covered by any region (0 if empty). */
+off_t       midi_region_list_total_frames(GPtrArray *list, double frames_per_tick);
+
+/* Split the region straddling timeline `frame` (frames) into two adjacent
+ * regions sharing the source clip (a split at an existing edge is a no-op). */
+void        midi_region_list_split_at(GPtrArray *list, off_t frame,
+                                      double frames_per_tick);
 
 /*
  * Immutable RT event snapshot.
@@ -87,6 +109,12 @@ typedef struct {
 
 MidiEventSnapshot *midi_event_snapshot_new (MidiClip *clip,
                                             double frames_per_beat);
+/* Build the snapshot from a list of MidiRegion* windows into their clips, so
+ * timeline splits / moves / per-region placement drive what the RT thread
+ * plays. Each region emits the notes of its clip that fall in [clip_in,
+ * clip_in+length), shifted so clip tick `clip_in` lands at frame `tl_pos`. */
+MidiEventSnapshot *midi_event_snapshot_new_regions(GPtrArray *regions,
+                                                   double frames_per_beat);
 void               midi_event_snapshot_free(MidiEventSnapshot *s);
 
 /* Last event frame (0 if empty). */

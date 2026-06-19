@@ -882,6 +882,45 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
             g_array_free(vals, TRUE);
         }
 
+        /* MIDI regions (instrument tracks): timeline windows into the clip that
+         * survive split/move. All regions share the single midi_clip, so only
+         * the window geometry is stored. */
+        GPtrArray *mregs = jackdaw_track_get_midi_regions(t);
+        guint mrc = (jackdaw_track_get_kind(t) == JACKDAW_TRACK_INSTRUMENT &&
+                     mregs) ? mregs->len : 0;
+        g_key_file_set_integer(kf, grp, "midi_region_count", (gint)mrc);
+        MidiClip *track_mc = jackdaw_track_get_midi_clip(t);
+        for (guint mi = 0; mi < mrc; mi++) {
+            MidiRegion *r = g_ptr_array_index(mregs, mi);
+            char rg[56]; g_snprintf(rg, sizeof rg, "track%u.midiregion%u", ti, mi);
+            g_key_file_set_integer(kf, rg, "clip_in", (gint)r->clip_in);
+            g_key_file_set_integer(kf, rg, "length",  (gint)r->length);
+            g_key_file_set_int64  (kf, rg, "tl_pos",  r->tl_pos);
+            g_key_file_set_integer(kf, rg, "auto_grow", r->auto_grow ? 1 : 0);
+            /* A region dragged in from another track references that track's clip
+             * rather than this track's — persist its notes inline so the move
+             * survives save/reload (the in-point ticks index into these notes). */
+            if (r->clip && r->clip != track_mc) {
+                guint rn = midi_clip_note_count(r->clip);
+                g_key_file_set_integer(kf, rg, "own_clip_notes", (gint)rn);
+                if (rn > 0) {
+                    GArray *vals = g_array_new(FALSE, FALSE, sizeof(gint));
+                    for (guint ni = 0; ni < rn; ni++) {
+                        MidiNote *n = midi_clip_note(r->clip, ni);
+                        gint v;
+                        v = (gint)n->start;    g_array_append_val(vals, v);
+                        v = (gint)n->length;   g_array_append_val(vals, v);
+                        v = (gint)n->pitch;    g_array_append_val(vals, v);
+                        v = (gint)n->velocity; g_array_append_val(vals, v);
+                        v = (gint)n->channel;  g_array_append_val(vals, v);
+                    }
+                    g_key_file_set_integer_list(kf, rg, "own_clip",
+                                                (gint *)vals->data, vals->len);
+                    g_array_free(vals, TRUE);
+                }
+            }
+        }
+
         project_save_fx(kf, t, grp);
     }
 
@@ -1036,6 +1075,52 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
                 midi_clip_add_note(mc, n);
             }
             g_free(notes);
+        }
+
+        /* MIDI regions (timeline windows). Absent in legacy sessions — then the
+         * commit below auto-creates one full-clip region covering everything. */
+        {
+            MidiClip  *mc    = jackdaw_track_get_midi_clip(t);
+            GPtrArray *mregs = jackdaw_track_get_midi_regions(t);
+            gint mrc = CLAMP(kf_int(kf, grp, "midi_region_count", 0), 0, 100000);
+            /* Replace the default region seeded by set_kind with the saved
+             * arrangement.  No saved regions (legacy) → keep the default. */
+            if (mrc > 0 && mregs->len > 0)
+                g_ptr_array_remove_range(mregs, 0, mregs->len);
+            for (gint mi = 0; mi < mrc; mi++) {
+                char rg[56]; g_snprintf(rg, sizeof rg, "track%d.midiregion%d", ti, mi);
+                if (!g_key_file_has_group(kf, rg)) continue;
+                guint32 clip_in = (guint32)MAX(kf_int(kf, rg, "clip_in", 0), 0);
+                guint32 length  = (guint32)MAX(kf_int(kf, rg, "length",  0), 0);
+                off_t   tl_pos  = MAX(kf_i64(kf, rg, "tl_pos", 0), (gint64)0);
+                if (length == 0) continue;
+
+                /* Region dragged in from another track: rebuild its independent
+                 * clip from the inline notes; otherwise window this track's clip. */
+                MidiClip *rc = mc;
+                gboolean  own = FALSE;
+                if (kf_int(kf, rg, "own_clip_notes", 0) > 0) {
+                    rc = midi_clip_new(clip_in + length);
+                    own = TRUE;
+                    gsize nn = 0;
+                    gint *on = g_key_file_get_integer_list(kf, rg, "own_clip",
+                                                           &nn, NULL);
+                    for (gsize k = 0; on && k + 5 <= nn; k += 5) {
+                        MidiNote n;
+                        n.start    = (guint32)MAX(on[k], 0);
+                        n.length   = (guint32)MAX(on[k + 1], 1);
+                        n.pitch    = (guint8)CLAMP(on[k + 2], 0, 127);
+                        n.velocity = (guint8)CLAMP(on[k + 3], 0, 127);
+                        n.channel  = (guint8)CLAMP(on[k + 4], 0, 15);
+                        midi_clip_add_note(rc, n);
+                    }
+                    g_free(on);
+                }
+                MidiRegion *reg = midi_region_new(rc, clip_in, length, tl_pos);
+                reg->auto_grow = kf_int(kf, rg, "auto_grow", 0) ? TRUE : FALSE;
+                g_ptr_array_add(mregs, reg);
+                if (own) midi_clip_free(rc);   /* region holds its own ref */
+            }
         }
         jackdaw_track_commit_midi(t, fpb);
 

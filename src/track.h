@@ -46,7 +46,12 @@ struct _JackDawTrack {
     /* MIDI clip (instrument tracks; main-thread). Notes stored at absolute tick
      * positions (tick 0 = timeline frame 0). The RT callback reads the immutable
      * rt_midi snapshot, published lock-free like rt_chain. */
-    MidiClip          *midi_clip;     /* single clip for the whole timeline */
+    MidiClip          *midi_clip;     /* single source clip (all notes) */
+    GPtrArray         *midi_regions;  /* GPtrArray of MidiRegion* windowing into
+                                       * midi_clip; drives the RT snapshot so
+                                       * timeline splits/moves take effect.
+                                       * Kept non-empty (default = one full
+                                       * region) once committed. */
     gpointer           rt_midi;       /* MidiEventSnapshot* (atomic) */
     GPtrArray         *retire_midi;   /* MidiEventSnapshot* awaiting free */
 
@@ -164,6 +169,15 @@ gboolean         jackdaw_track_is_instrument(JackDawTrack *t);
 /* Borrowed MIDI region list — edit in place (regions/notes), then call
  * jackdaw_track_commit_midi() to republish the RT event snapshot. */
 MidiClip    *jackdaw_track_get_midi_clip(JackDawTrack *t);
+
+/* Borrowed MIDI region list (instrument tracks). Edit in place (split/move/
+ * place), then call jackdaw_track_commit_midi() to republish the RT snapshot. */
+GPtrArray   *jackdaw_track_get_midi_regions(JackDawTrack *t);
+
+/* Seed the default full-clip region if the list is empty (no-op otherwise).
+ * Use before adding fresh content (e.g. recording) to a track whose regions
+ * were all moved away. */
+void         jackdaw_track_ensure_midi_region(JackDawTrack *t);
 
 /* Replace the track's MIDI clip wholesale (consumes `clip`; frees the old one)
  * and republish the RT event snapshot via the atomic swap. Used by undo to

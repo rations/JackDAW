@@ -137,7 +137,11 @@ struct _JackDawTimeline {
     gboolean          moving;        /* a section move-drag is in progress */
     gboolean          move_committed;/* undo already pushed for this drag */
     gdouble           move_press_x;  /* pointer x (widget coords) at drag start */
+    gdouble           move_press_y_root; /* pointer y_root at drag start (vert.) */
     off_t            *move_orig;     /* orig tl_pos per selected region (sel_regions->len) */
+    JackDawTrack     *move_src;      /* track the move started on (for cross-track) */
+    GHashTable       *move_pre;      /* JackDawTrack* -> pristine section-list copy,
+                                      * captured lazily for a combined move undo */
 
     /* Right-click context: track + timeline frame under the pointer */
     JackDawTrack     *menu_track;

@@ -2485,6 +2485,9 @@ static gboolean midi_finalize_idle(gpointer data)
         for (guint ni = 0; ni < midi_clip_note_count(c); ni++)
             midi_clip_add_note(dst, *midi_clip_note(c, ni));
         midi_clip_free(c);
+        /* Re-seed a default region if every section was moved off this track, so
+         * the freshly recorded notes are audible. */
+        jackdaw_track_ensure_midi_region(t);
         jackdaw_track_commit_midi(t, fpb);  /* publishes RT snapshot + redraws */
     }
     return G_SOURCE_REMOVE;
