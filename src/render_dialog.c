@@ -172,6 +172,8 @@ static RenderFormat opt_format(OptUI *u)
     return u->fmt_map[idx];
 }
 
+static gchar *unique_out_path(const gchar *path);
+
 /* Replace the extension of the path entry to match the selected format. */
 static void opt_sync_extension(OptUI *u)
 {
@@ -182,10 +184,23 @@ static void opt_sync_extension(OptUI *u)
     gchar *base = g_path_get_basename(cur);
     char  *dot  = strrchr(base, '.');
     if (dot) *dot = '\0';
+    /* Strip any existing " (N)" disambiguator before re-uniquifying so toggling
+     * formats back and forth doesn't accumulate counters. */
+    char *p = base + strlen(base);
+    if (p > base && p[-1] == ')') {
+        char *open = strrchr(base, '(');
+        if (open && open > base && open[-1] == ' ') {
+            gboolean digits = (open[1] != ')');
+            for (char *q = open + 1; *q && *q != ')'; q++)
+                if (*q < '0' || *q > '9') { digits = FALSE; break; }
+            if (digits) open[-1] = '\0';   /* drop " (N)" */
+        }
+    }
     gchar *name = g_strdup_printf("%s.%s", base, ext);
     gchar *full = g_build_filename(dir, name, NULL);
-    gtk_entry_set_text(GTK_ENTRY(u->path_entry), full);
-    g_free(dir); g_free(base); g_free(name); g_free(full);
+    gchar *uniq = unique_out_path(full);
+    gtk_entry_set_text(GTK_ENTRY(u->path_entry), uniq);
+    g_free(dir); g_free(base); g_free(name); g_free(full); g_free(uniq);
 }
 
 static void on_format_changed(GtkComboBox *c, gpointer data)
@@ -245,8 +260,46 @@ static gchar *default_out_path(JackDawProject *p, RenderFormat fmt)
     }
     gchar *name = g_strdup_printf("%s.%s", stem, ext);
     gchar *full = g_build_filename(dir, name, NULL);
-    g_free(dir); g_free(stem); g_free(name);
-    return full;
+    gchar *uniq = unique_out_path(full);
+    g_free(dir); g_free(stem); g_free(name); g_free(full);
+    return uniq;
+}
+
+/* Return a newly-allocated path that does not yet exist on disk. If `path` is
+ * already free it is returned as a copy; otherwise a " (N)" counter is inserted
+ * before the extension: "song.wav" -> "song (1).wav" -> "song (2).wav" … so an
+ * auto-filled name never silently overwrites a previous render. */
+static gchar *unique_out_path(const gchar *path)
+{
+    if (!path || !*path || !g_file_test(path, G_FILE_TEST_EXISTS))
+        return g_strdup(path ? path : "");
+
+    gchar *dir  = g_path_get_dirname(path);
+    gchar *base = g_path_get_basename(path);
+    char  *dot  = strrchr(base, '.');
+    gchar *stem, *ext;
+    if (dot && dot != base) {       /* keep the extension; ignore leading-dot files */
+        *dot = '\0';
+        stem = g_strdup(base);
+        ext  = g_strdup(dot + 1);
+    } else {
+        stem = g_strdup(base);
+        ext  = NULL;
+    }
+
+    gchar *result = NULL;
+    for (int n = 1; n < 100000; n++) {
+        gchar *name = ext ? g_strdup_printf("%s (%d).%s", stem, n, ext)
+                          : g_strdup_printf("%s (%d)", stem, n);
+        gchar *full = g_build_filename(dir, name, NULL);
+        g_free(name);
+        if (!g_file_test(full, G_FILE_TEST_EXISTS)) { result = full; break; }
+        g_free(full);
+    }
+    if (!result) result = g_strdup(path);   /* implausible: give up, keep original */
+
+    g_free(dir); g_free(base); g_free(stem); g_free(ext);
+    return result;
 }
 
 static GtkWidget *labeled_row(const char *text, GtkWidget *w)
