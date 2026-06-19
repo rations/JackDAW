@@ -982,11 +982,11 @@ static void mw_locate_next_boundary_cb(GtkWidget *widget, gpointer data)
 
 static off_t mw_one_frame(void)
 {
-    /* One frame at 25 fps (the standard audio production frame size).
-     * Falls back to 1920 (48000/25) when JACK is not connected. */
+    /* One step = 10 ms (1/100 s).
+     * Falls back to 480 (48000/100) when JACK is not connected. */
     jack_nframes_t sr = jackdaw_engine_is_running()
                         ? jackdaw_engine_get_sample_rate() : 48000u;
-    return (off_t)(sr / 25);
+    return (off_t)(sr / 100);
 }
 
 static void mw_step_back_cb(GtkWidget *widget, gpointer data)
@@ -1131,6 +1131,14 @@ static gboolean mw_key_press(GtkWidget *widget, GdkEventKey *event,
     case GDK_KEY_Home:
     case GDK_KEY_KP_Home:
         mw_locate_start_cb(NULL, win);
+        return TRUE;
+    case GDK_KEY_Left:
+    case GDK_KEY_KP_Left:
+        mw_step_back_cb(NULL, win);
+        return TRUE;
+    case GDK_KEY_Right:
+    case GDK_KEY_KP_Right:
+        mw_step_forward_cb(NULL, win);
         return TRUE;
     case GDK_KEY_s:
     case GDK_KEY_g: {
@@ -1406,13 +1414,13 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(toolbar), btn_start, FALSE, FALSE, 0);
 
     GtkWidget *btn_step_back = gtk_button_new_with_label("|<<");
-    gtk_widget_set_tooltip_text(btn_step_back, "Step back one frame (25fps)");
+    gtk_widget_set_tooltip_text(btn_step_back, "Step back 10 ms (Left arrow)");
     g_signal_connect(btn_step_back, "clicked",
                      G_CALLBACK(mw_step_back_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_step_back, FALSE, FALSE, 0);
 
     GtkWidget *btn_step_fwd = gtk_button_new_with_label(">>|");
-    gtk_widget_set_tooltip_text(btn_step_fwd, "Step forward one frame (25fps)");
+    gtk_widget_set_tooltip_text(btn_step_fwd, "Step forward 10 ms (Right arrow)");
     g_signal_connect(btn_step_fwd, "clicked",
                      G_CALLBACK(mw_step_forward_cb), win);
     gtk_box_pack_start(GTK_BOX(toolbar), btn_step_fwd, FALSE, FALSE, 0);
