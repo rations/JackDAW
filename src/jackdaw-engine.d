@@ -93,9 +93,9 @@ src/jackdaw-engine.o: src/jackdaw-engine.c src/config.h src/rt_denormal.h \
  /usr/include/glib-2.0/gobject/gvaluearray.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h src/track.h \
- src/audio_clip.h src/clipregion.h src/midiclip.h src/pluginhost.h \
- /usr/include/gtk-3.0/gtk/gtk.h /usr/include/gtk-3.0/gdk/gdk.h \
- /usr/include/gtk-3.0/gdk/gdkconfig.h \
+ src/audio_clip.h src/clipregion.h src/midiclip.h src/undo.h \
+ src/pluginhost.h /usr/include/gtk-3.0/gtk/gtk.h \
+ /usr/include/gtk-3.0/gdk/gdk.h /usr/include/gtk-3.0/gdk/gdkconfig.h \
  /usr/include/gtk-3.0/gdk/gdkversionmacros.h \
  /usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h \
  /usr/include/glib-2.0/gio/gio.h /usr/include/glib-2.0/gio/giotypes.h \
@@ -739,6 +739,7 @@ src/track.h:
 src/audio_clip.h:
 src/clipregion.h:
 src/midiclip.h:
+src/undo.h:
 src/pluginhost.h:
 /usr/include/gtk-3.0/gtk/gtk.h:
 /usr/include/gtk-3.0/gdk/gdk.h:

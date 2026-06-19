@@ -64,6 +64,10 @@ static const char MW_CSS_SHARED[] =
     "box.ts-selected {"
     "  background-color:#2d4a6b;"
     "  border:1px solid #5b9bd5; }"
+    /* The single active/primary track — stronger highlight than ts-selected. */
+    "box.ts-active {"
+    "  background-color:#36608f;"
+    "  border:1px solid #8ec3ff; }"
     /* Mixer fader: flat horizontal cap (not the theme's round handle)
      * so its centre is a clear reference that lines up with the dB
      * labels. Trough margins = half the cap height so the cap centre
@@ -134,6 +138,9 @@ static void mw_new_project_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    /* Drop undo history first: its mementos reference the tracks we're about to
+     * tear down and must not resurrect them into the empty project. */
+    undo_manager_clear(jackdaw_project_get_undo(win->project));
     guint n = jackdaw_project_track_count(win->project);
     while (n-- > 0) {
         JackDawTrack *t = jackdaw_project_get_track(win->project, 0);
@@ -185,6 +192,8 @@ static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
                     user_error("Engine: could not add track (slot limit reached)");
                     g_object_unref(t);
                 } else {
+                    jackdaw_project_push_structural_undo(win->project,
+                                                         "Import audio track");
                     jackdaw_project_add_track(win->project, t);
                     g_object_unref(t);
                 }
@@ -313,6 +322,7 @@ static void mw_add_track_cb(GtkMenuItem *item, gpointer data)
         g_object_unref(t);
         return;
     }
+    jackdaw_project_push_structural_undo(win->project, "Add track");
     jackdaw_project_add_track(win->project, t);
     g_object_unref(t);
 }
@@ -340,6 +350,7 @@ static void mw_add_instrument_track_cb(GtkMenuItem *item, gpointer data)
         g_object_unref(t);
         return;
     }
+    jackdaw_project_push_structural_undo(win->project, "Add MIDI track");
     jackdaw_project_add_track(win->project, t);
     g_object_unref(t);
 }
@@ -348,10 +359,9 @@ static void mw_remove_track_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
-    JackDawTrack *t = jackdaw_timeline_get_focused(win->timeline);
+    JackDawTrack *t = jackdaw_project_get_active_track(win->project);
     if (!t) return;
-    jackdaw_engine_remove_track(t);
-    jackdaw_project_remove_track(win->project, t);
+    jackdaw_project_delete_track(win->project, t);
 }
 
 static gboolean mw_tracks_box_press_cb(GtkWidget *widget, GdkEventButton *ev,
@@ -371,13 +381,6 @@ static gboolean mw_tracks_box_press_cb(GtkWidget *widget, GdkEventButton *ev,
     g_signal_connect(mi_midi, "activate",
                      G_CALLBACK(mw_add_instrument_track_cb), win);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_midi);
-
-    GtkWidget *mi_sep = gtk_separator_menu_item_new();
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_sep);
-
-    GtkWidget *mi_rem = gtk_menu_item_new_with_label("Remove Focused Track");
-    g_signal_connect(mi_rem, "activate", G_CALLBACK(mw_remove_track_cb), win);
-    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_rem);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
 
@@ -986,13 +989,15 @@ static void mw_step_forward_cb(GtkWidget *widget, gpointer data)
 static void mw_undo_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
-    jackdaw_timeline_undo(mw_timeline(GTK_WIDGET(data)));
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_undo(win->project);
 }
 
 static void mw_redo_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
-    jackdaw_timeline_redo(mw_timeline(GTK_WIDGET(data)));
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_redo(win->project);
 }
 
 /* ---- View menu ---- */
@@ -1306,7 +1311,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "_Load File as New Track…",
               G_CALLBACK(mw_load_file_cb), win, 0, 0, ag);
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);
-    menu_item(m, "_Remove Focused Track",
+    menu_item(m, "_Delete Active Track",
               G_CALLBACK(mw_remove_track_cb), win, 0, 0, ag);
 
     /* Transport */

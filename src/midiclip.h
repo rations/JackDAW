@@ -36,6 +36,10 @@ typedef struct {
 MidiClip *midi_clip_new (guint32 length_ticks);
 MidiClip *midi_clip_ref (MidiClip *c);          /* NULL-safe */
 void      midi_clip_free(MidiClip *c);          /* unref; frees at zero */
+/* Deep copy: a brand-new clip (refcount 1) with every note duplicated, fully
+ * independent of the source. Unlike midi_clip_ref (which shares the notes),
+ * this is used for undo mementos. NULL-safe (returns NULL). */
+MidiClip *midi_clip_copy(MidiClip *c);
 
 /* Editing (main thread). add returns the new note's index. */
 guint     midi_clip_add_note   (MidiClip *c, MidiNote note);

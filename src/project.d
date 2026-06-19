@@ -250,7 +250,7 @@ src/project.o: src/project.c src/config.h /usr/include/glib-2.0/gio/gio.h \
  /usr/include/glib-2.0/gio/gio-autocleanups.h \
  /usr/include/glib-2.0/glib/gstdio.h /usr/include/glib-2.0/glib/gprintf.h \
  src/project.h src/track.h src/audio_clip.h src/clipregion.h \
- src/midiclip.h src/settings.h src/pluginhost.h \
+ src/midiclip.h src/undo.h src/settings.h src/pluginhost.h \
  /usr/include/gtk-3.0/gtk/gtk.h /usr/include/gtk-3.0/gdk/gdk.h \
  /usr/include/gtk-3.0/gdk/gdkconfig.h \
  /usr/include/gtk-3.0/gdk/gdkversionmacros.h \
@@ -901,6 +901,7 @@ src/track.h:
 src/audio_clip.h:
 src/clipregion.h:
 src/midiclip.h:
+src/undo.h:
 src/settings.h:
 src/pluginhost.h:
 /usr/include/gtk-3.0/gtk/gtk.h:

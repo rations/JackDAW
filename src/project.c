@@ -21,6 +21,7 @@ enum {
     SIGNAL_PORTS_CHANGED,
     SIGNAL_TIMING_CHANGED,
     SIGNAL_SELECTION_CHANGED,
+    SIGNAL_TRACKS_REORDERED,
     LAST_SIGNAL
 };
 
@@ -39,6 +40,10 @@ static void jackdaw_project_finalize(GObject *obj)
     if (p->sel_tracks) {
         g_ptr_array_unref(p->sel_tracks);
         p->sel_tracks = NULL;
+    }
+    if (p->undo) {
+        undo_manager_free(p->undo);
+        p->undo = NULL;
     }
     g_free(p->project_file);
     g_clear_object(&p->master_track);
@@ -80,12 +85,20 @@ static void jackdaw_project_class_init(JackDawProjectClass *klass)
         G_SIGNAL_RUN_FIRST,
         G_STRUCT_OFFSET(JackDawProjectClass, selection_changed),
         NULL, NULL, NULL, G_TYPE_NONE, 0);
+
+    project_signals[SIGNAL_TRACKS_REORDERED] = g_signal_new(
+        "tracks-reordered", G_TYPE_FROM_CLASS(klass),
+        G_SIGNAL_RUN_FIRST,
+        G_STRUCT_OFFSET(JackDawProjectClass, tracks_reordered),
+        NULL, NULL, NULL, G_TYPE_NONE, 0);
 }
 
 static void jackdaw_project_init(JackDawProject *p)
 {
     p->tracks          = g_ptr_array_new_with_free_func(g_object_unref);
     p->sel_tracks      = g_ptr_array_new();   /* borrowed pointers, no free func */
+    p->active_track    = NULL;
+    p->undo            = undo_manager_new(64);
     p->project_file    = NULL;
     p->master_volume   = 1.0f;
     p->master_rt_chain = NULL;
@@ -136,8 +149,15 @@ void jackdaw_project_remove_track(JackDawProject *p, JackDawTrack *t)
      * g_ptr_array_remove() calls the free_func (g_object_unref) on removal,
      * and the "track-removed" handler may destroy the last external ref. */
     g_object_ref(t);
-    /* Drop it from the multi-selection first so no dangling pointer remains. */
-    if (p->sel_tracks && g_ptr_array_remove(p->sel_tracks, t))
+    /* Drop it from the multi-selection first so no dangling pointer remains.
+     * active_track is a weak ref — clear it too if it pointed at t. */
+    gboolean sel_changed = (p->sel_tracks && g_ptr_array_remove(p->sel_tracks, t));
+    if (p->active_track == t) {
+        p->active_track = (p->sel_tracks && p->sel_tracks->len > 0)
+            ? g_ptr_array_index(p->sel_tracks, p->sel_tracks->len - 1) : NULL;
+        sel_changed = TRUE;
+    }
+    if (sel_changed)
         g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
     if (g_ptr_array_remove(p->tracks, t))
         g_signal_emit(p, project_signals[SIGNAL_TRACK_REMOVED], 0, t);
@@ -166,6 +186,7 @@ void jackdaw_project_select_single(JackDawProject *p, JackDawTrack *t)
     g_return_if_fail(JACKDAW_IS_TRACK(t));
     g_ptr_array_set_size(p->sel_tracks, 0);
     g_ptr_array_add(p->sel_tracks, t);
+    p->active_track = t;
     g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
 }
 
@@ -173,17 +194,171 @@ void jackdaw_project_toggle_selected(JackDawProject *p, JackDawTrack *t)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
     g_return_if_fail(JACKDAW_IS_TRACK(t));
-    if (!g_ptr_array_remove(p->sel_tracks, t))
+    if (g_ptr_array_remove(p->sel_tracks, t)) {
+        /* Removed t. If it was active, fall back to the last remaining. */
+        if (p->active_track == t)
+            p->active_track = (p->sel_tracks->len > 0)
+                ? g_ptr_array_index(p->sel_tracks, p->sel_tracks->len - 1) : NULL;
+    } else {
         g_ptr_array_add(p->sel_tracks, t);
+        p->active_track = t;          /* newly added becomes active */
+    }
     g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
 }
 
 void jackdaw_project_clear_selection(JackDawProject *p)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
-    if (p->sel_tracks->len == 0) return;
+    if (p->sel_tracks->len == 0 && p->active_track == NULL) return;
     g_ptr_array_set_size(p->sel_tracks, 0);
+    p->active_track = NULL;
     g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
+}
+
+JackDawTrack *jackdaw_project_get_active_track(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), NULL);
+    return p->active_track;
+}
+
+void jackdaw_project_set_active_track(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    if (p->active_track == t) return;
+    p->active_track = t;
+    /* Invariant: the active track is part of the selection. */
+    if (t && !jackdaw_project_is_selected(p, t))
+        g_ptr_array_add(p->sel_tracks, t);
+    g_signal_emit(p, project_signals[SIGNAL_SELECTION_CHANGED], 0);
+}
+
+/* ---- Global undo/redo ---- */
+
+JackDawUndoManager *jackdaw_project_get_undo(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), NULL);
+    return p->undo;
+}
+
+void jackdaw_project_undo(JackDawProject *p)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    undo_manager_undo(p->undo);
+}
+
+void jackdaw_project_redo(JackDawProject *p)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    undo_manager_redo(p->undo);
+}
+
+void jackdaw_project_emit_tracks_reordered(JackDawProject *p)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_signal_emit(p, project_signals[SIGNAL_TRACKS_REORDERED], 0);
+}
+
+/* ---- Structural (track add/delete/reorder) undo ----
+ *
+ * Memento = the ordered track list, holding a STRONG ref to each track so a
+ * deleted track survives on the undo stack until the action is evicted. Restore
+ * diffs the saved list against the live project: removes tracks added since,
+ * re-adds tracks deleted since (still fully intact), then reorders to match. */
+
+typedef struct { GPtrArray *tracks; } TrackListState;  /* g_object_ref'd, ordered */
+
+static gpointer tracklist_capture(gpointer ctx)
+{
+    JackDawProject *p = ctx;
+    TrackListState *s = g_new0(TrackListState, 1);
+    s->tracks = g_ptr_array_new_with_free_func(g_object_unref);
+    for (guint i = 0; i < p->tracks->len; i++)
+        g_ptr_array_add(s->tracks, g_object_ref(g_ptr_array_index(p->tracks, i)));
+    return s;
+}
+
+static void tracklist_free(gpointer state)
+{
+    TrackListState *s = state;
+    if (!s) return;
+    g_ptr_array_unref(s->tracks);
+    g_free(s);
+}
+
+static gboolean ptr_array_has(GPtrArray *a, gconstpointer x)
+{
+    for (guint i = 0; i < a->len; i++)
+        if (g_ptr_array_index(a, i) == x) return TRUE;
+    return FALSE;
+}
+
+static void tracklist_restore(gpointer ctx, gpointer state)
+{
+    JackDawProject *p = ctx;
+    TrackListState *s = state;
+
+    /* Plugin (re)instantiation and engine slot changes are not RT-safe — hold
+     * the graph while we reshape it, mirroring jackdaw_project_load. */
+    jackdaw_engine_set_suspended(TRUE);
+
+    /* Remove tracks present now but not in the saved list (undo of an add). */
+    GPtrArray *cur = g_ptr_array_new();
+    for (guint i = 0; i < p->tracks->len; i++)
+        g_ptr_array_add(cur, g_ptr_array_index(p->tracks, i));
+    for (guint i = 0; i < cur->len; i++) {
+        JackDawTrack *t = g_ptr_array_index(cur, i);
+        if (!ptr_array_has(s->tracks, t)) {
+            jackdaw_engine_remove_track(t);
+            jackdaw_project_remove_track(p, t);
+        }
+    }
+    g_ptr_array_free(cur, TRUE);
+
+    /* Re-add tracks in the saved list that are no longer live (undo of a
+     * delete). The track object is intact — the memento kept it alive. */
+    for (guint i = 0; i < s->tracks->len; i++) {
+        JackDawTrack *t = g_ptr_array_index(s->tracks, i);
+        if (jackdaw_project_track_index(p, t) < 0) {
+            if (!jackdaw_engine_add_track(t))   /* FALSE = success */
+                jackdaw_project_add_track(p, t);
+        }
+    }
+
+    /* Reorder the live list to match the saved order. */
+    for (guint i = 0; i < s->tracks->len; i++) {
+        JackDawTrack *t = g_ptr_array_index(s->tracks, i);
+        gint idx = jackdaw_project_track_index(p, t);
+        if (idx >= 0 && (guint)idx != i)
+            jackdaw_project_move_track(p, (guint)idx, i);
+    }
+
+    jackdaw_engine_set_suspended(FALSE);
+    jackdaw_project_emit_tracks_reordered(p);
+}
+
+void jackdaw_project_push_structural_undo(JackDawProject *p, const char *desc)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    JackDawUndoAction a = {
+        .ctx         = p,
+        .saved_state = tracklist_capture(p),
+        .capture_fn  = tracklist_capture,
+        .restore_fn  = tracklist_restore,
+        .free_fn     = tracklist_free,
+        .after_fn    = NULL,
+        .ctx_free_fn = NULL,            /* ctx is the project; never freed here */
+        .desc        = g_strdup(desc ? desc : "Track change"),
+    };
+    undo_manager_push(p->undo, &a);
+}
+
+void jackdaw_project_delete_track(JackDawProject *p, JackDawTrack *t)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    jackdaw_project_push_structural_undo(p, "Delete track");
+    jackdaw_engine_remove_track(t);
+    jackdaw_project_remove_track(p, t);
 }
 
 guint jackdaw_project_track_count(JackDawProject *p)
@@ -760,6 +935,10 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
      * not RT-safe and would otherwise xrun the live audio thread). Resumed at the
      * single success exit below. */
     jackdaw_engine_set_suspended(TRUE);
+
+    /* Drop all undo history: mementos reference the outgoing session's tracks
+     * and must not resurrect them into the loaded one. */
+    undo_manager_clear(p->undo);
 
     /* Clear the current session (engine slots + project tracks). */
     guint cur = p->tracks->len;

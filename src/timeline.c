@@ -585,11 +585,20 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
         }
     }
 
-    /* Focus border */
-    if (wv->focused) {
-        cairo_set_source_rgba(cr, 0.40, 0.60, 0.90, 0.85);
-        cairo_set_line_width(cr, 2.0);
-        cairo_rectangle(cr, 1.0, 1.0, (double)(w - 2), (double)(h - 2));
+    /* Selection / active border — read from the project so the strip and the
+     * timeline highlight as one unit. A merely-selected track gets a soft blue
+     * border; the active (primary) track gets a brighter, thicker one. */
+    if (wv->project && jackdaw_project_is_selected(wv->project, wv->track)) {
+        gboolean active =
+            (jackdaw_project_get_active_track(wv->project) == wv->track);
+        if (active) {
+            cairo_set_source_rgba(cr, 0.55, 0.78, 1.0, 1.0);
+            cairo_set_line_width(cr, 2.5);
+        } else {
+            cairo_set_source_rgba(cr, 0.40, 0.60, 0.90, 0.70);
+            cairo_set_line_width(cr, 1.5);
+        }
+        cairo_rectangle(cr, 1.5, 1.5, (double)(w - 3), (double)(h - 3));
         cairo_stroke(cr);
     }
 
@@ -785,20 +794,18 @@ enum {
 };
 static guint timeline_signals[LAST_SIGNAL];
 
-/* Set focused track, update border on all WaveViews */
-static void timeline_set_focused(JackDawTimeline *tl, JackDawTrack *track)
+/* Project selection changed: mirror the active track into focused_track (kept
+ * for the many internal readers), repaint every wave view, and re-emit the
+ * timeline's track-focused signal for external listeners. */
+static void timeline_selection_changed(JackDawProject *project, gpointer data)
 {
-    tl->focused_track = track;
-
-    GHashTableIter iter;
-    gpointer key, val;
-    g_hash_table_iter_init(&iter, tl->wave_views);
-    while (g_hash_table_iter_next(&iter, &key, &val)) {
-        JackDawWaveView *wv = JACKDAW_WAVE_VIEW(val);
-        jackdaw_wave_view_set_focused(wv, (JackDawTrack *)key == track);
-    }
-
-    g_signal_emit(tl, timeline_signals[SIGNAL_TRACK_FOCUSED], 0, track);
+    JackDawTimeline *tl = JACKDAW_TIMELINE(data);
+    JackDawTrack *active = jackdaw_project_get_active_track(project);
+    gboolean changed = (tl->focused_track != active);
+    tl->focused_track = active;
+    jackdaw_timeline_redraw_all(tl);
+    if (changed)
+        g_signal_emit(tl, timeline_signals[SIGNAL_TRACK_FOCUSED], 0, active);
 }
 
 /* ---- Shared helpers ---- */
@@ -871,37 +878,13 @@ static void timeline_set_playhead(JackDawTimeline *tl, off_t frame)
         jackdaw_engine_locate(frame);
 }
 
-/* ---- Region-edit undo/redo ---- */
+/* ---- Region-edit undo/redo (routed through the project's global manager) ----
+ *
+ * One memento per edit: capture the track's region list before the edit, push
+ * an action onto JackDawProject's undo manager. ctx carries {timeline, track}
+ * so the restore can repaint and drop the now-stale section selection. */
 
-static void region_snapshot_free(gpointer p)
-{
-    if (p) g_ptr_array_unref((GPtrArray *)p);
-}
-
-static void undo_queue_free(gpointer q)
-{
-    if (!q) return;
-    g_queue_free_full((GQueue *)q, region_snapshot_free);
-}
-
-static GQueue *undo_stack_for(GHashTable *tbl, JackDawTrack *t)
-{
-    GQueue *q = g_hash_table_lookup(tbl, t);
-    if (!q) { q = g_queue_new(); g_hash_table_insert(tbl, t, q); }
-    return q;
-}
-
-static void timeline_push_undo(JackDawTimeline *tl, JackDawTrack *t)
-{
-    GQueue *u = undo_stack_for(tl->undo_stacks, t);
-    g_queue_push_head(u, clip_region_list_copy(jackdaw_track_get_regions(t)));
-    while (g_queue_get_length(u) > 64)
-        region_snapshot_free(g_queue_pop_tail(u));
-    /* A new edit invalidates the redo history for this track. */
-    GQueue *r = g_hash_table_lookup(tl->redo_stacks, t);
-    if (r) while (!g_queue_is_empty(r))
-        region_snapshot_free(g_queue_pop_head(r));
-}
+typedef struct { JackDawTimeline *tl; JackDawTrack *t; } RegionUndoCtx;
 
 /* Replace a track's region list with copies from `list` (does not consume). */
 static void timeline_apply_regions(JackDawTrack *t, GPtrArray *list)
@@ -914,36 +897,59 @@ static void timeline_apply_regions(JackDawTrack *t, GPtrArray *list)
     jackdaw_track_commit_regions(t);
 }
 
+static gpointer region_undo_capture(gpointer ctx)
+{
+    RegionUndoCtx *c = ctx;
+    return clip_region_list_copy(jackdaw_track_get_regions(c->t));
+}
+
+static void region_undo_restore(gpointer ctx, gpointer state)
+{
+    RegionUndoCtx *c = ctx;
+    timeline_apply_regions(c->t, (GPtrArray *)state);
+}
+
+static void region_undo_free_state(gpointer state)
+{
+    if (state) g_ptr_array_unref((GPtrArray *)state);
+}
+
+static void region_undo_after(gpointer ctx)
+{
+    RegionUndoCtx *c = ctx;
+    timeline_clear_section_sel(c->tl);   /* region pointers are now stale */
+    jackdaw_timeline_redraw_all(c->tl);
+}
+
+/* Snapshot the track's regions BEFORE an edit and push the undo action. */
+static void timeline_push_undo(JackDawTimeline *tl, JackDawTrack *t)
+{
+    if (!tl->project) return;
+    RegionUndoCtx *c = g_new0(RegionUndoCtx, 1);
+    c->tl = tl; c->t = t;
+    JackDawUndoAction a = {
+        .ctx         = c,
+        .saved_state = clip_region_list_copy(jackdaw_track_get_regions(t)),
+        .capture_fn  = region_undo_capture,
+        .restore_fn  = region_undo_restore,
+        .free_fn     = region_undo_free_state,
+        .after_fn    = region_undo_after,
+        .ctx_free_fn = g_free,
+        .desc        = g_strdup("Region edit"),
+    };
+    undo_manager_push(jackdaw_project_get_undo(tl->project), &a);
+}
+
 void jackdaw_timeline_undo(JackDawTimeline *tl)
 {
     g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
-    JackDawTrack *t = tl->focused_track;
-    if (!t) return;
-    GQueue *u = g_hash_table_lookup(tl->undo_stacks, t);
-    if (!u || g_queue_is_empty(u)) return;
-    GQueue *r = undo_stack_for(tl->redo_stacks, t);
-    g_queue_push_head(r, clip_region_list_copy(jackdaw_track_get_regions(t)));
-    GPtrArray *snap = g_queue_pop_head(u);
-    timeline_apply_regions(t, snap);
-    region_snapshot_free(snap);
-    timeline_clear_section_sel(tl);   /* region pointers are now stale */
-    jackdaw_timeline_redraw_all(tl);
+    if (tl->project) jackdaw_project_undo(tl->project);
 }
 
 void jackdaw_timeline_redo(JackDawTimeline *tl)
 {
     g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
-    JackDawTrack *t = tl->focused_track;
-    if (!t) return;
-    GQueue *r = g_hash_table_lookup(tl->redo_stacks, t);
-    if (!r || g_queue_is_empty(r)) return;
-    GQueue *u = undo_stack_for(tl->undo_stacks, t);
-    g_queue_push_head(u, clip_region_list_copy(jackdaw_track_get_regions(t)));
-    GPtrArray *snap = g_queue_pop_head(r);
-    timeline_apply_regions(t, snap);
-    region_snapshot_free(snap);
-    timeline_clear_section_sel(tl);   /* region pointers are now stale */
-    jackdaw_timeline_redraw_all(tl);
+    if (tl->project) jackdaw_project_redo(tl->project);
 }
 
 /* ---- Region edit operations ---- */
@@ -1178,6 +1184,15 @@ static void menu_open_midi_cb(GtkMenuItem *item, gpointer data)
     jackdaw_midi_window_open(tl->menu_track, tl->project);
 }
 
+/* Delete the RIGHT-CLICKED track (tl->menu_track), not the active one. */
+static void menu_delete_track_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    if (!tl->menu_track || !tl->project) return;
+    jackdaw_project_delete_track(tl->project, tl->menu_track);
+}
+
 static void menu_gain_cb(GtkMenuItem *item, gpointer data)
 {
     (void)item;
@@ -1273,6 +1288,13 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
         gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
     }
 
+    if (tl->menu_track) {
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+        GtkWidget *mi = gtk_menu_item_new_with_label("Delete Track");
+        g_signal_connect(mi, "activate", G_CALLBACK(menu_delete_track_cb), tl);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+    }
+
     gtk_widget_show_all(menu);
     gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
 }
@@ -1339,7 +1361,17 @@ static gboolean timeline_wave_clicked(GtkWidget *widget,
     JackDawWaveView *wv = JACKDAW_WAVE_VIEW(widget);
 
     off_t sample = timeline_x_to_sample(tl, event->x);
-    timeline_set_focused(tl, wv->track);
+    /* Unify strip + timeline selection: a plain click (left or right) selects
+     * just this track so both the strip and the timeline highlight as one unit.
+     * Ctrl+left-click keeps any existing track multi-selection and only makes
+     * this the active track — the waveform Ctrl+click handling further down is
+     * for region/section selection within the track, not track-unit toggling. */
+    if (tl->project && wv->track) {
+        if (event->button == 1 && (event->state & GDK_CONTROL_MASK))
+            jackdaw_project_set_active_track(tl->project, wv->track);
+        else
+            jackdaw_project_select_single(tl->project, wv->track);
+    }
 
     /* Double-click on an instrument track opens the MIDI window. */
     if (event->type == GDK_2BUTTON_PRESS && wv->track &&
@@ -1634,6 +1666,16 @@ static void on_project_track_removed(JackDawProject *p, JackDawTrack *t,
     jackdaw_timeline_remove_track(JACKDAW_TIMELINE(data), t);
 }
 
+static void timeline_sync_track_order(JackDawTimeline *tl);  /* fwd decl */
+
+/* Project track order changed (e.g. an undo/redo of add/delete/reorder): resync
+ * the widget rows to match the array order. */
+static void on_project_tracks_reordered(JackDawProject *p, gpointer data)
+{
+    (void)p;
+    timeline_sync_track_order(JACKDAW_TIMELINE(data));
+}
+
 static void on_project_timing_changed(JackDawProject *p, gpointer data)
 {
     (void)p;
@@ -1817,8 +1859,6 @@ static void jackdaw_timeline_finalize(GObject *obj)
     if (tl->sel_regions) g_ptr_array_unref(tl->sel_regions);
     if (tl->clipboard) g_ptr_array_unref(tl->clipboard);
     g_free(tl->move_orig);
-    if (tl->undo_stacks) g_hash_table_destroy(tl->undo_stacks);
-    if (tl->redo_stacks) g_hash_table_destroy(tl->redo_stacks);
 
     G_OBJECT_CLASS(jackdaw_timeline_parent_class)->finalize(obj);
 }
@@ -1880,10 +1920,6 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->clipboard     = g_ptr_array_new_with_free_func(
                             (GDestroyNotify)clip_region_free);
     tl->hscroll       = NULL;
-    tl->undo_stacks   = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                              NULL, undo_queue_free);
-    tl->redo_stacks   = g_hash_table_new_full(g_direct_hash, g_direct_equal,
-                                              NULL, undo_queue_free);
 
     gtk_orientable_set_orientation(GTK_ORIENTABLE(tl),
                                    GTK_ORIENTATION_VERTICAL);
@@ -1966,6 +2002,10 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
                             G_CALLBACK(on_project_track_removed), tl, 0);
     g_signal_connect_object(project, "timing-changed",
                             G_CALLBACK(on_project_timing_changed), tl, 0);
+    g_signal_connect_object(project, "selection-changed",
+                            G_CALLBACK(timeline_selection_changed), tl, 0);
+    g_signal_connect_object(project, "tracks-reordered",
+                            G_CALLBACK(on_project_tracks_reordered), tl, 0);
 
     tl->update_timer = g_timeout_add(50, timeline_update_timer, tl);
 
@@ -2127,6 +2167,8 @@ static void track_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
             gint final = (from < ins) ? ins - 1 : ins;   /* index after move  */
             final = CLAMP(final, 0, (gint)n - 1);
             if (final != from) {
+                jackdaw_project_push_structural_undo(td->tl->project,
+                                                     "Reorder tracks");
                 jackdaw_project_move_track(td->tl->project,
                                            (guint)from, (guint)final);
                 timeline_sync_track_order(td->tl);
@@ -2173,6 +2215,52 @@ static void track_dnd_grip(GtkWidget *w, TrackDnd *td)
                      G_CALLBACK(track_drag_data_received), td);
 }
 
+/* ---- Track-strip context menu (right-click the header) ---- */
+
+static void strip_menu_delete_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
+    if (strip->track && strip->project)
+        jackdaw_project_delete_track(strip->project, strip->track);
+}
+
+static void strip_menu_midi_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
+    if (strip->track && jackdaw_track_is_instrument(strip->track))
+        jackdaw_midi_window_open(strip->track, strip->project);
+}
+
+/* Right-click anywhere on a track strip header: select that track (so strip and
+ * timeline both highlight) and pop a per-track menu acting on THIS track. */
+static gboolean strip_button_press(GtkWidget *w, GdkEventButton *ev,
+                                   gpointer data)
+{
+    (void)w;
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3) return FALSE;
+    JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
+    if (!strip->track || !strip->project) return FALSE;
+
+    jackdaw_project_select_single(strip->project, strip->track);
+
+    GtkWidget *menu = gtk_menu_new();
+    if (jackdaw_track_is_instrument(strip->track)) {
+        GtkWidget *mi = gtk_menu_item_new_with_label("Open MIDI Editor");
+        g_signal_connect(mi, "activate", G_CALLBACK(strip_menu_midi_cb), strip);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi);
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
+    }
+    GtkWidget *del = gtk_menu_item_new_with_label("Delete Track");
+    g_signal_connect(del, "activate", G_CALLBACK(strip_menu_delete_cb), strip);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), del);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE;
+}
+
 void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
 {
     g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
@@ -2197,6 +2285,9 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     GtkWidget *strip_box = gtk_event_box_new();
     gtk_container_add(GTK_CONTAINER(strip_box), strip);
     gtk_size_group_add_widget(tl->header_size_group, strip_box);
+    /* Right-click the strip header → per-track context menu (Delete Track). */
+    g_signal_connect(strip_box, "button-press-event",
+                     G_CALLBACK(strip_button_press), strip);
 
     TrackDnd *td = g_new0(TrackDnd, 1);
     td->tl = tl; td->track = track; td->snap = strip_box;

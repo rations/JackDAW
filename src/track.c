@@ -261,6 +261,17 @@ void jackdaw_track_commit_midi(JackDawTrack *t, double frames_per_beat)
     g_signal_emit(t, track_signals[SIGNAL_STATE_CHANGED], 0);
 }
 
+void jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip,
+                                 double frames_per_beat)
+{
+    g_return_if_fail(JACKDAW_IS_TRACK(t));
+    if (clip == t->midi_clip) { midi_clip_free(clip); return; }
+    MidiClip *old = t->midi_clip;
+    t->midi_clip = clip;            /* take ownership */
+    if (old) midi_clip_free(old);
+    jackdaw_track_commit_midi(t, frames_per_beat);
+}
+
 void jackdaw_track_commit_regions(JackDawTrack *t)
 {
     g_return_if_fail(JACKDAW_IS_TRACK(t));

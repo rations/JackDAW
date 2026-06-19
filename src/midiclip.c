@@ -28,6 +28,15 @@ void midi_clip_free(MidiClip *c)
     g_free(c);
 }
 
+MidiClip *midi_clip_copy(MidiClip *c)
+{
+    if (!c) return NULL;
+    MidiClip *d = midi_clip_new(c->length);
+    if (c->notes && c->notes->len > 0)
+        g_array_append_vals(d->notes, c->notes->data, c->notes->len);
+    return d;
+}
+
 guint midi_clip_add_note(MidiClip *c, MidiNote note)
 {
     g_array_append_val(c->notes, note);

@@ -93,6 +93,7 @@ SRCS_C := \
     $(SRCDIR)/clipregion.c \
     $(SRCDIR)/midiclip.c \
     $(SRCDIR)/track.c \
+    $(SRCDIR)/undo.c \
     $(SRCDIR)/project.c \
     $(SRCDIR)/jackdaw-engine.c \
     $(SRCDIR)/pluginhost.c \

@@ -94,7 +94,7 @@ src/track.o: src/track.c src/config.h src/track.h \
  /usr/include/glib-2.0/gobject/gvaluetypes.h \
  /usr/include/glib-2.0/gobject/gobject-autocleanups.h src/audio_clip.h \
  src/clipregion.h src/midiclip.h src/jackdaw-engine.h src/project.h \
- src/pluginhost.h /usr/include/gtk-3.0/gtk/gtk.h \
+ src/undo.h src/pluginhost.h /usr/include/gtk-3.0/gtk/gtk.h \
  /usr/include/gtk-3.0/gdk/gdk.h /usr/include/gtk-3.0/gdk/gdkconfig.h \
  /usr/include/gtk-3.0/gdk/gdkversionmacros.h \
  /usr/include/gtk-3.0/gdk/gdkapplaunchcontext.h \
@@ -738,6 +738,7 @@ src/clipregion.h:
 src/midiclip.h:
 src/jackdaw-engine.h:
 src/project.h:
+src/undo.h:
 src/pluginhost.h:
 /usr/include/gtk-3.0/gtk/gtk.h:
 /usr/include/gtk-3.0/gdk/gdk.h:

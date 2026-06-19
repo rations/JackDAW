@@ -395,8 +395,10 @@ static void on_ports_changed(JackDawProject *project, gpointer data)
 
 /* ---- Track multi-selection (Ctrl+click) --------------------------------- */
 
-/* Reflect the project's selection set on this strip via the "ts-selected" CSS
- * class (highlight border/background defined in the shared app CSS). */
+/* Reflect the project's selection set on this strip via CSS classes (highlight
+ * styling defined in the shared app CSS). "ts-selected" = in the multi-select;
+ * "ts-active" = the single primary/active track (stronger highlight), keeping
+ * the strip and its timeline lane visually in sync. */
 static void on_selection_changed(JackDawProject *project, gpointer data)
 {
     JackDawTrackStrip *strip = JACKDAW_TRACK_STRIP(data);
@@ -405,6 +407,10 @@ static void on_selection_changed(JackDawProject *project, gpointer data)
         gtk_style_context_add_class(ctx, "ts-selected");
     else
         gtk_style_context_remove_class(ctx, "ts-selected");
+    if (jackdaw_project_get_active_track(project) == strip->track)
+        gtk_style_context_add_class(ctx, "ts-active");
+    else
+        gtk_style_context_remove_class(ctx, "ts-active");
 }
 
 /* Click on the track name selects the track. Ctrl+click toggles it in/out of

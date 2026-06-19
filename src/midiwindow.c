@@ -147,6 +147,75 @@ static void mw_commit(MidiWindow *mw)
     gtk_widget_queue_draw(mw->ruler);
 }
 
+/* ---- MIDI note undo (routed through the project's global manager) ----
+ *
+ * Memento = a deep copy of the track's MIDI clip. ctx carries {track, project}
+ * so restore can compute frames-per-beat and republish the RT snapshot via the
+ * track's atomic swap. Push BEFORE each editing gesture. */
+
+typedef struct { JackDawTrack *track; JackDawProject *project; } MidiUndoCtx;
+
+static double mw_ctx_fpb(MidiUndoCtx *c)
+{
+    return jackdaw_project_frames_per_beat(c->project,
+                                           jackdaw_engine_get_sample_rate());
+}
+
+static gpointer midi_undo_capture(gpointer ctx)
+{
+    MidiUndoCtx *c = ctx;
+    return midi_clip_copy(jackdaw_track_get_midi_clip(c->track));
+}
+
+static void midi_undo_restore(gpointer ctx, gpointer state)
+{
+    MidiUndoCtx *c = ctx;
+    /* set_midi_clip consumes its argument; hand it a copy so the memento (and
+     * its post-edit successor after the swap) stays intact for redo. */
+    jackdaw_track_set_midi_clip(c->track, midi_clip_copy((MidiClip *)state),
+                                mw_ctx_fpb(c));
+}
+
+static void midi_undo_free(gpointer state)
+{
+    midi_clip_free((MidiClip *)state);
+}
+
+static void midi_undo_after(gpointer ctx)
+{
+    MidiUndoCtx *c = ctx;
+    MidiWindow *mw = g_object_get_data(G_OBJECT(c->track), "midi-window");
+    if (!mw) return;
+    /* The clip pointer was replaced; refresh the cache and drop now-stale
+     * selection/drag indices, then repaint. */
+    mw->clip = jackdaw_track_get_midi_clip(c->track);
+    if (mw->sel) memset(mw->sel, 0, mw->sel_cap * sizeof(gboolean));
+    mw->drag_mode = 0;
+    mw->drag_note = -1;
+    gtk_widget_queue_draw(mw->roll);
+    gtk_widget_queue_draw(mw->vel);
+    gtk_widget_queue_draw(mw->keys);
+    gtk_widget_queue_draw(mw->ruler);
+}
+
+static void mw_push_undo(MidiWindow *mw, const char *desc)
+{
+    if (!mw->project) return;
+    MidiUndoCtx *c = g_new0(MidiUndoCtx, 1);
+    c->track = mw->track; c->project = mw->project;
+    JackDawUndoAction a = {
+        .ctx         = c,
+        .saved_state = midi_clip_copy(jackdaw_track_get_midi_clip(mw->track)),
+        .capture_fn  = midi_undo_capture,
+        .restore_fn  = midi_undo_restore,
+        .free_fn     = midi_undo_free,
+        .after_fn    = midi_undo_after,
+        .ctx_free_fn = g_free,
+        .desc        = g_strdup(desc ? desc : "MIDI edit"),
+    };
+    undo_manager_push(jackdaw_project_get_undo(mw->project), &a);
+}
+
 /* Topmost note whose rect contains (x,y); -1 if none. */
 static int note_at(MidiWindow *mw, double x, double y, gboolean *on_edge)
 {
@@ -713,6 +782,8 @@ static void quantize_notes(MidiWindow *mw)
     int step = JACKDAW_PPQ / 4;          /* 1/16-note grid */
     guint nc = midi_clip_note_count(mw->clip);
     guint sc = sel_count(mw);
+    if (nc == 0) return;
+    mw_push_undo(mw, "Quantize");
     for (guint i = 0; i < nc; i++) {
         if (sc > 0 && !sel_is(mw, i)) continue;   /* selection-only when any selected */
         MidiNote *n = midi_clip_note(mw->clip, i);
@@ -728,6 +799,7 @@ static void mw_ctx_delete_note(GtkMenuItem *item, gpointer data)
     (void)item;
     MidiWindow *mw = data;
     if (sel_count(mw) > 0) {              /* delete every highlighted note */
+        mw_push_undo(mw, "Delete notes");
         guint nc = midi_clip_note_count(mw->clip);
         for (int i = (int)nc - 1; i >= 0; i--)   /* high→low keeps indices valid */
             if (sel_is(mw, (guint)i))
@@ -738,6 +810,7 @@ static void mw_ctx_delete_note(GtkMenuItem *item, gpointer data)
         return;
     }
     if (mw->ctx_note_idx >= 0) {
+        mw_push_undo(mw, "Delete note");
         midi_clip_remove_note(mw->clip, (guint)mw->ctx_note_idx);
         mw->ctx_note_idx = -1;
         mw_commit(mw);
@@ -792,6 +865,7 @@ static void mw_ctx_paste(GtkMenuItem *item, gpointer data)
                 ? mw->play_tick : gtk_adjustment_get_value(mw->h_adj);
     guint32 origin = snap_tick(mw, base);    /* snaps to grid when Snap is on */
 
+    mw_push_undo(mw, "Paste notes");
     sel_clear(mw);
     for (guint i = 0; i < mw->clip_count; i++) {
         MidiNote n = mw->clip_notes[i];
@@ -892,6 +966,7 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
      * rather than creating notes. */
     if (sel_count(mw) > 0) {
         if (idx >= 0 && sel_is(mw, (guint)idx)) {   /* grab the group → move it */
+            mw_push_undo(mw, "Move notes");
             grp_capture(mw);
             mw->drag_mode = 4;
             mw->drag_note = idx;
@@ -903,6 +978,7 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
         return TRUE;
     }
 
+    mw_push_undo(mw, "Edit note");
     if (idx < 0) {                        /* empty: add a note */
         MidiNote n;
         n.start    = snap_tick(mw, x_to_tick(mw, e->x));
@@ -1046,6 +1122,7 @@ static gboolean vel_press(GtkWidget *w, GdkEventButton *e, gpointer data)
     if (e->button != 1) return TRUE;
     int idx = vel_note_at_x(mw, e->x);
     if (idx >= 0) {
+        mw_push_undo(mw, "Velocity");
         mw->drag_mode = 3;
         mw->drag_note = idx;
         grp_capture(mw);            /* snapshot originals for relative group edit */
@@ -1308,6 +1385,18 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
     case GDK_KEY_v:
     case GDK_KEY_V:
         if (e->state & GDK_CONTROL_MASK) { mw_ctx_paste(NULL, mw); return TRUE; }
+        break;
+    case GDK_KEY_z:
+    case GDK_KEY_Z:
+        if (e->state & GDK_CONTROL_MASK) {
+            jackdaw_project_undo(mw->project); return TRUE;
+        }
+        break;
+    case GDK_KEY_y:
+    case GDK_KEY_Y:
+        if (e->state & GDK_CONTROL_MASK) {
+            jackdaw_project_redo(mw->project); return TRUE;
+        }
         break;
     case GDK_KEY_Escape:
         sel_clear(mw);

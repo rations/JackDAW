@@ -165,6 +165,12 @@ gboolean         jackdaw_track_is_instrument(JackDawTrack *t);
  * jackdaw_track_commit_midi() to republish the RT event snapshot. */
 MidiClip    *jackdaw_track_get_midi_clip(JackDawTrack *t);
 
+/* Replace the track's MIDI clip wholesale (consumes `clip`; frees the old one)
+ * and republish the RT event snapshot via the atomic swap. Used by undo to
+ * restore a captured clip. frames_per_beat as for jackdaw_track_commit_midi. */
+void         jackdaw_track_set_midi_clip(JackDawTrack *t, MidiClip *clip,
+                                         double frames_per_beat);
+
 /* Rebuild + publish the immutable RT MIDI event snapshot from midi_clip.
  * frames_per_beat = sample_rate * 60 / bpm (caller computes via the project).
  * Emits state-changed so timeline previews redraw. */

@@ -148,11 +148,6 @@ struct _JackDawTimeline {
      * the playhead on the right-clicked track. */
     GPtrArray        *clipboard;
 
-    /* Per-track region-edit undo/redo stacks (GHashTable track→GQueue of
-     * GPtrArray* region-list snapshots). */
-    GHashTable       *undo_stacks;
-    GHashTable       *redo_stacks;
-
     GtkWidget        *hscroll;     /* horizontal scrollbar bound to time_adj */
 
     /* Keeps ruler spacer and all track strips at the same width automatically */

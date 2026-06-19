@@ -3,6 +3,7 @@
 
 #include <glib-object.h>
 #include "track.h"
+#include "undo.h"
 
 G_BEGIN_DECLS
 
@@ -26,6 +27,10 @@ struct _JackDawProject {
 
     GPtrArray   *tracks;          /* array of JackDawTrack* (strong refs) */
     GPtrArray   *sel_tracks;      /* multi-selection: borrowed JackDawTrack* */
+    JackDawTrack *active_track;   /* primary/active track (borrowed, weak): the
+                                   * single target for undo/paste/keyboard ops.
+                                   * Always a member of sel_tracks, or NULL. */
+    JackDawUndoManager *undo;     /* global undo/redo history (owned) */
     gchar       *project_file;    /* NULL if unsaved */
 
     gfloat       master_volume;
@@ -61,6 +66,7 @@ struct _JackDawProjectClass {
     void (*ports_changed)(JackDawProject *project);
     void (*timing_changed)(JackDawProject *project);
     void (*selection_changed)(JackDawProject *project);
+    void (*tracks_reordered)(JackDawProject *project);
 };
 
 GType          jackdaw_project_get_type(void);
@@ -78,6 +84,21 @@ gint          jackdaw_project_track_index (JackDawProject *p, JackDawTrack *t);
  * this only changes display + save order. */
 void          jackdaw_project_move_track  (JackDawProject *p, guint from, guint to);
 
+/* Emit "tracks-reordered" so views resync their row order to the array order. */
+void          jackdaw_project_emit_tracks_reordered(JackDawProject *p);
+
+/* Capture the current track list as an undo checkpoint. Call BEFORE a
+ * structural change (add/delete/reorder) so a single Ctrl+Z restores the whole
+ * list — including a deleted track (kept alive on the undo stack) at its
+ * original position. `desc` is a short label (may be NULL). */
+void          jackdaw_project_push_structural_undo(JackDawProject *p,
+                                                   const char *desc);
+
+/* Delete a track with full undo: pushes a structural checkpoint, then removes
+ * the track from the engine and the project. Undo brings it back intact. The
+ * single entry point used by every "Delete Track" menu. */
+void          jackdaw_project_delete_track(JackDawProject *p, JackDawTrack *t);
+
 /* ---- Track multi-selection (for render "selected tracks") ----
  * A set of tracks the user has marked on the track strips, distinct from the
  * timeline's keyboard focus. Emits "selection-changed" on every change. The
@@ -87,6 +108,20 @@ void       jackdaw_project_select_single  (JackDawProject *p, JackDawTrack *t);
 void       jackdaw_project_toggle_selected(JackDawProject *p, JackDawTrack *t);
 gboolean   jackdaw_project_is_selected    (JackDawProject *p, JackDawTrack *t);
 void       jackdaw_project_clear_selection(JackDawProject *p);
+
+/* The single active/primary track (the undo/paste/keyboard target). It is kept
+ * in sync with the selection: select_single makes its track active; toggling
+ * the active track off picks another selected track (or NULL). Setting it
+ * also adds the track to the selection. May return NULL. */
+JackDawTrack *jackdaw_project_get_active_track(JackDawProject *p);
+void          jackdaw_project_set_active_track(JackDawProject *p, JackDawTrack *t);
+
+/* ---- Global undo/redo ----
+ * One chronological history for the whole project (region edits, track
+ * add/delete, MIDI edits). All windows route Ctrl+Z/Ctrl+Y here. */
+JackDawUndoManager *jackdaw_project_get_undo(JackDawProject *p);
+void                jackdaw_project_undo(JackDawProject *p);
+void                jackdaw_project_redo(JackDawProject *p);
 
 /* Master volume */
 void   jackdaw_project_set_master_volume(JackDawProject *p, gfloat vol);
