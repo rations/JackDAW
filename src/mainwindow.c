@@ -132,6 +132,27 @@ static void mw_apply_theme(gboolean dark)
     g_free(css);
 }
 
+/* Refresh the window title from the project's current save state: the project
+ * name (file basename without .jdaw) when saved, else "untitled". Call after
+ * new/open/save so the title tracks the project. */
+static void mw_update_title(JackDawMainWindow *win)
+{
+    const gchar *cur = jackdaw_project_get_file(win->project);
+    gchar *name;
+    if (cur) {
+        gchar *base = g_path_get_basename(cur);
+        if (g_str_has_suffix(base, ".jdaw"))
+            base[strlen(base) - 5] = '\0';
+        name = base;
+    } else {
+        name = g_strdup("untitled");
+    }
+    gchar *title = g_strdup_printf("%s — JackDAW " VERSION, name);
+    gtk_window_set_title(GTK_WINDOW(win), title);
+    g_free(title);
+    g_free(name);
+}
+
 /* ---- File menu ---- */
 
 static void mw_new_project_cb(GtkMenuItem *item, gpointer data)
@@ -149,6 +170,7 @@ static void mw_new_project_cb(GtkMenuItem *item, gpointer data)
     }
     win->track_counter = 0;
     jackdaw_project_set_file(win->project, NULL);
+    mw_update_title(win);
 }
 
 static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
@@ -230,6 +252,8 @@ static void mw_save_as_project_cb(GtkMenuItem *item, gpointer data)
         if (path) {
             if (jackdaw_project_save(win->project, path))   /* TRUE = failure */
                 user_error("Could not save project.");
+            else
+                mw_update_title(win);
             g_free(path);
         }
     }
@@ -291,8 +315,10 @@ static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
         if (path) {
             if (jackdaw_project_load(win->project, path))   /* TRUE = failure */
                 user_error("Could not open project.");
-            else
+            else {
                 win->track_counter = jackdaw_project_track_count(win->project);
+                mw_update_title(win);
+            }
             g_free(path);
         }
     }
@@ -1246,7 +1272,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
 
     win->project = g_object_ref(project);
 
-    gtk_window_set_title(GTK_WINDOW(win), "JackDAW 0.1.0");
+    mw_update_title(win);
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 700);
 
     /* Transport/track state colours + light-or-dark chrome. Applies the
