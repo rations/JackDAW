@@ -144,6 +144,7 @@ struct Vst3Editor {
     HostPlugFrame  *frame   = nullptr;
     GtkWidget      *widget  = nullptr;   /* GtkDrawingArea: the X11 embed parent */
     gulong          map_id = 0, unrealize_id = 0, alloc_id = 0;
+    guint           view_retry_id = 0;   /* poll until the X window is viewable */
     bool            attached = false;
     int             last_w = 0, last_h = 0;   /* last size pushed to view->onSize */
 };
@@ -486,26 +487,34 @@ static void vst3_push_size(Vst3Editor *ed, int w, int h)
     ed->view->onSize(&r);
 }
 
-/* GTK gave the embed widget a new allocation — forward it to the view. */
-static void vst3_on_size_allocate(GtkWidget *w, GdkRectangle *a, gpointer data)
-{
-    (void)w;
-    Vst3Editor *ed = (Vst3Editor *)data;
-    if (a) vst3_push_size(ed, a->width, a->height);
-}
+/* Attach the IPlugView, but only once the GtkDrawingArea is genuinely viewable:
+ * MAPPED (on-screen) AND given a real, non-degenerate allocation. X11 XEmbed
+ * reparenting needs the parent window mapped; and a Wine-bridged view attached
+ * against a still-1x1 parent (a freshly built FX window can fire "map" before
+ * layout settles) comes up clipped and never receives the XEmbed activation —
+ * it paints once and then sits frozen with no cursor. Gating on a real allocation
+ * makes the attach independent of map/allocation timing (it was that timing the
+ * global undo/redo + drag-section work perturbed). The `attached` guard keeps it
+ * one-shot, so the repeated "map" of a GtkStack tab switch is a no-op. */
+static gboolean vst3_view_retry_cb(gpointer data);
 
-/* Attach once the GtkDrawingArea is MAPPED (on-screen), not merely realized.
- * X11 XEmbed reparenting needs the parent window mapped; embedding into a window
- * that exists but isn't shown yet stalls Wine-bridged editors (the freeze seen
- * when a plug-in is restored from a saved project, where the FX window is built
- * fresh and children realize before the toplevel is mapped). The `attached`
- * guard makes the repeated "map" of a GtkStack tab switch a no-op. */
-static void vst3_on_map(GtkWidget *w, gpointer data)
+static void vst3_try_attach(Vst3Editor *ed, GtkWidget *w)
 {
-    Vst3Editor *ed = (Vst3Editor *)data;
     if (!ed->view || ed->attached) return;
+    if (!gtk_widget_get_mapped(w)) return;
+    GtkAllocation a; gtk_widget_get_allocation(w, &a);
+    if (a.width <= 1 || a.height <= 1) return;   /* layout not settled yet */
     GdkWindow *gw = gtk_widget_get_window(w);
     if (!gw) return;
+    /* XEmbed only activates once the whole ancestor chain is mapped (viewable);
+     * no GTK signal reports an ancestor becoming viewable, so poll until it does.
+     * Attaching into a non-viewable window leaves a bridged child frozen with no
+     * cursor — the after-load regression. */
+    if (!gdk_window_is_viewable(gw)) {
+        if (!ed->view_retry_id)
+            ed->view_retry_id = g_timeout_add(16, vst3_view_retry_cb, ed);
+        return;
+    }
     Window xid = gdk_x11_window_get_xid(gw);
 
     ed->view->setFrame(ed->frame);
@@ -515,11 +524,34 @@ static void vst3_on_map(GtkWidget *w, gpointer data)
         ViewRect r;
         if (ed->view->getSize(&r) == kResultOk && r.getWidth() > 0)
             gtk_widget_set_size_request(w, r.getWidth(), r.getHeight());
-        /* Sync the view to whatever GTK has actually allocated us right now, so
-         * the editor's render surface is correct from the first frame. */
-        GtkAllocation a; gtk_widget_get_allocation(w, &a);
+        /* Sync the view to the allocation we actually have, so the editor's
+         * render surface is correct from the first frame. */
         vst3_push_size(ed, a.width, a.height);
     }
+}
+
+/* GTK gave the embed widget an allocation. Attach now if "map" fired too early
+ * (degenerate 1x1 size); once attached, forward the new size to the view. */
+static void vst3_on_size_allocate(GtkWidget *w, GdkRectangle *a, gpointer data)
+{
+    Vst3Editor *ed = (Vst3Editor *)data;
+    if (!ed->attached) { vst3_try_attach(ed, w); return; }
+    if (a) vst3_push_size(ed, a->width, a->height);
+}
+
+/* Poll for the embed window to become viewable (ancestors mapped), then attach. */
+static gboolean vst3_view_retry_cb(gpointer data)
+{
+    Vst3Editor *ed = (Vst3Editor *)data;
+    if (ed->attached) { ed->view_retry_id = 0; return G_SOURCE_REMOVE; }
+    vst3_try_attach(ed, ed->widget);
+    if (ed->attached) { ed->view_retry_id = 0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;          /* keep waiting for viewability */
+}
+
+static void vst3_on_map(GtkWidget *w, gpointer data)
+{
+    vst3_try_attach((Vst3Editor *)data, w);
 }
 
 /* The window is going away (e.g. switching tabs never unrealizes a GtkStack
@@ -529,6 +561,7 @@ static void vst3_on_unrealize(GtkWidget *w, gpointer data)
 {
     (void)w;
     Vst3Editor *ed = (Vst3Editor *)data;
+    if (ed->view_retry_id) { g_source_remove(ed->view_retry_id); ed->view_retry_id = 0; }
     if (ed->view && ed->attached) { ed->view->removed(); ed->attached = false; }
 }
 
@@ -572,6 +605,8 @@ static void vst3_destroy_gui(PluginInstance *pi)
     Vst3Backend *b = (Vst3Backend *)pi->backend;
     if (!b || !b->editor) return;
     Vst3Editor *ed = b->editor;
+
+    if (ed->view_retry_id) { g_source_remove(ed->view_retry_id); ed->view_retry_id = 0; }
 
     /* Stop our handlers firing during the gtk_widget_destroy the host does next. */
     if (ed->widget) {

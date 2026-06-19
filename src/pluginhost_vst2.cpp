@@ -105,8 +105,9 @@ typedef struct {
 
     /* Native editor (effEditOpen into our X11 window), mirrors the VST3 path. */
     GtkWidget *gui;            /* GtkDrawingArea with its own X11 window */
-    gulong     map_id, unrealize_id;
+    gulong     map_id, unrealize_id, alloc_id;
     guint      idle_id;        /* effEditIdle pump */
+    guint      view_retry_id;  /* poll until the X window is viewable */
     gboolean   editor_open;
 } Vst2Backend;
 
@@ -339,18 +340,36 @@ static gboolean vst2_idle_cb(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-/* Attach once the drawing area is MAPPED (on-screen), not merely realized: the
- * yabridge XEmbed bridge reparents the Windows UI into our window, which X11
- * only completes for a mapped parent. Embedding at "realize" (window exists but
- * not yet shown — the case when restoring a plug-in into a freshly built FX
- * window) leaves the bridged editor frozen. The editor_open guard makes the
- * repeated "map" of a GtkStack tab switch a no-op. */
-static void vst2_on_map(GtkWidget *w, gpointer data)
+/* Embed the plug-in editor, but only once the drawing area is genuinely viewable:
+ * MAPPED (on-screen) AND given a real, non-degenerate allocation. The yabridge
+ * XEmbed bridge reparents the Windows UI into our window, which X11 only completes
+ * for a mapped parent — and if that parent is still sized 1x1 (a freshly built FX
+ * window can fire "map" before layout settles), the bridged child is created
+ * clipped and never receives the XEmbed activation: it paints once and then sits
+ * frozen with no cursor. Gating on a real allocation makes the attach independent
+ * of map/allocation timing (it was that timing the global undo/redo + drag-section
+ * work perturbed). The editor_open guard keeps it one-shot, so the repeated "map"
+ * of a GtkStack tab switch — and the stream of "size-allocate"s — stay no-ops. */
+static gboolean vst2_view_retry_cb(gpointer data);
+
+static void vst2_try_open_editor(Vst2Backend *b, GtkWidget *w)
 {
-    Vst2Backend *b = (Vst2Backend *)data;
-    if (b->editor_open) return;
+    if (b->editor_open || !b->eff) return;
+    if (!gtk_widget_get_mapped(w)) return;
+    GtkAllocation a; gtk_widget_get_allocation(w, &a);
+    if (a.width <= 1 || a.height <= 1) return;   /* layout not settled yet */
     GdkWindow *gw = gtk_widget_get_window(w);
     if (!gw) return;
+    /* The widget's own X window is mapped, but XEmbed only activates when the
+     * whole ancestor chain is too (viewable). No GTK signal fires when an
+     * ancestor becomes viewable, so poll briefly until it does — otherwise the
+     * bridged child reparents into a non-viewable window and sits frozen with
+     * no cursor (the after-load case the regression exposed). */
+    if (!gdk_window_is_viewable(gw)) {
+        if (!b->view_retry_id)
+            b->view_retry_id = g_timeout_add(16, vst2_view_retry_cb, b);
+        return;
+    }
     Window xid = gdk_x11_window_get_xid(gw);
     if (b->eff->dispatcher(b->eff, EFF_EDIT_OPEN, 0, 0,
                            (void *)(uintptr_t)xid, 0.0f)) {
@@ -361,8 +380,34 @@ static void vst2_on_map(GtkWidget *w, gpointer data)
     if (!b->idle_id) b->idle_id = g_timeout_add(40, vst2_idle_cb, b);
 }
 
+/* Poll for the embed window to become viewable (ancestors mapped), then open. */
+static gboolean vst2_view_retry_cb(gpointer data)
+{
+    Vst2Backend *b = (Vst2Backend *)data;
+    if (b->editor_open) { b->view_retry_id = 0; return G_SOURCE_REMOVE; }
+    vst2_try_open_editor(b, b->gui);
+    if (b->editor_open) { b->view_retry_id = 0; return G_SOURCE_REMOVE; }
+    return G_SOURCE_CONTINUE;          /* keep waiting for viewability */
+}
+
+static void vst2_on_map(GtkWidget *w, gpointer data)
+{
+    vst2_try_open_editor((Vst2Backend *)data, w);
+}
+
+/* GTK gave the embed widget an allocation. If "map" fired too early (degenerate
+ * 1x1 size), this is where we finally open the editor against a real window; once
+ * open, re-assert the plug-in's reported size so the FX window keeps fitting it. */
+static void vst2_on_size_allocate(GtkWidget *w, GdkRectangle *a, gpointer data)
+{
+    Vst2Backend *b = (Vst2Backend *)data;
+    if (!b->editor_open) { vst2_try_open_editor(b, w); return; }
+    if (a && a->width > 1 && a->height > 1) vst2_apply_rect(b);
+}
+
 static void vst2_close_editor(Vst2Backend *b)
 {
+    if (b->view_retry_id) { g_source_remove(b->view_retry_id); b->view_retry_id = 0; }
     if (b->idle_id) { g_source_remove(b->idle_id); b->idle_id = 0; }
     if (b->editor_open && b->eff)
         b->eff->dispatcher(b->eff, EFF_EDIT_CLOSE, 0, 0, NULL, 0.0f);
@@ -391,6 +436,8 @@ static GtkWidget *vst2_make_gui(PluginInstance *pi)
                                        G_CALLBACK(vst2_on_map), b);
     b->unrealize_id = g_signal_connect(b->gui, "unrealize",
                                        G_CALLBACK(vst2_on_unrealize), b);
+    b->alloc_id     = g_signal_connect(b->gui, "size-allocate",
+                                       G_CALLBACK(vst2_on_size_allocate), b);
     return b->gui;
 }
 
@@ -400,7 +447,8 @@ static void vst2_destroy_gui(PluginInstance *pi)
     if (!b || !b->gui) return;
     if (b->map_id)       g_signal_handler_disconnect(b->gui, b->map_id);
     if (b->unrealize_id) g_signal_handler_disconnect(b->gui, b->unrealize_id);
-    b->map_id = b->unrealize_id = 0;
+    if (b->alloc_id)     g_signal_handler_disconnect(b->gui, b->alloc_id);
+    b->map_id = b->unrealize_id = b->alloc_id = 0;
     vst2_close_editor(b);
     b->gui = NULL;                    /* the host destroys the widget itself */
 }
