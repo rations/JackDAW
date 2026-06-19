@@ -240,6 +240,13 @@ static gpointer render_offline_thread(gpointer data)
         g_free(ctx);
         return NULL;
     }
+    /* Clip out-of-range floats to [-1,1] on write. The internal mix is float and
+     * may legitimately exceed 0 dBFS (plugin output is clamped to +-4, hot amp
+     * sims push past unity); integer PCM (WAV/FLAC) would otherwise WRAP those
+     * samples into full-scale digital noise. (MP3's float encoder tolerates them,
+     * which is why only the PCM formats sound corrupted.) Matches Reaper's
+     * render-to-int behaviour. */
+    sf_command(sf, SFC_SET_CLIPPING, NULL, SF_TRUE);
 
     guint ntr = jackdaw_project_track_count(proj);
 
@@ -563,6 +570,9 @@ gboolean jackdaw_render_realtime_start(const RenderOptions *o,
         g_free(c);
         return TRUE;
     }
+    /* Clip out-of-range floats on write so a hot mix doesn't wrap to digital
+     * noise in integer PCM (WAV/FLAC). See the offline path for the rationale. */
+    sf_command(c->sf, SFC_SET_CLIPPING, NULL, SF_TRUE);
 
     c->rd_cap  = RENDER_BLOCK_MAX;
     double rat = (double)c->render_sr / c->engine_sr;
