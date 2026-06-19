@@ -99,6 +99,12 @@ typedef struct {
     float *click_buf;
     int    click_len;
 
+    /* Dedicated mono metronome output port ("metronome"). The click is always
+     * mirrored here so it can be routed to a performer's headphones independently
+     * of the main mix; whether it ALSO reaches the main outs is set per-project
+     * (metronome_route). Never part of the master sum, meters, or render tap. */
+    jack_port_t *metro_out;
+
     /* Post-master-fader peak meter (master VU). Racy read is acceptable. */
     volatile gfloat master_peak_L;
     volatile gfloat master_peak_R;
@@ -1117,6 +1123,10 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             jack_midi_clear_buffer(
                 jack_port_get_buffer(engine.midi_out[i], nframes));
         }
+        if (engine.metro_out) {
+            port_buf = jack_port_get_buffer(engine.metro_out, nframes);
+            memset(port_buf, 0, nframes * sizeof(float));
+        }
         ph_rt_mark(0);
         return 0;
     }
@@ -1268,32 +1278,6 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
 
 
-    /* Metronome click — mixed into the master before the master fader. */
-    if ((flags & ENGINE_PLAYING) && engine.project &&
-        engine.project->metronome_enabled && engine.click_buf &&
-        engine.click_len > 0 && engine.project->bpm > 0.0) {
-        double fpb = (double)engine.sample_rate * 60.0 / engine.project->bpm;
-        guint  bpb = engine.project->beats_per_bar
-                     ? engine.project->beats_per_bar : 4;
-        float  click_gain = engine.project->metronome_gain;
-        if (fpb > 1.0) {
-            off_t base = engine.play_pos - (off_t)nframes;
-            for (k = 0; k < nframes; k++) {
-                off_t a = base + (off_t)k;
-                if (a < 0) continue;
-                off_t beat     = (off_t)((double)a / fpb);
-                off_t boundary = (off_t)((double)beat * fpb + 0.5);
-                off_t off      = a - boundary;
-                if (off >= 0 && off < engine.click_len) {
-                    float s = engine.click_buf[off] * click_gain;
-                    if ((beat % (off_t)bpb) != 0) s *= 0.45f; /* accent downbeat */
-                    engine.master_L[k] += s;
-                    engine.master_R[k] += s;
-                }
-            }
-        }
-    }
-
     /* Master bus track: run its FX chain in place on the summed mix, then take
      * the master gain (and mute) from the master track. Audio track, so the
      * whole chain is effects (no instrument at index 0). */
@@ -1363,6 +1347,59 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         }
         if (engine.play_pos >= engine.render_end)
             g_atomic_int_set(&engine.render_done, 1);
+    }
+
+    /* Metronome click — monitored by mixing straight onto the audio outputs,
+     * AFTER the master fader, the master FX chain, the master peak meter and the
+     * render tap. The click is therefore audible but completely separate from
+     * the project signal: it cannot raise the master meters, it never passes
+     * through the master FX chain, and it is excluded from rendered/exported
+     * files. The click is also independent of the master volume/mute.
+     *
+     * The dedicated "metronome" port always carries the click (a standalone feed
+     * the user can route to a performer's headphones). metronome_route decides
+     * whether the click ALSO bleeds into the main outs (MAIN) or stays on the
+     * dedicated port only (CLICK_PORT = "headphones only"). The metro port is
+     * cleared every cycle so it never plays stale buffer contents. */
+    {
+        float *metro_buf = engine.metro_out
+            ? (float *)jack_port_get_buffer(engine.metro_out, nframes) : NULL;
+        if (metro_buf) memset(metro_buf, 0, nframes * sizeof(float));
+
+        if ((flags & ENGINE_PLAYING) && engine.project &&
+            engine.project->metronome_enabled && engine.click_buf &&
+            engine.click_len > 0 && engine.project->bpm > 0.0) {
+            gboolean to_main =
+                engine.project->metronome_route == METRONOME_ROUTE_MAIN;
+            double fpb = (double)engine.sample_rate * 60.0 / engine.project->bpm;
+            guint  bpb = engine.project->beats_per_bar
+                         ? engine.project->beats_per_bar : 4;
+            float  click_gain = engine.project->metronome_gain;
+            if (fpb > 1.0) {
+                off_t  base = engine.play_pos - (off_t)nframes;
+                float *out_buf[2] = { NULL, NULL };
+                if (to_main) {
+                    for (oi = 0; oi < engine.audio_out_count && oi < 2; oi++)
+                        if (engine.audio_out[oi])
+                            out_buf[oi] = jack_port_get_buffer(
+                                engine.audio_out[oi], nframes);
+                }
+                for (k = 0; k < nframes; k++) {
+                    off_t a = base + (off_t)k;
+                    if (a < 0) continue;
+                    off_t beat     = (off_t)((double)a / fpb);
+                    off_t boundary = (off_t)((double)beat * fpb + 0.5);
+                    off_t off      = a - boundary;
+                    if (off >= 0 && off < engine.click_len) {
+                        float s = engine.click_buf[off] * click_gain;
+                        if ((beat % (off_t)bpb) != 0) s *= 0.45f; /* accent downbeat */
+                        if (metro_buf)  metro_buf[k]  += s;
+                        if (out_buf[0]) out_buf[0][k] += s;
+                        if (out_buf[1]) out_buf[1][k] += s;
+                    }
+                }
+            }
+        }
     }
 
     /* Clear all MIDI output buffers before any writes */
@@ -1783,6 +1820,12 @@ gboolean jackdaw_engine_init(JackDawProject *project)
             JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
         if (!engine.audio_out[i]) goto fail;
     }
+
+    /* Dedicated metronome output (mono). Routed by the user (e.g. to a
+     * performer's headphone bus) via the patchbay; not auto-connected. */
+    engine.metro_out = jack_port_register(engine.client, "metronome",
+        JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+    if (!engine.metro_out) goto fail;
 
     /* Preview-note queue (main thread -> RT). Sized for many in-flight clicks. */
     eng_preview_rb = jack_ringbuffer_create(256 * sizeof(EngPrevMsg));

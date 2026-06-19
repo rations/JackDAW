@@ -22,6 +22,13 @@ typedef enum {
     JACKDAW_RULER_BARS        /* bars.beats from BPM + time signature */
 } JackDawRulerMode;
 
+/* Metronome routing: where the click is heard. The dedicated "metronome" JACK
+ * output always carries the click; this only controls the main outs. */
+typedef enum {
+    METRONOME_ROUTE_MAIN = 0,    /* click on main outs + dedicated metro port */
+    METRONOME_ROUTE_CLICK_PORT   /* "headphones only": dedicated metro port only */
+} JackDawMetronomeRoute;
+
 struct _JackDawProject {
     GObject parent_instance;
 
@@ -55,6 +62,7 @@ struct _JackDawProject {
     gdouble          metronome_volume_db; /* user-set, -25..+25 dB (0 = unity) */
     gfloat           metronome_gain;      /* linear gain derived from the dB,
                                            * read by the RT process callback */
+    gint             metronome_route;     /* JackDawMetronomeRoute; read by RT */
     JackDawRulerMode ruler_mode;
 };
 
@@ -161,6 +169,10 @@ void     jackdaw_project_set_metronome    (JackDawProject *p, gboolean on);
  * read by the engine and persists the setting globally. */
 void     jackdaw_project_set_metronome_volume(JackDawProject *p, gdouble db);
 gdouble  jackdaw_project_get_metronome_volume(JackDawProject *p);
+/* Metronome routing (main outs vs. dedicated click port only). */
+void     jackdaw_project_set_metronome_route(JackDawProject *p,
+                                             JackDawMetronomeRoute route);
+JackDawMetronomeRoute jackdaw_project_get_metronome_route(JackDawProject *p);
 void     jackdaw_project_set_ruler_mode   (JackDawProject *p, JackDawRulerMode m);
 void     jackdaw_project_emit_timing_changed(JackDawProject *p);
 

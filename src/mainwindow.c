@@ -818,17 +818,57 @@ static void mw_open_metronome_window(JackDawMainWindow *win)
     gtk_window_present(GTK_WINDOW(win->metro_window));
 }
 
-/* Right-click on the Metro toolbar button opens the settings window. */
+/* Metro right-click menu: "Volume…" opens the slider window. */
+static void mw_metro_volume_item_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    mw_open_metronome_window(JACKDAW_MAIN_WINDOW(data));
+}
+
+/* Metro right-click menu: "Headphones only" toggles the routing mode. When on,
+ * the click is emitted only on the dedicated "metronome" JACK port; when off it
+ * is also mixed onto the main outputs. */
+static void mw_metro_headphones_item_cb(GtkCheckMenuItem *m, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_metronome_route(
+        win->project,
+        gtk_check_menu_item_get_active(m) ? METRONOME_ROUTE_CLICK_PORT
+                                          : METRONOME_ROUTE_MAIN);
+}
+
+/* Right-click on the Metro toolbar button opens its options menu. New
+ * metronome features can be added here as additional menu items. */
 static gboolean mw_metro_button_press_cb(GtkWidget *w, GdkEventButton *ev,
                                          gpointer data)
 {
     (void)w;
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
-    if (ev->type == GDK_BUTTON_PRESS && ev->button == 3) {
-        mw_open_metronome_window(win);
-        return TRUE; /* don't toggle on right-click */
-    }
-    return FALSE;
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3) return FALSE;
+
+    GtkWidget *menu = gtk_menu_new();
+
+    GtkWidget *mi_vol = gtk_menu_item_new_with_label("Volume…");
+    g_signal_connect(mi_vol, "activate",
+                     G_CALLBACK(mw_metro_volume_item_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_vol);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu),
+                          gtk_separator_menu_item_new());
+
+    GtkWidget *mi_hp = gtk_check_menu_item_new_with_label(
+        "Headphones only (click output)");
+    gtk_check_menu_item_set_active(
+        GTK_CHECK_MENU_ITEM(mi_hp),
+        jackdaw_project_get_metronome_route(win->project)
+            == METRONOME_ROUTE_CLICK_PORT);
+    g_signal_connect(mi_hp, "toggled",
+                     G_CALLBACK(mw_metro_headphones_item_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_hp);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE; /* don't toggle on right-click */
 }
 
 static void mw_metro_menu_cb(GtkMenuItem *m, gpointer data)
@@ -1502,7 +1542,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
 
     GtkWidget *tg_metro = gtk_toggle_button_new_with_label("Metro");
     gtk_widget_set_tooltip_text(tg_metro,
-        "Toggle metronome  (right-click for settings)");
+        "Toggle metronome  (right-click for options)");
     g_signal_connect(tg_metro, "toggled", G_CALLBACK(mw_metro_toggled), win);
     g_signal_connect(tg_metro, "button-press-event",
                      G_CALLBACK(mw_metro_button_press_cb), win);
