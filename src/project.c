@@ -400,6 +400,16 @@ static void project_save_fx(GKeyFile *kf, JackDawTrack *t, const char *grp)
             g_key_file_set_double_list(kf, fg, "params", pv, pc);
             g_free(pv);
         }
+        /* Opaque plug-in state chunk (VST2/VST3/CLAP) — the authoritative full
+         * state the param list can't express (loaded IR/NAM/sample paths, modes,
+         * editor state). Base64'd into the key file. No-op for LV2/LADSPA. */
+        void *blob = NULL; gsize blen = 0;
+        if (pluginhost_state_save(inst, &blob, &blen) && blob && blen > 0) {
+            gchar *b64 = g_base64_encode((const guchar *)blob, blen);
+            g_key_file_set_string(kf, fg, "state", b64);
+            g_free(b64);
+        }
+        g_free(blob);
     }
 }
 
@@ -431,6 +441,19 @@ static void project_load_fx(GKeyFile *kf, JackDawTrack *t, const char *grp)
                 for (gsize pi = 0; pv && pi < pn && pi < pc; pi++)
                     pluginhost_param_set(inst, (guint)pi, (float)pv[pi]);
                 g_free(pv);
+                /* Opaque state chunk last: it's authoritative for VST2/VST3/CLAP
+                 * and overrides the params above (and syncs the native editor so
+                 * a reopened GUI shows the restored settings). Applied before the
+                 * instance joins the RT chain, so it's safe off the RT thread. */
+                gchar *b64 = g_key_file_get_string(kf, fg, "state", NULL);
+                if (b64 && b64[0]) {
+                    gsize blen = 0;
+                    guchar *blob = g_base64_decode(b64, &blen);
+                    if (blob && blen > 0)
+                        pluginhost_state_load(inst, blob, blen);
+                    g_free(blob);
+                }
+                g_free(b64);
                 jackdaw_track_fx_add(t, inst);
             }
         }

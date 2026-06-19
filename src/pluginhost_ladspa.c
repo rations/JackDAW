@@ -204,7 +204,8 @@ static void lad_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 static const PhOps lad_ops = {
     lad_process, NULL /*process_midi*/, lad_destroy, NULL, NULL,
     lad_param_count, lad_param_name, lad_param_get, lad_param_set, lad_param_range,
-    lad_reset
+    lad_reset,
+    NULL /*state_save*/, NULL /*state_load*/   /* params are LADSPA's full state */
 };
 
 /* ---- Instantiate ---- */

@@ -105,7 +105,7 @@ typedef struct {
 
     /* Native editor (effEditOpen into our X11 window), mirrors the VST3 path. */
     GtkWidget *gui;            /* GtkDrawingArea with its own X11 window */
-    gulong     realize_id, unrealize_id;
+    gulong     map_id, unrealize_id;
     guint      idle_id;        /* effEditIdle pump */
     gboolean   editor_open;
 } Vst2Backend;
@@ -289,6 +289,35 @@ static void vst2_param_set(PluginInstance *pi, guint i, float v)
 static void vst2_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; }  /* normalised */
 
+/* ---- Opaque state (project save/reload) ----
+ * Plug-ins that advertise effFlagsProgramChunks keep their full state in an
+ * opaque bank chunk (effGetChunk/effSetChunk), NOT in the parameter list — this
+ * is where loaded IR/sample/NAM paths and internal modes live. Without it a
+ * reloaded project only got the visible parameters back. isPreset=0 ⇒ the whole
+ * bank (entire plug-in state), which is what we want to round-trip. */
+static gboolean vst2_state_save(PluginInstance *pi, void **out, gsize *out_len)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (!b->eff || !(b->eff->flags & effFlagsProgramChunks)) return FALSE;
+    void *chunk = NULL;
+    intptr_t n = b->eff->dispatcher(b->eff, effGetChunk, 0 /*bank*/, 0,
+                                    &chunk, 0.0f);
+    if (n <= 0 || !chunk) return FALSE;
+    *out = g_memdup2(chunk, (gsize)n);   /* chunk is plug-in owned; copy it */
+    *out_len = (gsize)n;
+    return TRUE;
+}
+
+static gboolean vst2_state_load(PluginInstance *pi, const void *data, gsize len)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (!b->eff || !(b->eff->flags & effFlagsProgramChunks)) return FALSE;
+    /* effSetChunk's ptr is consumed synchronously; const-cast is safe. */
+    b->eff->dispatcher(b->eff, effSetChunk, 0 /*bank*/, (intptr_t)len,
+                       (void *)data, 0.0f);
+    return TRUE;
+}
+
 /* ---- Native editor (effEditOpen into a GTK X11 window) ---- */
 
 /* Apply the plug-in's reported editor size to our drawing area. */
@@ -310,9 +339,13 @@ static gboolean vst2_idle_cb(gpointer data)
     return G_SOURCE_CONTINUE;
 }
 
-/* Attach once the drawing area has a real X11 window. The plug-in (via the
- * yabridge XEmbed bridge for Windows VSTs) reparents its UI into our window. */
-static void vst2_on_realize(GtkWidget *w, gpointer data)
+/* Attach once the drawing area is MAPPED (on-screen), not merely realized: the
+ * yabridge XEmbed bridge reparents the Windows UI into our window, which X11
+ * only completes for a mapped parent. Embedding at "realize" (window exists but
+ * not yet shown — the case when restoring a plug-in into a freshly built FX
+ * window) leaves the bridged editor frozen. The editor_open guard makes the
+ * repeated "map" of a GtkStack tab switch a no-op. */
+static void vst2_on_map(GtkWidget *w, gpointer data)
 {
     Vst2Backend *b = (Vst2Backend *)data;
     if (b->editor_open) return;
@@ -354,8 +387,8 @@ static GtkWidget *vst2_make_gui(PluginInstance *pi)
     gtk_widget_set_vexpand(b->gui, TRUE);
     vst2_apply_rect(b);               /* seed a size so the FX window fits */
 
-    b->realize_id   = g_signal_connect(b->gui, "realize",
-                                       G_CALLBACK(vst2_on_realize), b);
+    b->map_id       = g_signal_connect(b->gui, "map",
+                                       G_CALLBACK(vst2_on_map), b);
     b->unrealize_id = g_signal_connect(b->gui, "unrealize",
                                        G_CALLBACK(vst2_on_unrealize), b);
     return b->gui;
@@ -365,9 +398,9 @@ static void vst2_destroy_gui(PluginInstance *pi)
 {
     Vst2Backend *b = (Vst2Backend *)pi->backend;
     if (!b || !b->gui) return;
-    if (b->realize_id)   g_signal_handler_disconnect(b->gui, b->realize_id);
+    if (b->map_id)       g_signal_handler_disconnect(b->gui, b->map_id);
     if (b->unrealize_id) g_signal_handler_disconnect(b->gui, b->unrealize_id);
-    b->realize_id = b->unrealize_id = 0;
+    b->map_id = b->unrealize_id = 0;
     vst2_close_editor(b);
     b->gui = NULL;                    /* the host destroys the widget itself */
 }
@@ -376,7 +409,8 @@ static const PhOps vst2_ops = {
     vst2_process, vst2_process_midi, vst2_destroy,
     vst2_make_gui, vst2_destroy_gui,
     vst2_param_count, vst2_param_name, vst2_param_get, vst2_param_set,
-    vst2_param_range, vst2_reset
+    vst2_param_range, vst2_reset,
+    vst2_state_save, vst2_state_load
 };
 
 /* ---- Instantiate ---- */

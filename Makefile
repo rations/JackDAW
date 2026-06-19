@@ -134,6 +134,7 @@ VST3_SDK_SRC := \
     $(VST3SDK)/base/source/baseiids.cpp \
     $(VST3SDK)/base/thread/source/flock.cpp \
     $(VST3SDK)/public.sdk/source/common/commonstringconvert.cpp \
+    $(VST3SDK)/public.sdk/source/common/memorystream.cpp \
     $(VST3SDK)/public.sdk/source/common/threadchecker_linux.cpp \
     $(VST3SDK)/public.sdk/source/vst/hosting/module.cpp \
     $(VST3SDK)/public.sdk/source/vst/hosting/module_linux.cpp \

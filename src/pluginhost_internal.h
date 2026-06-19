@@ -22,6 +22,15 @@ typedef struct {
     /* Optional: clear internal DSP state (reverb/delay buffers, synth voices)
      * without changing parameters. NULL if the backend offers no reset. */
     void        (*reset)      (PluginInstance *);
+    /* Optional: opaque full-state save/restore (the plug-in's own state chunk —
+     * VST3 IComponent/IEditController state, VST2 effGetChunk/effSetChunk, CLAP
+     * clap_plugin_state). This captures everything the generic param list cannot:
+     * loaded sample/IR/NAM file paths, internal modes, editor state. NULL for
+     * backends whose params already are the full state (LV2/LADSPA).
+     * state_save returns a newly g_malloc'd blob in *out (caller frees) with its
+     * length in *out_len; TRUE on success. state_load consumes such a blob. */
+    gboolean    (*state_save) (PluginInstance *, void **out, gsize *out_len);
+    gboolean    (*state_load) (PluginInstance *, const void *data, gsize len);
 } PhOps;
 
 struct PluginInstance {

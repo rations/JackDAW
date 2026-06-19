@@ -101,6 +101,19 @@ void            pluginhost_process_midi(PluginInstance *inst,
  * offers no reset. */
 void            pluginhost_reset(PluginInstance *inst);
 
+/* Opaque full-state save/restore for project save/reload. Captures the plug-in's
+ * own state chunk — everything the generic parameter list misses (loaded IR/NAM
+ * sample paths, internal modes, native-editor state) for VST2/VST3/CLAP. LV2 and
+ * LADSPA expose their full state as parameters, so these return FALSE for them.
+ * pluginhost_state_save: TRUE + a newly g_malloc'd blob in *out (caller g_free's)
+ * of *out_len bytes. pluginhost_state_load: apply such a blob (also syncs the
+ * native editor where applicable, so a reopened GUI reflects the restored state).
+ * Both main-thread only; safe before the instance is added to an RT chain. */
+gboolean        pluginhost_state_save(PluginInstance *inst,
+                                      void **out, gsize *out_len);
+gboolean        pluginhost_state_load(PluginInstance *inst,
+                                      const void *data, gsize len);
+
 /* --- Diagnostics (JACKDAW_DIAG) --- */
 /* Mark the calling thread as inside/outside the JACK RT process callback, so the
  * VST3 host context can detect plugins that allocate messages on the RT thread. */

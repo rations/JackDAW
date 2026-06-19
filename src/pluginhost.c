@@ -699,6 +699,22 @@ void pluginhost_reset(PluginInstance *inst)
         inst->ops->reset(inst);
 }
 
+gboolean pluginhost_state_save(PluginInstance *inst, void **out, gsize *out_len)
+{
+    if (out) *out = NULL;
+    if (out_len) *out_len = 0;
+    if (!inst || !inst->ops || !inst->ops->state_save || !out || !out_len)
+        return FALSE;
+    return inst->ops->state_save(inst, out, out_len);
+}
+
+gboolean pluginhost_state_load(PluginInstance *inst, const void *data, gsize len)
+{
+    if (!inst || !inst->ops || !inst->ops->state_load || !data || len == 0)
+        return FALSE;
+    return inst->ops->state_load(inst, data, len);
+}
+
 void pluginhost_set_active(PluginInstance *inst, gboolean on)
 {
     if (inst) g_atomic_int_set(&inst->active, on ? 1 : 0);

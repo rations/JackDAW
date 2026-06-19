@@ -29,6 +29,7 @@ typedef struct {
     const clap_plugin_entry_t  *entry;
     const clap_plugin_t        *plugin;
     const clap_plugin_params_t *params;
+    const clap_plugin_state_t  *state;
 
     clap_id  *param_ids;
     guint     n_params;
@@ -243,10 +244,58 @@ static void clap_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
     if (mx) *mx = 1.0f;
 }
 
+/* ---- Opaque state (project save/reload) ----
+ * CLAP plug-ins serialise their full state (including loaded files / modes the
+ * parameter list doesn't cover) through clap.state's stream callbacks. */
+typedef struct { GByteArray *ba; } ClapSaveCtx;
+static int64_t clap_ostream_write(const clap_ostream_t *s, const void *buf,
+                                  uint64_t size)
+{
+    ClapSaveCtx *c = (ClapSaveCtx *)s->ctx;
+    g_byte_array_append(c->ba, (const guint8 *)buf, (guint)size);
+    return (int64_t)size;
+}
+
+typedef struct { const guint8 *p; gsize len, pos; } ClapLoadCtx;
+static int64_t clap_istream_read(const clap_istream_t *s, void *buf,
+                                 uint64_t size)
+{
+    ClapLoadCtx *c = (ClapLoadCtx *)s->ctx;
+    gsize avail = c->len - c->pos;
+    gsize n = ((gsize)size < avail) ? (gsize)size : avail;
+    if (n) { memcpy(buf, c->p + c->pos, n); c->pos += n; }
+    return (int64_t)n;
+}
+
+static gboolean clap_state_save(PluginInstance *pi, void **out, gsize *out_len)
+{
+    ClapBackend *b = (ClapBackend *)pi->backend;
+    if (!b->state || !b->state->save) return FALSE;
+    ClapSaveCtx ctx = { g_byte_array_new() };
+    clap_ostream_t os = { &ctx, clap_ostream_write };
+    if (!b->state->save(b->plugin, &os)) {
+        g_byte_array_free(ctx.ba, TRUE);
+        return FALSE;
+    }
+    *out_len = ctx.ba->len;
+    *out = g_byte_array_free(ctx.ba, FALSE);   /* hand the buffer to the caller */
+    return TRUE;
+}
+
+static gboolean clap_state_load(PluginInstance *pi, const void *data, gsize len)
+{
+    ClapBackend *b = (ClapBackend *)pi->backend;
+    if (!b->state || !b->state->load) return FALSE;
+    ClapLoadCtx ctx = { (const guint8 *)data, len, 0 };
+    clap_istream_t is = { &ctx, clap_istream_read };
+    return b->state->load(b->plugin, &is) ? TRUE : FALSE;
+}
+
 static const PhOps clap_ops = {
     clap_process_cb, NULL /*process_midi*/, clap_destroy, NULL, NULL,
     clap_param_count, clap_param_name, clap_param_get, clap_param_set,
-    clap_param_range, clap_reset
+    clap_param_range, clap_reset,
+    clap_state_save, clap_state_load
 };
 
 /* ---- Instantiate ---- */
@@ -285,6 +334,8 @@ PluginInstance *ph_clap_instantiate(const PluginInfo *info, double sr, int max_b
     b->outL = g_new0(float, max_block);
     b->outR = g_new0(float, max_block);
 
+    b->state = (const clap_plugin_state_t *)
+        plugin->get_extension(plugin, CLAP_EXT_STATE);
     b->params = (const clap_plugin_params_t *)
         plugin->get_extension(plugin, CLAP_EXT_PARAMS);
     if (b->params) {

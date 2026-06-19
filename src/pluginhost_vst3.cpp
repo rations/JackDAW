@@ -11,6 +11,7 @@
 #include "public.sdk/source/vst/hosting/processdata.h"
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "public.sdk/source/vst/hosting/eventlist.h"
+#include "public.sdk/source/common/memorystream.h"
 #include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
@@ -142,8 +143,9 @@ struct Vst3Editor {
     IPtr<IPlugView> view;
     HostPlugFrame  *frame   = nullptr;
     GtkWidget      *widget  = nullptr;   /* GtkDrawingArea: the X11 embed parent */
-    gulong          realize_id = 0, unrealize_id = 0;
+    gulong          map_id = 0, unrealize_id = 0, alloc_id = 0;
     bool            attached = false;
+    int             last_w = 0, last_h = 0;   /* last size pushed to view->onSize */
 };
 
 struct Vst3Backend {
@@ -389,12 +391,116 @@ static void vst3_param_set(PluginInstance *pi, guint i, float v)
 static void vst3_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; } /* normalised */
 
+/* ---- Opaque state (project save/reload) ----
+ * The normalised parameter list does NOT capture a VST3 plug-in's full state:
+ * loaded sample/IR/NAM file paths, internal modes and any controller-private
+ * data live in the IComponent/IEditController state streams, not in parameters.
+ * Save both; the container is two little-endian length-prefixed blobs:
+ *   [int32 comp_len][comp bytes][int32 ctrl_len][ctrl bytes]. */
+static gboolean vst3_state_save(PluginInstance *pi, void **out, gsize *out_len)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b->component) return FALSE;
+
+    MemoryStream comp, ctrl;
+    if (b->component->getState(&comp) != kResultOk) return FALSE;
+    gboolean have_ctrl =
+        (b->controller && b->controller->getState(&ctrl) == kResultOk);
+
+    gint32 clen = (gint32)comp.getSize();
+    gint32 elen = have_ctrl ? (gint32)ctrl.getSize() : 0;
+    if (clen < 0 || elen < 0) return FALSE;
+
+    gsize total = 8 + (gsize)clen + (gsize)elen;
+    guint8 *buf = (guint8 *)g_malloc(total);
+    gint32 cle = GINT32_TO_LE(clen), ele = GINT32_TO_LE(elen);
+    memcpy(buf + 0, &cle, 4);
+    memcpy(buf + 4, &ele, 4);
+    if (clen > 0) memcpy(buf + 8, comp.getData(), (size_t)clen);
+    if (elen > 0) memcpy(buf + 8 + clen, ctrl.getData(), (size_t)elen);
+
+    *out = buf;
+    *out_len = total;
+    return TRUE;
+}
+
+static gboolean vst3_state_load(PluginInstance *pi, const void *data, gsize len)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b->component || len < 8) return FALSE;
+
+    const guint8 *p = (const guint8 *)data;
+    gint32 clen, elen;
+    memcpy(&clen, p + 0, 4); clen = GINT32_FROM_LE(clen);
+    memcpy(&elen, p + 4, 4); elen = GINT32_FROM_LE(elen);
+    if (clen < 0 || elen < 0 || (gsize)8 + (gsize)clen + (gsize)elen > len)
+        return FALSE;
+
+    /* Restore the processor (component) state, then hand the SAME stream to the
+     * edit controller via setComponentState so a (re)opened editor reflects the
+     * restored values — this is the step missing before, which is why VST3 GUIs
+     * came back showing defaults. MemoryStream(mem,size) wraps our buffer
+     * read-only without taking ownership. */
+    if (clen > 0) {
+        MemoryStream cs((void *)(p + 8), clen);
+        b->component->setState(&cs);
+        cs.seek(0, IBStream::kIBSeekSet, nullptr);
+        if (b->controller) b->controller->setComponentState(&cs);
+    }
+    /* Controller-private state (editor zoom, etc.). */
+    if (elen > 0 && b->controller) {
+        MemoryStream es((void *)(p + 8 + clen), elen);
+        b->controller->setState(&es);
+    }
+
+    /* Mirror the restored normalised values into the RT parameter queue so the
+     * live processor matches the controller on the very next block (plug-ins
+     * that drive DSP from parameter changes, not from setState alone). */
+    if (b->controller) {
+        for (size_t i = 0; i < b->param_ids.size(); i++) {
+            ParamValue v = b->controller->getParamNormalized(b->param_ids[i]);
+            int32 idx = 0;
+            IParamValueQueue *q = b->in_params.addParameterData(b->param_ids[i], idx);
+            if (q) { int32 pidx = 0; q->addPoint(0, v, pidx); }
+        }
+    }
+    return TRUE;
+}
+
 /* ---- Native editor (IPlugView embedded in a GTK X11 window) ---- */
 
-/* Attach once the GtkDrawingArea has a real X11 window. The plug-in creates its
- * UI as a child of our window id; it talks to us back through the frame
- * (resize) and the run loop (its own X fd + timers). */
-static void vst3_on_realize(GtkWidget *w, gpointer data)
+/* Tell the plug-in view its real on-screen size. The host MUST do this whenever
+ * the embed window's size changes — GTK only changes OUR X window; the plug-in's
+ * child view (and, for GPU editors, its swap chain) won't follow unless we call
+ * onSize(). Skipping this is why a DXVK/Vulkan editor painted its restored state
+ * once and then froze: its render surface never matched the window. We let the
+ * plug-in clamp the rect to its own constraints first. */
+static void vst3_push_size(Vst3Editor *ed, int w, int h)
+{
+    if (!ed->view || !ed->attached || w <= 0 || h <= 0) return;
+    ViewRect r; r.left = 0; r.top = 0; r.right = w; r.bottom = h;
+    ed->view->checkSizeConstraint(&r);
+    if (r.getWidth() <= 0 || r.getHeight() <= 0) return;
+    if (r.getWidth() == ed->last_w && r.getHeight() == ed->last_h) return;
+    ed->last_w = r.getWidth(); ed->last_h = r.getHeight();
+    ed->view->onSize(&r);
+}
+
+/* GTK gave the embed widget a new allocation — forward it to the view. */
+static void vst3_on_size_allocate(GtkWidget *w, GdkRectangle *a, gpointer data)
+{
+    (void)w;
+    Vst3Editor *ed = (Vst3Editor *)data;
+    if (a) vst3_push_size(ed, a->width, a->height);
+}
+
+/* Attach once the GtkDrawingArea is MAPPED (on-screen), not merely realized.
+ * X11 XEmbed reparenting needs the parent window mapped; embedding into a window
+ * that exists but isn't shown yet stalls Wine-bridged editors (the freeze seen
+ * when a plug-in is restored from a saved project, where the FX window is built
+ * fresh and children realize before the toplevel is mapped). The `attached`
+ * guard makes the repeated "map" of a GtkStack tab switch a no-op. */
+static void vst3_on_map(GtkWidget *w, gpointer data)
 {
     Vst3Editor *ed = (Vst3Editor *)data;
     if (!ed->view || ed->attached) return;
@@ -409,6 +515,10 @@ static void vst3_on_realize(GtkWidget *w, gpointer data)
         ViewRect r;
         if (ed->view->getSize(&r) == kResultOk && r.getWidth() > 0)
             gtk_widget_set_size_request(w, r.getWidth(), r.getHeight());
+        /* Sync the view to whatever GTK has actually allocated us right now, so
+         * the editor's render surface is correct from the first frame. */
+        GtkAllocation a; gtk_widget_get_allocation(w, &a);
+        vst3_push_size(ed, a.width, a.height);
     }
 }
 
@@ -447,10 +557,12 @@ static GtkWidget *vst3_make_gui(PluginInstance *pi)
     if (view->getSize(&r) == kResultOk && r.getWidth() > 0)
         gtk_widget_set_size_request(ed->widget, r.getWidth(), r.getHeight());
 
-    ed->realize_id   = g_signal_connect(ed->widget, "realize",
-                                        G_CALLBACK(vst3_on_realize), ed);
+    ed->map_id       = g_signal_connect(ed->widget, "map",
+                                        G_CALLBACK(vst3_on_map), ed);
     ed->unrealize_id = g_signal_connect(ed->widget, "unrealize",
                                         G_CALLBACK(vst3_on_unrealize), ed);
+    ed->alloc_id     = g_signal_connect(ed->widget, "size-allocate",
+                                        G_CALLBACK(vst3_on_size_allocate), ed);
     b->editor = ed;
     return ed->widget;
 }
@@ -463,8 +575,9 @@ static void vst3_destroy_gui(PluginInstance *pi)
 
     /* Stop our handlers firing during the gtk_widget_destroy the host does next. */
     if (ed->widget) {
-        if (ed->realize_id)   g_signal_handler_disconnect(ed->widget, ed->realize_id);
+        if (ed->map_id)       g_signal_handler_disconnect(ed->widget, ed->map_id);
         if (ed->unrealize_id) g_signal_handler_disconnect(ed->widget, ed->unrealize_id);
+        if (ed->alloc_id)     g_signal_handler_disconnect(ed->widget, ed->alloc_id);
     }
     if (ed->view) {
         if (ed->attached) { ed->view->removed(); ed->attached = false; }
@@ -484,7 +597,8 @@ static const PhOps vst3_ops = {
     vst3_process, vst3_process_midi, vst3_destroy,
     vst3_make_gui, vst3_destroy_gui,
     vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
-    vst3_param_range, vst3_reset
+    vst3_param_range, vst3_reset,
+    vst3_state_save, vst3_state_load
 };
 
 /* ---- Instantiate ---- */
