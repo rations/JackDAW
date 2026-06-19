@@ -210,6 +210,91 @@ typedef struct {
     JackDawRenderProgress *prog;    /* borrowed (owned by the UI) */
 } OfflineCtx;
 
+/* Parallel per-track processing for one block. The offline render is non-RT, so
+ * unlike the live engine pool this uses a plain GThreadPool with a mutex/cond
+ * barrier (no SCHED_FIFO / no-malloc discipline needed). Tracks are independent
+ * — each touches only its own plugins, reader, scratch and MIDI buffer — so they
+ * fan out across cores; only the master sum + master chain stay serial. */
+typedef struct {
+    JackDawProject      *proj;
+    const RenderOptions *o;
+    EngTrackReader     **readers;
+    int                  engine_sr;
+    gboolean             any_soloed;
+    off_t                frame;        /* set per block */
+    jack_nframes_t       nn;           /* set per block */
+    float              **trkL, **trkR; /* per-track post-fader scratch */
+    PhMidiEvent        **mev;          /* per-track MIDI gather buffer */
+    gboolean            *active;       /* OUT: did track i contribute? */
+    GMutex               mtx;
+    GCond                cond;
+    gint                 remaining;    /* tasks left in the current block */
+} RenderPar;
+
+typedef struct { RenderPar *par; guint idx; } TrackJob;
+
+/* Process one track into par->trkL[i]/trkR[i], volume+pan applied. Sets
+ * active[i] FALSE if the track is gated out (muted / soloed-away / not selected
+ * / silent instrument), TRUE if it contributes. */
+static void render_process_one_track(RenderPar *par, guint i)
+{
+    JackDawTrack *t = jackdaw_project_get_track(par->proj, i);
+    par->active[i] = FALSE;
+
+    if (par->o->source == RENDER_SRC_SELECTED) {
+        if (!render_track_selected(par->o, t)) return;
+    } else {
+        gint fl = g_atomic_int_get(&t->state_flags);
+        if (fl & TRACK_MUTED) return;
+        if (par->any_soloed && !(fl & TRACK_SOLOED)) return;
+    }
+
+    jack_nframes_t  nn    = par->nn;
+    float          *tmpL  = par->trkL[i];
+    float          *tmpR  = par->trkR[i];
+    gboolean        instr = jackdaw_track_is_instrument(t);
+    JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
+
+    if (instr) {
+        if (!chain || chain->n == 0) return;   /* no instrument -> silent */
+        memset(tmpL, 0, nn * sizeof(float));
+        memset(tmpR, 0, nn * sizeof(float));
+        int nev = eng_gather_render_midi(t, par->frame, nn, par->mev[i],
+                                         RENDER_MIDI_MAX);
+        pluginhost_process_midi((PluginInstance *)chain->fx[0], par->mev[i], nev,
+                                tmpL, tmpR, (int)nn);
+        for (int fi = 1; fi < chain->n; fi++)
+            pluginhost_process((PluginInstance *)chain->fx[fi],
+                               tmpL, tmpR, (int)nn);
+    } else {
+        engine_track_reader_read(par->readers[i], t, par->frame, nn, tmpL, tmpR);
+        if (chain)
+            for (int fi = 0; fi < chain->n; fi++)
+                pluginhost_process((PluginInstance *)chain->fx[fi],
+                                   tmpL, tmpR, (int)nn);
+    }
+
+    gfloat vol = t->volume, pan = t->pan;
+    float  ang = (pan + 1.0f) * (float)M_PI_4;
+    float  gL  = vol * cosf(ang), gR = vol * sinf(ang);
+    for (jack_nframes_t k = 0; k < nn; k++) {
+        tmpL[k] *= gL;
+        tmpR[k] *= gR;
+    }
+    par->active[i] = TRUE;
+}
+
+static void render_track_worker(gpointer data, gpointer user)
+{
+    (void)user;
+    TrackJob  *job = data;
+    RenderPar *par = job->par;
+    render_process_one_track(par, job->idx);
+    g_mutex_lock(&par->mtx);
+    if (--par->remaining == 0) g_cond_signal(&par->cond);
+    g_mutex_unlock(&par->mtx);
+}
+
 static gpointer render_offline_thread(gpointer data)
 {
     OfflineCtx            *ctx  = data;
@@ -282,9 +367,34 @@ static gpointer render_offline_thread(gpointer data)
 
     float *masterL = g_new(float, block);
     float *masterR = g_new(float, block);
-    float *tmpL    = g_new(float, block);
-    float *tmpR    = g_new(float, block);
-    PhMidiEvent mev[RENDER_MIDI_MAX];
+
+    /* Per-track scratch + MIDI buffers so tracks can be processed in parallel
+     * (each worker writes only its own track's buffers). */
+    guint nalloc = ntr ? ntr : 1;
+    float       **trkL   = g_new0(float *, nalloc);
+    float       **trkR   = g_new0(float *, nalloc);
+    PhMidiEvent **mevbuf = g_new0(PhMidiEvent *, nalloc);
+    gboolean     *active = g_new0(gboolean, nalloc);
+    for (guint i = 0; i < ntr; i++) {
+        trkL[i]   = g_new(float, block);
+        trkR[i]   = g_new(float, block);
+        mevbuf[i] = g_new(PhMidiEvent, RENDER_MIDI_MAX);
+    }
+
+    RenderPar par = {0};
+    par.proj = proj; par.o = o; par.readers = readers;
+    par.engine_sr = engine_sr; par.any_soloed = any_soloed;
+    par.trkL = trkL; par.trkR = trkR; par.mev = mevbuf; par.active = active;
+    g_mutex_init(&par.mtx);
+    g_cond_init(&par.cond);
+
+    int nthreads = g_get_num_processors();
+    if (nthreads < 1) nthreads = 1;
+    TrackJob *jobs = g_new(TrackJob, nalloc);
+    for (guint i = 0; i < ntr; i++) { jobs[i].par = &par; jobs[i].idx = i; }
+    GThreadPool *pool = (ntr > 1 && nthreads > 1)
+        ? g_thread_pool_new(render_track_worker, NULL, nthreads, FALSE, NULL)
+        : NULL;
 
     gboolean need_src = (render_sr != engine_sr);
     double   mratio   = (double)render_sr / (double)engine_sr;
@@ -313,44 +423,31 @@ static gpointer render_offline_thread(gpointer data)
         memset(masterR, 0, nn * sizeof(float));
         pluginhost_set_transport(bpm, (double)engine_sr, (gint64)frame, TRUE);
 
+        par.frame = frame;
+        par.nn    = nn;
+
+        if (pool) {
+            par.remaining = (gint)ntr;
+            for (guint i = 0; i < ntr; i++)
+                g_thread_pool_push(pool, &jobs[i], NULL);
+            g_mutex_lock(&par.mtx);
+            while (par.remaining > 0) g_cond_wait(&par.cond, &par.mtx);
+            g_mutex_unlock(&par.mtx);
+        } else {
+            for (guint i = 0; i < ntr; i++)
+                render_process_one_track(&par, i);
+        }
+
+        /* Sum per-track contributions in track order — identical accumulation
+         * order to the previous serial loop, so the output is bit-for-bit the
+         * same. Only the master bus + master chain below remain serial. */
         for (guint i = 0; i < ntr; i++) {
-            JackDawTrack *t = jackdaw_project_get_track(proj, i);
-
-            if (o->source == RENDER_SRC_SELECTED) {
-                if (!render_track_selected(o, t)) continue;
-            } else {
-                gint fl = g_atomic_int_get(&t->state_flags);
-                if (fl & TRACK_MUTED) continue;
-                if (any_soloed && !(fl & TRACK_SOLOED)) continue;
-            }
-
-            gboolean instr = jackdaw_track_is_instrument(t);
-            JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
-
-            if (instr) {
-                if (!chain || chain->n == 0) continue;   /* no instrument -> silent */
-                memset(tmpL, 0, nn * sizeof(float));
-                memset(tmpR, 0, nn * sizeof(float));
-                int nev = eng_gather_render_midi(t, frame, nn, mev, RENDER_MIDI_MAX);
-                pluginhost_process_midi((PluginInstance *)chain->fx[0], mev, nev,
-                                        tmpL, tmpR, (int)nn);
-                for (int fi = 1; fi < chain->n; fi++)
-                    pluginhost_process((PluginInstance *)chain->fx[fi],
-                                       tmpL, tmpR, (int)nn);
-            } else {
-                engine_track_reader_read(readers[i], t, frame, nn, tmpL, tmpR);
-                if (chain)
-                    for (int fi = 0; fi < chain->n; fi++)
-                        pluginhost_process((PluginInstance *)chain->fx[fi],
-                                           tmpL, tmpR, (int)nn);
-            }
-
-            gfloat vol = t->volume, pan = t->pan;
-            float  ang = (pan + 1.0f) * (float)M_PI_4;
-            float  gL  = vol * cosf(ang), gR = vol * sinf(ang);
+            if (!active[i]) continue;
+            const float *tl = trkL[i];
+            const float *tr = trkR[i];
             for (jack_nframes_t k = 0; k < nn; k++) {
-                masterL[k] += tmpL[k] * gL;
-                masterR[k] += tmpR[k] * gR;
+                masterL[k] += tl[k];
+                masterR[k] += tr[k];
             }
         }
 
@@ -423,11 +520,17 @@ static gpointer render_offline_thread(gpointer data)
     jackdaw_engine_render_suspend(FALSE);
 
     sf_close(sf);
+    if (pool) g_thread_pool_free(pool, FALSE, TRUE);
+    g_cond_clear(&par.cond);
+    g_mutex_clear(&par.mtx);
     for (guint i = 0; i < ntr; i++)
         if (readers[i]) engine_track_reader_free(readers[i]);
     g_free(readers);
     g_free(masterL); g_free(masterR);
-    g_free(tmpL);    g_free(tmpR);
+    for (guint i = 0; i < ntr; i++) {
+        g_free(trkL[i]); g_free(trkR[i]); g_free(mevbuf[i]);
+    }
+    g_free(trkL); g_free(trkR); g_free(mevbuf); g_free(active); g_free(jobs);
     g_free(outL);    g_free(outR);   g_free(inter);
 
     prog->frames_done = end - start;
