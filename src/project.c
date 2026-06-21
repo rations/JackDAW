@@ -120,6 +120,8 @@ static void jackdaw_project_init(JackDawProject *p)
     p->metronome_volume_db = 0.0;  /* unity; loaded per-project from save file */
     p->metronome_gain    = 1.0f;
     p->metronome_route   = METRONOME_ROUTE_MAIN;
+    p->countin_before_record = 0;
+    p->countin_before_play   = 0;
     p->ruler_mode        = JACKDAW_RULER_TIME;
 }
 
@@ -517,6 +519,32 @@ JackDawMetronomeRoute jackdaw_project_get_metronome_route(JackDawProject *p)
     return (JackDawMetronomeRoute)p->metronome_route;
 }
 
+void jackdaw_project_set_countin_before_record(JackDawProject *p, guint beats)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    p->countin_before_record = MIN(beats, 32u);
+    jackdaw_project_emit_timing_changed(p);
+}
+
+guint jackdaw_project_get_countin_before_record(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), 0);
+    return p->countin_before_record;
+}
+
+void jackdaw_project_set_countin_before_play(JackDawProject *p, guint beats)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    p->countin_before_play = MIN(beats, 32u);
+    jackdaw_project_emit_timing_changed(p);
+}
+
+guint jackdaw_project_get_countin_before_play(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), 0);
+    return p->countin_before_play;
+}
+
 void jackdaw_project_set_ruler_mode(JackDawProject *p, JackDawRulerMode m)
 {
     g_return_if_fail(JACKDAW_IS_PROJECT(p));
@@ -844,6 +872,8 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
     g_key_file_set_boolean(kf, "project", "metronome", p->metronome_enabled);
     g_key_file_set_double (kf, "project", "metronome_volume", p->metronome_volume_db);
     g_key_file_set_integer(kf, "project", "metronome_route", p->metronome_route);
+    g_key_file_set_integer(kf, "project", "countin_record", (gint)p->countin_before_record);
+    g_key_file_set_integer(kf, "project", "countin_play",   (gint)p->countin_before_play);
     g_key_file_set_integer(kf, "project", "ruler", (gint)p->ruler_mode);
     g_key_file_set_integer(kf, "project", "track_count", (gint)p->tracks->len);
 
@@ -1016,6 +1046,10 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     p->metronome_route = (kf_int(kf, "project", "metronome_route",
                                  METRONOME_ROUTE_MAIN) == METRONOME_ROUTE_CLICK_PORT)
                          ? METRONOME_ROUTE_CLICK_PORT : METRONOME_ROUTE_MAIN;
+    p->countin_before_record =
+        (guint)CLAMP(kf_int(kf, "project", "countin_record", 0), 0, 32);
+    p->countin_before_play =
+        (guint)CLAMP(kf_int(kf, "project", "countin_play", 0), 0, 32);
     p->ruler_mode    = kf_int(kf, "project", "ruler", JACKDAW_RULER_TIME) ?
                        JACKDAW_RULER_BARS : JACKDAW_RULER_TIME;
 

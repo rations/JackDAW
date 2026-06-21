@@ -433,10 +433,15 @@ static void mw_set_class(GtkWidget *w, const char *cls, gboolean on)
 
 static void mw_transport_play_cb(GtkWidget *widget, gpointer data)
 {
-    (void)data;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
     gboolean on = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(widget));
-    if (on) jackdaw_engine_start_playback();
-    else    jackdaw_engine_stop_playback();
+    if (on) {
+        guint beats = jackdaw_project_get_countin_before_play(win->project);
+        if (!(beats > 0 && jackdaw_engine_begin_countin(beats, FALSE)))
+            jackdaw_engine_start_playback();
+    } else {
+        jackdaw_engine_stop_playback();
+    }
     mw_set_class(widget, "transport-play", on);
 }
 
@@ -517,10 +522,20 @@ static void mw_transport_record_cb(GtkWidget *widget, gpointer data)
     }
 
     if (on) {
-        jackdaw_engine_start_recording();
-        /* start_recording sets ENGINE_PLAYING; keep the play button in sync */
-        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(win->play_button)))
+        guint beats = jackdaw_project_get_countin_before_record(win->project);
+        if (!(beats > 0 && jackdaw_engine_begin_countin(beats, TRUE)))
+            jackdaw_engine_start_recording();
+        /* Recording engages ENGINE_PLAYING (now, or when the count-in ends);
+         * light the play button to match WITHOUT firing its handler — otherwise
+         * it would launch a second, playback count-in. */
+        if (!gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(win->play_button))) {
+            g_signal_handlers_block_by_func(win->play_button,
+                                            mw_transport_play_cb, win);
             gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->play_button), TRUE);
+            mw_set_class(win->play_button, "transport-play", TRUE);
+            g_signal_handlers_unblock_by_func(win->play_button,
+                                              mw_transport_play_cb, win);
+        }
     } else {
         jackdaw_engine_stop_recording();
     }
@@ -818,11 +833,105 @@ static void mw_open_metronome_window(JackDawMainWindow *win)
     gtk_window_present(GTK_WINDOW(win->metro_window));
 }
 
+/* ---- Count-in window (metronome pre-roll before play / record) ----------- */
+
+static gboolean mw_countin_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer d)
+{
+    (void)e; (void)d;
+    gtk_widget_hide(w);
+    return TRUE; /* keep the singleton alive */
+}
+
+static void mw_countin_record_changed(GtkSpinButton *sb, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_countin_before_record(
+        win->project, (guint)gtk_spin_button_get_value_as_int(sb));
+}
+
+static void mw_countin_play_changed(GtkSpinButton *sb, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    jackdaw_project_set_countin_before_play(
+        win->project, (guint)gtk_spin_button_get_value_as_int(sb));
+}
+
+/* Open (creating lazily) the count-in settings window. Two spin buttons: the
+ * number of metronome clicks before recording, and before playback (0 = off). */
+static void mw_open_countin_window(JackDawMainWindow *win)
+{
+    if (!win->countin_window) {
+        win->countin_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win->countin_window), "Count In");
+        gtk_window_set_resizable(GTK_WINDOW(win->countin_window), FALSE);
+        gtk_window_set_transient_for(GTK_WINDOW(win->countin_window),
+                                     GTK_WINDOW(win));
+        g_signal_connect(win->countin_window, "delete-event",
+                         G_CALLBACK(mw_countin_window_delete_cb), win);
+
+        GtkWidget *grid = gtk_grid_new();
+        gtk_grid_set_row_spacing(GTK_GRID(grid), 8);
+        gtk_grid_set_column_spacing(GTK_GRID(grid), 10);
+        gtk_container_set_border_width(GTK_CONTAINER(grid), 12);
+        gtk_container_add(GTK_CONTAINER(win->countin_window), grid);
+
+        GtkWidget *l_rec = gtk_label_new("Count in before record:");
+        gtk_widget_set_halign(l_rec, GTK_ALIGN_START);
+        GtkWidget *sp_rec = gtk_spin_button_new_with_range(0, 32, 1);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(sp_rec),
+            jackdaw_project_get_countin_before_record(win->project));
+        g_signal_connect(sp_rec, "value-changed",
+                         G_CALLBACK(mw_countin_record_changed), win);
+        gtk_grid_attach(GTK_GRID(grid), l_rec,  0, 0, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), sp_rec, 1, 0, 1, 1);
+
+        GtkWidget *l_play = gtk_label_new("Count in before playback:");
+        gtk_widget_set_halign(l_play, GTK_ALIGN_START);
+        GtkWidget *sp_play = gtk_spin_button_new_with_range(0, 32, 1);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(sp_play),
+            jackdaw_project_get_countin_before_play(win->project));
+        g_signal_connect(sp_play, "value-changed",
+                         G_CALLBACK(mw_countin_play_changed), win);
+        gtk_grid_attach(GTK_GRID(grid), l_play,  0, 1, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), sp_play, 1, 1, 1, 1);
+
+        GtkWidget *hint = gtk_label_new(
+            "Number of metronome clicks before transport starts (0 = off).");
+        gtk_widget_set_halign(hint, GTK_ALIGN_START);
+        gtk_grid_attach(GTK_GRID(grid), hint, 0, 2, 2, 1);
+
+        g_object_set_data(G_OBJECT(win->countin_window), "sp-rec",  sp_rec);
+        g_object_set_data(G_OBJECT(win->countin_window), "sp-play", sp_play);
+    }
+
+    /* Re-sync to the current project (it may differ after loading a session). */
+    {
+        GtkWidget *sp_rec  =
+            g_object_get_data(G_OBJECT(win->countin_window), "sp-rec");
+        GtkWidget *sp_play =
+            g_object_get_data(G_OBJECT(win->countin_window), "sp-play");
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(sp_rec),
+            jackdaw_project_get_countin_before_record(win->project));
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(sp_play),
+            jackdaw_project_get_countin_before_play(win->project));
+    }
+
+    gtk_widget_show_all(win->countin_window);
+    gtk_window_present(GTK_WINDOW(win->countin_window));
+}
+
 /* Metro right-click menu: "Volume…" opens the slider window. */
 static void mw_metro_volume_item_cb(GtkMenuItem *m, gpointer data)
 {
     (void)m;
     mw_open_metronome_window(JACKDAW_MAIN_WINDOW(data));
+}
+
+/* Metro right-click menu: "Count in…" opens the pre-roll settings window. */
+static void mw_metro_countin_item_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    mw_open_countin_window(JACKDAW_MAIN_WINDOW(data));
 }
 
 /* Metro right-click menu: "Headphones only" toggles the routing mode. When on,
@@ -852,6 +961,11 @@ static gboolean mw_metro_button_press_cb(GtkWidget *w, GdkEventButton *ev,
     g_signal_connect(mi_vol, "activate",
                      G_CALLBACK(mw_metro_volume_item_cb), win);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_vol);
+
+    GtkWidget *mi_ci = gtk_menu_item_new_with_label("Count in…");
+    g_signal_connect(mi_ci, "activate",
+                     G_CALLBACK(mw_metro_countin_item_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_ci);
 
     gtk_menu_shell_append(GTK_MENU_SHELL(menu),
                           gtk_separator_menu_item_new());

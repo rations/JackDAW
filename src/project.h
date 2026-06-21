@@ -63,6 +63,8 @@ struct _JackDawProject {
     gfloat           metronome_gain;      /* linear gain derived from the dB,
                                            * read by the RT process callback */
     gint             metronome_route;     /* JackDawMetronomeRoute; read by RT */
+    guint            countin_before_record;/* metronome beats before recording (0=off) */
+    guint            countin_before_play;  /* metronome beats before playback (0=off) */
     JackDawRulerMode ruler_mode;
 };
 
@@ -173,6 +175,11 @@ gdouble  jackdaw_project_get_metronome_volume(JackDawProject *p);
 void     jackdaw_project_set_metronome_route(JackDawProject *p,
                                              JackDawMetronomeRoute route);
 JackDawMetronomeRoute jackdaw_project_get_metronome_route(JackDawProject *p);
+/* Count-in pre-roll, in metronome beats (0 = off, clamped to 0..32). */
+void     jackdaw_project_set_countin_before_record(JackDawProject *p, guint beats);
+guint    jackdaw_project_get_countin_before_record(JackDawProject *p);
+void     jackdaw_project_set_countin_before_play  (JackDawProject *p, guint beats);
+guint    jackdaw_project_get_countin_before_play  (JackDawProject *p);
 void     jackdaw_project_set_ruler_mode   (JackDawProject *p, JackDawRulerMode m);
 void     jackdaw_project_emit_timing_changed(JackDawProject *p);
 

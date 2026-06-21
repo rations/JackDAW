@@ -74,6 +74,9 @@ void jackdaw_engine_start_playback (void);
 void jackdaw_engine_stop_playback  (void);
 void jackdaw_engine_start_recording(void);
 void jackdaw_engine_stop_recording (void);
+/* Sound `beats` metronome clicks, then start playback (record=FALSE) or recording
+ * (record=TRUE). Returns FALSE if no pre-roll was started (caller starts now). */
+gboolean jackdaw_engine_begin_countin(guint beats, gboolean record);
 void jackdaw_engine_locate         (off_t sample);
 
 /* --- Loop region ---
