@@ -93,6 +93,18 @@ typedef struct {
     volatile gint  record_mode;    /* RECORD_MODE_NORMAL | RECORD_MODE_PUNCH */
     volatile gint  punch_armed;    /* 1 while a punch is pending/in progress */
 
+    /* Count-in pre-roll. While countin_active the transport is in a metronome-
+     * only lead-in: the project is frozen (play_pos does not advance) and nothing
+     * records. The metronome clicks from countin_pos; when it reaches countin_len
+     * the pending transport (PLAYING, plus RECORDING if countin_pending_rec)
+     * engages and normal play begins from the unchanged play_pos. Set up on the
+     * main thread (recorder slots pre-opened first when recording); the RT path
+     * drives countin_pos and performs the hand-off. */
+    volatile gint  countin_active;
+    volatile gint  countin_pending_rec;
+    volatile off_t countin_pos;
+    volatile off_t countin_len;
+
     jack_nframes_t sample_rate;    /* cached at init */
 
     /* Pre-rendered metronome click (mono), built at init. */
@@ -1137,6 +1149,27 @@ static int engine_process(jack_nframes_t nframes, void *arg)
 
     flags = g_atomic_int_get(&engine.transport_flags);
 
+    /* Count-in pre-roll: a metronome-only lead-in. While active the project is
+     * frozen (play_pos does not advance) and nothing records; the metronome
+     * clicks from countin_pos. When the pre-roll length elapses the pending
+     * transport (PLAYING, optionally RECORDING) engages and normal play begins
+     * this block from the unchanged play_pos. Period-granular, like loop/punch. */
+    gboolean preroll = FALSE;
+    off_t    preroll_base = 0;
+    if (g_atomic_int_get(&engine.countin_active)) {
+        if (engine.countin_pos >= engine.countin_len) {
+            gint pend = g_atomic_int_get(&engine.countin_pending_rec);
+            g_atomic_int_set(&engine.countin_active, 0);
+            g_atomic_int_or(&engine.transport_flags,
+                            ENGINE_PLAYING | (pend ? ENGINE_RECORDING : 0));
+            flags = g_atomic_int_get(&engine.transport_flags);
+        } else {
+            preroll      = TRUE;
+            preroll_base = engine.countin_pos;
+            engine.countin_pos += (off_t)nframes;
+        }
+    }
+
     if (flags & ENGINE_PLAYING)
         engine.play_pos += nframes;
 
@@ -1366,8 +1399,13 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             ? (float *)jack_port_get_buffer(engine.metro_out, nframes) : NULL;
         if (metro_buf) memset(metro_buf, 0, nframes * sizeof(float));
 
-        if ((flags & ENGINE_PLAYING) && engine.project &&
-            engine.project->metronome_enabled && engine.click_buf &&
+        /* The click sounds either for the normal metronome (playing + enabled) or
+         * for a count-in pre-roll (always, regardless of the metronome toggle —
+         * the count-in IS the click). The two cases differ only in the position
+         * the beat grid is measured from. */
+        gboolean play_click = (flags & ENGINE_PLAYING) && engine.project &&
+            engine.project->metronome_enabled;
+        if ((play_click || preroll) && engine.project && engine.click_buf &&
             engine.click_len > 0 && engine.project->bpm > 0.0) {
             gboolean to_main =
                 engine.project->metronome_route == METRONOME_ROUTE_MAIN;
@@ -1376,7 +1414,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                          ? engine.project->beats_per_bar : 4;
             float  click_gain = engine.project->metronome_gain;
             if (fpb > 1.0) {
-                off_t  base = engine.play_pos - (off_t)nframes;
+                off_t  base = preroll ? preroll_base
+                                      : engine.play_pos - (off_t)nframes;
                 float *out_buf[2] = { NULL, NULL };
                 if (to_main) {
                     for (oi = 0; oi < engine.audio_out_count && oi < 2; oi++)
@@ -2340,6 +2379,22 @@ void jackdaw_engine_stop_playback(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_PLAYING);
 
+    /* Cancel a count-in pre-roll that never reached its hand-off. Discard any
+     * capture slots that were pre-opened for a record count-in (an unwritten
+     * take is finalized empty and dropped by the recorder thread). */
+    if (g_atomic_int_get(&engine.countin_active)) {
+        gboolean was_rec = g_atomic_int_get(&engine.countin_pending_rec);
+        g_atomic_int_set(&engine.countin_active, 0);
+        g_atomic_int_set(&engine.countin_pending_rec, 0);
+        if (was_rec) {
+            for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++)
+                if (recorder_slots[i].sf) {
+                    recorder_slots[i].expected_frames = 0;
+                    g_atomic_int_set(&recorder_slots[i].finalize_req, 1);
+                }
+        }
+    }
+
     /* Cancel any pending/in-progress punch: stop capture and let the recorder
      * thread finalize whatever was recorded (an empty take is discarded). */
     if (g_atomic_int_get(&engine.punch_armed)) {
@@ -2431,7 +2486,12 @@ static gboolean recorder_open_slot(guint i, JackDawTrack *t,
     return TRUE;
 }
 
-void jackdaw_engine_start_recording(void)
+/* Arm every armed track for capture at the current play_pos: open a WAV slot for
+ * audio tracks, reset the MIDI capture ringbuffer for instrument tracks. Must run
+ * on the main thread (does file I/O) BEFORE ENGINE_RECORDING is set, so the RT
+ * thread is not yet touching the slots/buffers. Shared by immediate recording and
+ * count-in recording (where the slots wait, pre-opened, through the pre-roll). */
+static void recorder_arm_all(void)
 {
     for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
@@ -2442,8 +2502,8 @@ void jackdaw_engine_start_recording(void)
         t->rec_start_frame = (off_t)engine.play_pos;
 
         /* Instrument tracks capture live MIDI into a clip — clear the capture
-         * ringbuffer now (RECORDING isn't set until the end of this function,
-         * so the RT thread is not yet writing to it). No WAV file. */
+         * ringbuffer now (RECORDING isn't set yet, so the RT thread is not yet
+         * writing to it). No WAV file. */
         if (jackdaw_track_is_instrument(t)) {
             if (t->midi_rec_buf) jack_ringbuffer_reset(t->midi_rec_buf);
             continue;
@@ -2452,9 +2512,42 @@ void jackdaw_engine_start_recording(void)
         if (t->audio_in_idx < 0) continue;
         recorder_open_slot(i, t, (off_t)engine.play_pos, 0 /* unlimited */);
     }
+}
+
+void jackdaw_engine_start_recording(void)
+{
+    recorder_arm_all();
 
     /* Start rolling — RT callback begins filling rec_buf immediately */
     g_atomic_int_or(&engine.transport_flags, ENGINE_RECORDING | ENGINE_PLAYING);
+}
+
+/* Begin a count-in pre-roll, then start playback (record=FALSE) or recording
+ * (record=TRUE) when it elapses. `beats` is the number of metronome clicks to
+ * sound first. Returns FALSE (caller should start immediately) when no pre-roll
+ * is possible: engine not running, beats==0, or a degenerate tempo. The project
+ * playhead stays put during the pre-roll, so when recording the take begins
+ * exactly at the cursor. */
+gboolean jackdaw_engine_begin_countin(guint beats, gboolean record)
+{
+    if (!engine.active || beats == 0) return FALSE;
+    if (g_atomic_int_get(&engine.countin_active)) return TRUE; /* already counting */
+
+    double bpm = (engine.project && engine.project->bpm > 0.0)
+                     ? engine.project->bpm : 120.0;
+    double fpb = (double)engine.sample_rate * 60.0 / bpm;
+    off_t  len = (off_t)(fpb * (double)beats + 0.5);
+    if (len <= 0) return FALSE;
+
+    /* For a record count-in, pre-open the capture slots now so recording can
+     * engage instantly (no file I/O on the RT thread) when the pre-roll ends. */
+    if (record) recorder_arm_all();
+
+    engine.countin_pos = 0;
+    engine.countin_len = len;
+    g_atomic_int_set(&engine.countin_pending_rec, record ? 1 : 0);
+    g_atomic_int_set(&engine.countin_active, 1);   /* publish last */
+    return TRUE;
 }
 
 /* Drain each instrument track's captured MIDI into a new clip + region on the
@@ -2589,6 +2682,12 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
 void jackdaw_engine_stop_recording(void)
 {
     g_atomic_int_and(&engine.transport_flags, ~ENGINE_RECORDING);
+
+    /* A record count-in that hasn't engaged yet: clear it so the pre-roll won't
+     * hand off into recording. The pre-opened slots are finalized (empty/dropped)
+     * by the loop below, shared with the normal stop path. */
+    g_atomic_int_set(&engine.countin_active, 0);
+    g_atomic_int_set(&engine.countin_pending_rec, 0);
 
     /* Capture play_pos NOW — this is the exact cut point for all recording tracks.
      * Write expected_frames before setting finalize_req so the recorder thread sees
