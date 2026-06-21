@@ -64,7 +64,7 @@ GThread *jackdaw_render_offline_start(const RenderOptions *o,
 
 /* REALTIME: open the file + writer thread, solo the selected set if needed,
  * locate + arm the master tap + start playback. Non-blocking. FALSE = success
- * (mhwaveedit convention). Drives `prog` via jackdaw_render_realtime_poll(). */
+ * (TRUE = failure). Drives `prog` via jackdaw_render_realtime_poll(). */
 gboolean jackdaw_render_realtime_start(const RenderOptions *o,
                                        JackDawRenderProgress *prog);
 /* Call from the UI timer while a realtime render is active: finalizes when the

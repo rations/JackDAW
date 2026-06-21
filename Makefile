@@ -88,7 +88,7 @@ endif
 SRCS_C := \
     $(SRCDIR)/main.c \
     $(SRCDIR)/settings.c \
-    $(SRCDIR)/um.c \
+    $(SRCDIR)/message.c \
     $(SRCDIR)/audio_clip.c \
     $(SRCDIR)/clipregion.c \
     $(SRCDIR)/midiclip.c \

@@ -1315,7 +1315,7 @@ static gboolean transport_update(gpointer data)
         guint32 sr = jackdaw_engine_get_sample_rate();
         gchar tbuf[64];
         off_t tpos = jackdaw_engine_get_play_pos();
-        get_time(sr, tpos, tpos, tbuf, default_timescale_mode);
+        format_timecode(sr, tpos, tpos, tbuf, default_timescale_mode);
         gtk_label_set_text(GTK_LABEL(mw->time_label), tbuf);
     }
 

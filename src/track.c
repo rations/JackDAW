@@ -4,7 +4,7 @@
 #include "track.h"
 #include "jackdaw-engine.h"
 #include "pluginhost.h"
-#include "um.h"
+#include "message.h"
 
 G_DEFINE_TYPE(JackDawTrack, jackdaw_track, G_TYPE_OBJECT)
 

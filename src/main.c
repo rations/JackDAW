@@ -23,83 +23,64 @@ guint default_timescale_mode = 1;   /* TIMEMODE_REALLONG */
  * Time formatting
  * ----------------------------------------------------------------------- */
 
-gchar *get_time(guint32 samplerate, off_t samples, off_t samplemax,
-                gchar *timebuf, gint mode)
+gchar *format_timecode(guint32 samplerate, off_t samples, off_t samplemax,
+                       gchar *timebuf, gint mode)
 {
-    static gchar static_buf[64];
-    gfloat secs, ffps;
-    guint mins, msecs, hours, maxhours, frames, ifps, isecs;
-    guint fptm;
+    static gchar internal[64];
+    if (!timebuf) timebuf = internal;
+    if (samplerate == 0) samplerate = 1;
+    if (samplemax <= 0) samplemax = samples;
+    if (mode < 0 || mode > TIMEMODE_30FPS) mode = TIMEMODE_REAL;
 
-    if (samplemax == 0) samplemax = samples;
-    if (!timebuf) timebuf = static_buf;
-    if (mode > 6) mode = 0;
-
-    if (mode == 2) {
-        g_snprintf(timebuf, 50, "%05ld", (long)samples);
-    } else if (mode < 2) {
-        secs     = (gfloat)samples / (gfloat)samplerate;
-        mins     = (guint)(secs / 60.0f);
-        hours    = mins / 60;
-        mins     = mins % 60;
-        msecs    = ((guint)(secs * 1000.0f)) % 60000;
-        maxhours = (guint)(samplemax / ((off_t)samplerate * 3600));
-        if (mode == 0) {
-            if (maxhours > 0)
-                g_snprintf(timebuf, 50, "%d'%02d:%02d.%d",
-                           hours, mins, msecs/1000, (msecs%1000)/100);
-            else
-                g_snprintf(timebuf, 50, "%02d:%02d.%d",
-                           mins, msecs/1000, (msecs%1000)/100);
-        } else {
-            if (maxhours > 0)
-                g_snprintf(timebuf, 50, "%d'%02d:%02d.%03d",
-                           hours, mins, msecs/1000, msecs%1000);
-            else
-                g_snprintf(timebuf, 50, "%02d:%02d.%03d",
-                           mins, msecs/1000, msecs%1000);
-        }
-    } else {
-        secs = (gfloat)samples / (gfloat)samplerate;
-
-        if      (mode == 3) { ffps = 24.0f; ifps = 24; }
-        else if (mode == 4) { ffps = 25.0f; ifps = 25; }
-        else if (mode == 5) { ffps = 30.0f * 1000.0f / 1001.0f; ifps = 30; }
-        else                { ffps = 30.0f; ifps = 30; }
-
-        frames = (guint)(secs * ffps);
-
-        if (mode == 5)
-            fptm = 60 * 30 * 10 - 2 * 9;
-        else
-            fptm = ifps * 600;
-
-        mins   = 10 * (frames / fptm);
-        frames = frames % fptm;
-
-        if (mode != 5) {
-            isecs   = frames / ifps;
-            frames %= ifps;
-            mins   += isecs / 60;
-            isecs  %= 60;
-        } else {
-            if (frames >= 60 * 30) {
-                mins++;
-                frames -= 60 * 30;
-                mins   += frames / (60 * 30 - 2);
-                frames %= (60 * 30 - 2);
-                frames += 2;
-            }
-            isecs   = frames / ifps;
-            frames %= ifps;
-        }
-
-        hours = mins / 60;
-        mins  = mins % 60;
-
-        g_snprintf(timebuf, 50, "%02d:%02d:%02d[%02d]",
-                   hours, mins, isecs, frames);
+    /* Raw sample index. */
+    if (mode == TIMEMODE_SAMPLES) {
+        g_snprintf(timebuf, 64, "%05lld", (long long)samples);
+        return timebuf;
     }
+
+    double secs = (double)samples / (double)samplerate;
+    if (secs < 0.0) secs = 0.0;
+
+    /* Wall-clock display (tenths for REAL, milliseconds for REALLONG). The
+     * hours field is only shown once the project is long enough to need it. */
+    if (mode == TIMEMODE_REAL || mode == TIMEMODE_REALLONG) {
+        guint total_ms = (guint)(secs * 1000.0 + 0.5);
+        guint h  =  total_ms / 3600000u;
+        guint m  = (total_ms /   60000u) % 60u;
+        guint s  = (total_ms /    1000u) % 60u;
+        guint ms =  total_ms % 1000u;
+        gboolean show_h = samplemax / ((off_t)samplerate * 3600) > 0;
+        char head[24];
+        if (show_h) g_snprintf(head, sizeof head, "%u:%02u:%02u", h, m, s);
+        else        g_snprintf(head, sizeof head, "%02u:%02u", m, s);
+        /* Drop the fraction on whole-second ticks so the ruler isn't a wall
+         * of ".000"; tenths for REAL, milliseconds for REALLONG otherwise. */
+        if (ms == 0)
+            g_snprintf(timebuf, 64, "%s", head);
+        else if (mode == TIMEMODE_REAL)
+            g_snprintf(timebuf, 64, "%s.%u", head, ms / 100);
+        else
+            g_snprintf(timebuf, 64, "%s.%03u", head, ms);
+        return timebuf;
+    }
+
+    /* Frame-based timecode: HH:MM:SS[FF]. NTSC counts at 29.97 fps without
+     * SMPTE drop-frame compensation (positions only, not broadcast TC). */
+    int    fps;
+    double rate;
+    switch (mode) {
+    case TIMEMODE_24FPS: fps = 24; rate = 24.0; break;
+    case TIMEMODE_25FPS: fps = 25; rate = 25.0; break;
+    case TIMEMODE_NTSC:  fps = 30; rate = 30000.0 / 1001.0; break;
+    default:             fps = 30; rate = 30.0; break;   /* TIMEMODE_30FPS */
+    }
+    guint64 frames  = (guint64)(secs * rate + 1e-6);
+    guint   ff      = (guint)(frames % (guint64)fps);
+    guint64 tsecs   = frames / (guint64)fps;
+    guint   s = (guint)(tsecs % 60u);
+    guint   m = (guint)((tsecs / 60u) % 60u);
+    guint   h = (guint)(tsecs / 3600u);
+    g_snprintf(timebuf, 64, "%02u:%02u:%02u[%02u]", h, m, s, ff);
     return timebuf;
 }
 
@@ -107,130 +88,106 @@ gchar *get_time(guint32 samplerate, off_t samples, off_t samplemax,
  * Timescale point generation for the ruler
  * ----------------------------------------------------------------------- */
 
-static const gint bigsizes[] = {
-    1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 36000
+/* Candidate tick spacings in seconds, ascending: a 1-2-5 decade ladder
+ * extended with the clock-natural 15/30 steps, so labels land on round
+ * values as the user zooms. */
+static const double tick_secs[] = {
+    1e-3, 2e-3, 5e-3, 1e-2, 2e-2, 5e-2, 0.1, 0.2, 0.5,
+    1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800,
+    3600, 7200, 18000, 36000, 86400
 };
-static const gboolean bigskip[] = {
-    FALSE, TRUE, FALSE, FALSE, TRUE,
-    FALSE, FALSE, TRUE, TRUE, FALSE, TRUE,
-    TRUE, FALSE, FALSE
-};
-static const gint smallsizes_real[]  = { 1000, 100, 10 };
-static const gint smallsizes_24fps[] = { 24, 12, 4 };
-static const gint smallsizes_25fps[] = { 25, 5 };
-static const gint smallsizes_30fps[] = { 30, 10, 5 };
 
-guint find_timescale_points(guint32 samplerate,
-                             off_t start_samp, off_t end_samp,
-                             off_t *points,       int *npoints,
-                             off_t *midpoints,    int *nmidpoints,
-                             off_t *minor_points, int *nminorpoints,
-                             int timemode)
+static off_t secs_to_samp(double s, guint32 sr)
 {
-    guint pctr = 0, mpctr = 0, midpctr = 0;
-    off_t p, q, r, s;
-    int i;
-    const int *ss;
-    int ssl;
-    int max_points       = *npoints;
-    int max_minorpoints  = *nminorpoints;
-    int max_midpoints    = *nmidpoints;
-    *nmidpoints = 0;
+    off_t v = (off_t)(s * (double)sr + 0.5);
+    return v < 1 ? 1 : v;
+}
 
+/* Smallest of {1,2,5}x10^n that is >= raw (in samples). */
+static off_t nice_samples(off_t raw)
+{
+    if (raw < 1) raw = 1;
+    off_t p = 1;
+    while (p < raw) {
+        if (2 * p >= raw)  return 2 * p;
+        if (5 * p >= raw)  return 5 * p;
+        if (10 * p >= raw) return 10 * p;
+        p *= 10;
+    }
+    return p;
+}
+
+/* Write each multiple of `step` lying in [lo,hi] into out[], up to `cap`
+ * entries. Returns the count written. */
+static int fill_ticks(off_t lo, off_t hi, off_t step, off_t *out, int cap)
+{
+    if (step < 1) step = 1;
+    off_t first = (lo / step) * step;
+    if (first < lo) first += step;
+    int n = 0;
+    for (off_t s = first; s <= hi && n < cap; s += step)
+        out[n++] = s;
+    return n;
+}
+
+/* Index of the coarsest tick_secs entry whose tick count fits `budget`. */
+static int pick_secs_level(off_t span, guint32 sr, int budget)
+{
+    if (budget < 1) budget = 1;
+    for (guint i = 0; i < ARRAY_LENGTH(tick_secs); i++)
+        if (span / secs_to_samp(tick_secs[i], sr) <= (off_t)budget)
+            return (int)i;
+    return (int)ARRAY_LENGTH(tick_secs) - 1;
+}
+
+guint ruler_tick_positions(guint32 samplerate,
+                           off_t start_samp, off_t end_samp,
+                           off_t *points,       int *npoints,
+                           off_t *midpoints,    int *nmidpoints,
+                           off_t *minor_points, int *nminorpoints,
+                           int timemode)
+{
+    int cap_major = *npoints, cap_mid = *nmidpoints, cap_minor = *nminorpoints;
+    *npoints = *nmidpoints = *nminorpoints = 0;
+
+    if (samplerate == 0) samplerate = 1;
+    off_t span = end_samp - start_samp;
+    if (span < 1) span = 1;
+
+    /* Raw sample positions step directly in decades. */
     if (timemode == TIMEMODE_SAMPLES) {
-        p = 1; q = start_samp; r = end_samp;
-        while (r - q >= (off_t)(max_points - 1)) { q /= 10; r /= 10; p *= 10; }
-        for (s = q; s <= r + 1; s++) {
-            points[pctr++] = s * p;
-            if ((int)pctr >= max_points) break;
-        }
-        p = 1; q = start_samp; r = end_samp;
-        while (r - q >= (off_t)(max_minorpoints - 1)) { q /= 10; r /= 10; p *= 10; }
-        for (s = q; s <= r + 1; s++) {
-            minor_points[mpctr++] = s * p;
-            if ((int)mpctr >= max_minorpoints) break;
-        }
-        *npoints = (int)pctr; *nminorpoints = (int)mpctr;
+        off_t major = nice_samples(span / (cap_major > 1 ? cap_major - 1 : 1));
+        off_t minor = nice_samples(span / (cap_minor > 1 ? cap_minor - 1 : 1));
+        *npoints      = fill_ticks(start_samp, end_samp, major, points, cap_major);
+        *nminorpoints = fill_ticks(start_samp, end_samp, minor, minor_points, cap_minor);
         return 0;
     }
 
-    i = 0;
-    while (i < (int)(ARRAY_LENGTH(bigsizes) - 1) &&
-           (end_samp - start_samp) / (bigsizes[i] * (off_t)samplerate)
-               > (off_t)(max_points - 2))
-        i++;
-    q = start_samp / (bigsizes[i] * (off_t)samplerate);
-    r = end_samp   / (bigsizes[i] * (off_t)samplerate);
-    while (1) {
-        points[pctr++] = (q++) * bigsizes[i] * (off_t)samplerate;
-        if ((int)pctr >= max_points) break;
-        if (q > r) break;
-    }
-    *npoints = (int)pctr;
+    /* Time / timecode modes choose round spacings in seconds. */
+    int lv_major = pick_secs_level(span, samplerate, cap_major - 2);
+    *npoints = fill_ticks(start_samp, end_samp,
+                          secs_to_samp(tick_secs[lv_major], samplerate),
+                          points, cap_major);
 
-    if (i > 0) {
-        i--;
-        while (bigskip[i]) i--;
-        if ((end_samp - start_samp) / (bigsizes[i] * (off_t)samplerate)
-                >= (off_t)(max_minorpoints - 2)) {
-            *nminorpoints = 0; return 0;
-        }
-        while (i > 0 &&
-               (end_samp - start_samp) / (bigsizes[i-1] * (off_t)samplerate)
-                   < (off_t)(max_minorpoints - 2))
-            i--;
-        q = start_samp / (bigsizes[i] * (off_t)samplerate);
-        r = end_samp   / (bigsizes[i] * (off_t)samplerate);
-        for (s = q; s <= r + 1 && (int)mpctr < max_minorpoints; s++)
-            minor_points[mpctr++] = s * bigsizes[i] * (off_t)samplerate;
-        *nminorpoints = (int)mpctr;
-        return 0;
-    }
+    /* Descend to the finest level that still fits the minor-tick budget. */
+    int lv_minor = lv_major;
+    while (lv_minor > 0 &&
+           span / secs_to_samp(tick_secs[lv_minor - 1], samplerate)
+               <= (off_t)(cap_minor - 2))
+        lv_minor--;
+    if (lv_minor >= lv_major)
+        return 0;                       /* too zoomed-out for sub-ticks */
 
-    if (timemode == TIMEMODE_NTSC) {
-        q = (start_samp * 30 * 1000) / ((off_t)samplerate * 1001);
-        r = (end_samp   * 30 * 1000) / ((off_t)samplerate * 1001);
-        if (r - q >= max_minorpoints) { *nminorpoints = 0; return 0; }
-        for (s = q; s <= r && (int)mpctr < max_minorpoints; s++)
-            minor_points[mpctr++] = (s * (off_t)samplerate * 1001 + 29999) / 30000;
-        *nminorpoints = (int)mpctr;
-        return 1;
-    }
+    *nminorpoints = fill_ticks(start_samp, end_samp,
+                               secs_to_samp(tick_secs[lv_minor], samplerate),
+                               minor_points, cap_minor);
 
-    switch (timemode) {
-    case TIMEMODE_REAL: case TIMEMODE_REALLONG:
-        ss = smallsizes_real;  ssl = ARRAY_LENGTH(smallsizes_real);  break;
-    case TIMEMODE_24FPS:
-        ss = smallsizes_24fps; ssl = ARRAY_LENGTH(smallsizes_24fps); break;
-    case TIMEMODE_25FPS:
-        ss = smallsizes_25fps; ssl = ARRAY_LENGTH(smallsizes_25fps); break;
-    case TIMEMODE_30FPS: default:
-        ss = smallsizes_30fps; ssl = ARRAY_LENGTH(smallsizes_30fps); break;
-    }
-
-    i = 0;
-    while (i < ssl &&
-           ((end_samp - start_samp) * ss[i]) / (off_t)samplerate
-               >= (off_t)(max_minorpoints - 2))
-        i++;
-    if (i >= ssl) { *nminorpoints = 0; return 0; }
-
-    q = (start_samp * ss[i]) / (off_t)samplerate;
-    r = (end_samp   * ss[i]) / (off_t)samplerate;
-    for (s = q; s <= r + 1 && (int)mpctr < max_minorpoints; s++)
-        minor_points[mpctr++] = (s * (off_t)samplerate + ss[i] - 1) / ss[i];
-    *nminorpoints = (int)mpctr;
-
-    do { i++; } while (i < ssl &&
-        ((end_samp - start_samp) * ss[i]) / (off_t)samplerate
-            >= (off_t)(max_midpoints - 2));
-    if (i >= ssl) return 1;
-
-    q = (start_samp * ss[i]) / (off_t)samplerate;
-    r = (end_samp   * ss[i]) / (off_t)samplerate;
-    for (s = q; s <= r + 1 && (int)midpctr < max_midpoints; s++)
-        midpoints[midpctr++] = (s * (off_t)samplerate + ss[i] - 1) / ss[i];
-    *nmidpoints = (int)midpctr;
+    /* A mid level sits one rung above the minor ticks, when distinct. */
+    int lv_mid = lv_minor + 1;
+    if (lv_mid >= lv_major) return 0;
+    *nmidpoints = fill_ticks(start_samp, end_samp,
+                             secs_to_samp(tick_secs[lv_mid], samplerate),
+                             midpoints, cap_mid);
     return 1;
 }
 

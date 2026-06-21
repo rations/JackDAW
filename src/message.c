@@ -1,8 +1,8 @@
 #include <config.h>
 #include <gtk/gtk.h>
-#include "um.h"
+#include "message.h"
 
-void user_error(const gchar *msg)
+void jackdaw_error(const gchar *msg)
 {
     g_warning("%s", msg);
     GtkWidget *dlg = gtk_message_dialog_new(

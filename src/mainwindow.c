@@ -9,7 +9,7 @@
 #include "clipregion.h"
 #include "mixer.h"
 #include "main.h"
-#include "um.h"
+#include "message.h"
 #include "settings.h"
 #include "fxwindow.h"
 #include "render.h"
@@ -200,7 +200,7 @@ static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
                 gchar *msg = g_strdup_printf("Could not load file:\n%s\n%s",
                                              path,
                                              err ? err->message : "unknown error");
-                user_error(msg);
+                jackdaw_error(msg);
                 g_free(msg);
                 if (err) g_error_free(err);
             } else {
@@ -211,7 +211,7 @@ static void mw_load_file_cb(GtkMenuItem *item, gpointer data)
                 g_free(name);
 
                 if (jackdaw_engine_add_track(t)) {
-                    user_error("Engine: could not add track (slot limit reached)");
+                    jackdaw_error("Engine: could not add track (slot limit reached)");
                     g_object_unref(t);
                 } else {
                     jackdaw_project_push_structural_undo(win->project,
@@ -251,7 +251,7 @@ static void mw_save_as_project_cb(GtkMenuItem *item, gpointer data)
         gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
         if (path) {
             if (jackdaw_project_save(win->project, path))   /* TRUE = failure */
-                user_error("Could not save project.");
+                jackdaw_error("Could not save project.");
             else
                 mw_update_title(win);
             g_free(path);
@@ -268,7 +268,7 @@ static void mw_save_project_cb(GtkMenuItem *item, gpointer data)
     const gchar *cur = jackdaw_project_get_file(win->project);
     if (cur) {
         if (jackdaw_project_save(win->project, cur))   /* TRUE = failure */
-            user_error("Could not save project.");
+            jackdaw_error("Could not save project.");
     } else {
         mw_save_as_project_cb(item, data);
     }
@@ -314,7 +314,7 @@ static void mw_open_project_cb(GtkMenuItem *item, gpointer data)
         gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
         if (path) {
             if (jackdaw_project_load(win->project, path))   /* TRUE = failure */
-                user_error("Could not open project.");
+                jackdaw_error("Could not open project.");
             else {
                 win->track_counter = jackdaw_project_track_count(win->project);
                 mw_update_title(win);
@@ -344,7 +344,7 @@ static void mw_add_track_cb(GtkMenuItem *item, gpointer data)
     g_free(name);
 
     if (jackdaw_engine_add_track(t)) {
-        user_error("Engine: could not add track (slot limit reached)");
+        jackdaw_error("Engine: could not add track (slot limit reached)");
         g_object_unref(t);
         return;
     }
@@ -372,7 +372,7 @@ static void mw_add_instrument_track_cb(GtkMenuItem *item, gpointer data)
     jackdaw_track_set_kind(t, JACKDAW_TRACK_INSTRUMENT);
 
     if (jackdaw_engine_add_track(t)) {
-        user_error("Engine: could not add track (slot limit reached)");
+        jackdaw_error("Engine: could not add track (slot limit reached)");
         g_object_unref(t);
         return;
     }
@@ -1216,7 +1216,7 @@ static void mw_on_position_changed(JackDawTimeline *tl, gint64 sample,
                  ? (guint32)jackdaw_engine_get_sample_rate()
                  : 48000u;
     gchar tbuf[64];
-    get_time(sr, (off_t)sample, (off_t)sample, tbuf, default_timescale_mode);
+    format_timecode(sr, (off_t)sample, (off_t)sample, tbuf, default_timescale_mode);
     gtk_label_set_text(GTK_LABEL(win->time_label), tbuf);
 }
 
@@ -1232,7 +1232,7 @@ static gboolean mw_transport_timer(gpointer data)
                  : 48000u;
     off_t pos = jackdaw_engine_get_play_pos();
     gchar tbuf[64];
-    get_time(sr, pos, pos, tbuf, default_timescale_mode);
+    format_timecode(sr, pos, pos, tbuf, default_timescale_mode);
     gtk_label_set_text(GTK_LABEL(win->time_label), tbuf);
 
     /* Keep the loop toggle in sync (it may be toggled from the MIDI window). */

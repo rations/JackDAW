@@ -27,7 +27,7 @@ G_BEGIN_DECLS
 
 /* Initialise the engine and activate the JACK client.
  * Must be called from the main thread before adding any tracks.
- * Returns FALSE on success, TRUE on failure (mhwaveedit convention). */
+ * Returns FALSE on success, TRUE on failure. */
 gboolean jackdaw_engine_init(JackDawProject *project);
 
 /* Deactivate and close the JACK client. Safe to call even if not initialised. */

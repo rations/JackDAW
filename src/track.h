@@ -150,7 +150,7 @@ void         jackdaw_track_set_name (JackDawTrack *t, const gchar *name);
  * Back-compat helper; new code iterates jackdaw_track_get_regions(). */
 AudioClip   *jackdaw_track_get_clip (JackDawTrack *t);
 /* Replace all regions with a single region holding new_clip placed at tl=0.
- * Consumes one reference to new_clip (mhwaveedit "take ownership" semantics). */
+ * Consumes one reference to new_clip (take-ownership semantics). */
 void         jackdaw_track_set_clip (JackDawTrack *t, AudioClip *new_clip);
 
 /* ---- Clip regions (main thread only) ----

@@ -10,7 +10,7 @@
 #include "project.h"
 #include "track.h"
 #include "settings.h"
-#include "um.h"
+#include "message.h"
 
 /* -----------------------------------------------------------------------
  * Progress popup — shared by offline and realtime renders.
@@ -478,18 +478,18 @@ void render_dialog_open(GtkWindow *parent, JackDawProject *project,
         o.out_path  = g_strdup(gtk_entry_get_text(GTK_ENTRY(u->path_entry)));
 
         if (!o.out_path || !*o.out_path) {
-            user_error("Please choose an output file.");
+            jackdaw_error("Please choose an output file.");
             g_free(o.out_path);
             continue;
         }
         if (!jackdaw_render_format_supported(&o)) {
-            user_error("That format / sample-rate / depth combination is not "
+            jackdaw_error("That format / sample-rate / depth combination is not "
                        "supported by libsndfile.");
             g_free(o.out_path);
             continue;
         }
         if (o.method == RENDER_METHOD_OFFLINE && jackdaw_engine_is_playing()) {
-            user_error("Stop playback before an offline render.");
+            jackdaw_error("Stop playback before an offline render.");
             g_free(o.out_path);
             continue;
         }

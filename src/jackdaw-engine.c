@@ -21,7 +21,7 @@
 #include "jackdaw-engine.h"
 #include "pluginhost.h"
 #include "settings.h"
-#include "um.h"
+#include "message.h"
 
 /* -----------------------------------------------------------------------
  * Internal state
@@ -1745,7 +1745,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
 
     engine.client = jack_client_open("jackdaw", JackNullOption, &status);
     if (!engine.client) {
-        user_error("Could not connect to JACK server.\n"
+        jackdaw_error("Could not connect to JACK server.\n"
                    "Is jackd or pipewire-jack running?");
         return TRUE;
     }
@@ -1872,7 +1872,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
 
     /* Activate — after this the process callback can be called at any time */
     if (jack_activate(engine.client) != 0) {
-        user_error("jackdaw: jack_activate() failed");
+        jackdaw_error("jackdaw: jack_activate() failed");
         goto fail;
     }
 
@@ -2252,7 +2252,7 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
         if (!engine.slots[i]) break;
     }
     if (i == JACKDAW_MAX_TRACKS) {
-        user_error("jackdaw: maximum track count reached");
+        jackdaw_error("jackdaw: maximum track count reached");
         return TRUE;
     }
 
@@ -2268,7 +2268,7 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
 
     if (!track->play_buf_L || !track->play_buf_R ||
         !track->rec_buf_L  || !track->rec_buf_R  || !track->midi_rec_buf) {
-        user_error("jackdaw: ringbuffer allocation failed");
+        jackdaw_error("jackdaw: ringbuffer allocation failed");
         return TRUE;
     }
 

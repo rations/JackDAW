@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=JackDAW
+GenericName=Digital Audio Workstation
+Comment=JACK-based multitrack audio/MIDI workstation
+Exec=@bindir@/jackdaw %F
+TryExec=@bindir@/jackdaw
+Icon=jackdaw
+Terminal=false
+Categories=AudioVideo;Audio;Recorder;Sequencer;
+Keywords=DAW;JACK;audio;MIDI;recording;mixer;
+StartupNotify=true

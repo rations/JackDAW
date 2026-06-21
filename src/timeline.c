@@ -120,10 +120,14 @@ static gboolean ruler_draw(GtkWidget *widget, cairo_t *cr)
         return FALSE;
     }
 
-    /* Tick marks from find_timescale_points */
+    /* Tick marks from ruler_tick_positions. The tick budget is pixel-driven —
+     * roughly one labelled major tick per 90px so labels stay readable — not
+     * the array size, otherwise the ruler packs in far too many ticks. */
     off_t pts[256], mids[256], mins[512];
-    int   npts  = 256,   nmids  = 256,   nmins  = 512;
-    guint has_mids = find_timescale_points(r->sample_rate,
+    int   npts  = CLAMP(w / 90, 2, 256);
+    int   nmids = CLAMP(w / 45, 2, 256);
+    int   nmins = CLAMP(w / 15, 2, 512);
+    guint has_mids = ruler_tick_positions(r->sample_rate,
                                            start_samp, end_samp,
                                            pts,  &npts,
                                            mids, &nmids,
@@ -166,7 +170,7 @@ static gboolean ruler_draw(GtkWidget *widget, cairo_t *cr)
         cairo_stroke(cr);
 
         gchar tbuf[32];
-        get_time(r->sample_rate, pts[i], end_samp, tbuf, default_timescale_mode);
+        format_timecode(r->sample_rate, pts[i], end_samp, tbuf, default_timescale_mode);
         cairo_text_extents_t ext;
         cairo_text_extents(cr, tbuf, &ext);
         double lx = x + 3.0;
