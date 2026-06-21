@@ -9,8 +9,9 @@ CLAUDE.md
 *.la
 *.lo
 
-# Compiled binary
+# Compiled binaries
 src/jackdaw
+src/jackdaw-lv2ui-*
 
 # Autotools generated files (if ever used)
 autom4te.cache/
