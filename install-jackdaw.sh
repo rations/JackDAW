@@ -72,7 +72,7 @@ else
     fi
     printf '%s\n' "Where should JackDAW be installed?" >&2
     printf '  %s\n' "[1] system-wide  (/usr/local) — needs root/sudo" >&2
-    printf '  %s\n' "[2] this user    ($HOME/.local)" >&2
+    printf '  %s\n' "[2] this user    ($HOME/.local) — files local; package install still uses sudo" >&2
     printf '%s' "Choice [1]: " >&2
     read -r _choice || _choice=1
     case "${_choice:-1}" in
@@ -89,19 +89,28 @@ ICONROOT="$DATADIR/icons/hicolor"
 PIXMAPS="$DATADIR/pixmaps"
 
 # --------------------------------------------------------------------------- #
-# Privilege escalation: route every write to PREFIX through run_priv()
+# Privilege escalation — two distinct needs:
+#   * Installing distro PACKAGES always requires root, even for a per-user
+#     (~/.local) install. These go through run_root() (sudo when not root).
+#   * Installing FILES under PREFIX needs root only when PREFIX is not writable
+#     by us (i.e. a system prefix). These go through run_priv().
 # --------------------------------------------------------------------------- #
+IS_ROOT=0; [ "$(id -u)" -eq 0 ] && IS_ROOT=1
+SUDO=""
+if [ "$IS_ROOT" -eq 0 ] && command -v sudo >/dev/null 2>&1; then SUDO="sudo"; fi
+CAN_ROOT=0; { [ "$IS_ROOT" -eq 1 ] || [ -n "$SUDO" ]; } && CAN_ROOT=1
+
+# Run a command as root (package installs). Callers guard on CAN_ROOT first.
+run_root() { if [ "$IS_ROOT" -eq 1 ]; then "$@"; else $SUDO "$@"; fi; }
+
+# File writes under PREFIX: escalate only when PREFIX is not writable by us.
 NEED_SUDO=0
-if [ "$(id -u)" -ne 0 ]; then
-    # We need elevation only when the prefix root is not writable by us.
+if [ "$IS_ROOT" -eq 0 ]; then
     _probe="$PREFIX"
     while [ -n "$_probe" ] && [ ! -e "$_probe" ]; do _probe=$(dirname "$_probe"); done
     if [ ! -w "${_probe:-/}" ]; then
-        if command -v sudo >/dev/null 2>&1; then
-            NEED_SUDO=1
-        else
-            die "no write access to $PREFIX and sudo not found; re-run as root or use PREFIX=\$HOME/.local"
-        fi
+        if [ -n "$SUDO" ]; then NEED_SUDO=1
+        else die "no write access to $PREFIX and sudo not found; re-run as root or use PREFIX=\$HOME/.local"; fi
     fi
 fi
 run_priv() { if [ "$NEED_SUDO" -eq 1 ]; then sudo "$@"; else "$@"; fi; }
@@ -166,15 +175,21 @@ pkg_list() {
 pkg_install() {
     local pkgs="$1"
     [ -n "$pkgs" ] || return 0
+    if [ "$CAN_ROOT" -eq 0 ]; then
+        warn "not root and sudo not found — cannot install packages."
+        warn "Install these yourself, then re-run with --no-deps: $pkgs"
+        return 0
+    fi
+    [ "$IS_ROOT" -eq 1 ] || log "Package install needs root — you may be prompted for your sudo password."
     log "Installing packages: $pkgs"
     case "$PM" in
-        apt)    run_priv apt-get update -qq || warn "apt-get update failed"
-                run_priv apt-get install -y $pkgs || warn "some packages failed to install (may already be present)" ;;
-        dnf)    run_priv dnf install -y $pkgs    || warn "some packages failed to install (may already be present)" ;;
-        yum)    run_priv yum install -y $pkgs    || warn "some packages failed to install (may already be present)" ;;
-        pacman) run_priv pacman -S --needed --noconfirm $pkgs || warn "some packages failed to install (may already be present)" ;;
-        zypper) run_priv zypper install -y $pkgs || warn "some packages failed to install (may already be present)" ;;
-        apk)    run_priv apk add $pkgs           || warn "some packages failed to install (may already be present)" ;;
+        apt)    run_root apt-get update -qq || warn "apt-get update failed"
+                run_root apt-get install -y $pkgs || warn "some packages failed to install (may already be present)" ;;
+        dnf)    run_root dnf install -y $pkgs    || warn "some packages failed to install (may already be present)" ;;
+        yum)    run_root yum install -y $pkgs    || warn "some packages failed to install (may already be present)" ;;
+        pacman) run_root pacman -S --needed --noconfirm $pkgs || warn "some packages failed to install (may already be present)" ;;
+        zypper) run_root zypper install -y $pkgs || warn "some packages failed to install (may already be present)" ;;
+        apk)    run_root apk add $pkgs           || warn "some packages failed to install (may already be present)" ;;
         *)      warn "unknown package manager; skipping dependency install" ;;
     esac
 }
@@ -264,13 +279,18 @@ install_icons() {
 
 install_desktop() {
     [ -f jackdaw.desktop.in ] || { warn "jackdaw.desktop.in missing; skipping launcher"; return 0; }
-    local tmp; tmp=$(mktemp)
+    # Stage in a temp dir as jackdaw.desktop: desktop-file-validate rejects any
+    # name without a .desktop extension, so a bare mktemp name would fail
+    # validation on the filename alone, not the content.
+    local tmpd tmp
+    tmpd=$(mktemp -d)
+    tmp="$tmpd/jackdaw.desktop"
     sed "s|@bindir@|$BINDIR|g" jackdaw.desktop.in > "$tmp"
     if command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$tmp" || warn "desktop file failed validation (continuing)"
     fi
     run_priv install -Dm644 "$tmp" "$APPDIR/jackdaw.desktop"
-    rm -f "$tmp"
+    rm -rf "$tmpd"
     log "Installed launcher to $APPDIR/jackdaw.desktop"
 }
 
@@ -354,5 +374,5 @@ For low-latency audio, make sure your user can lock memory and is in the
     # and add to /etc/security/limits.d/audio.conf:
     #   @audio   -  rtprio     95
     #   @audio   -  memlock    unlimited
-(Then log out and back in.) JackDAW uses no systemd services.
+(Then log out and back in.)
 EOF
