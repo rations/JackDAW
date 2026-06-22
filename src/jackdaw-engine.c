@@ -1895,6 +1895,24 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         }
     }
 
+    /* Auto-connect out_N → physical audio playback ports by matching index, so
+     * out_1→playback_1, out_2→playback_2, ... Don't rely on JACK's own
+     * auto-connect (it's off unless the client requests it and many setups
+     * disable it), so wire it here the same way MIDI is. EEXIST is fine. */
+    {
+        const char **phys_audio_in = jack_get_ports(engine.client, NULL,
+            JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput | JackPortIsPhysical);
+        if (phys_audio_in) {
+            guint pi;
+            for (pi = 0; pi < engine.audio_out_count && phys_audio_in[pi]; pi++) {
+                const char *src = jack_port_name(engine.audio_out[pi]);
+                int r = jack_connect(engine.client, src, phys_audio_in[pi]);
+                (void)r; /* EEXIST is fine */
+            }
+            jack_free(phys_audio_in);
+        }
+    }
+
     /* Auto-connect physical MIDI capture ports → midi_in_N by matching index, so
      * capture_1→midi_in_1, capture_2→midi_in_2, ... This makes each midi_in port
      * a stable mirror of the hardware input of the same number (the way a track's
