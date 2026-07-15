@@ -12,6 +12,7 @@
 #include "midiclip.h"
 #include "pluginhost.h"
 #include "jackdaw-engine.h"
+#include "midicontrol.h"
 
 G_DEFINE_TYPE(JackDawProject, jackdaw_project, G_TYPE_OBJECT)
 
@@ -977,6 +978,10 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
                            jackdaw_track_is_muted(p->master_track) ? 1 : 0);
     project_save_fx(kf, p->master_track, "master");
 
+    /* MIDI control-surface mappings (reference track/FX indices, hence project
+     * scoped). The device connection itself is global (~/.jackdaw/config). */
+    midicontrol_save_keyfile(kf);
+
     /* Roll the previous save into a single backup, overwritten on each save so
      * the project directory keeps exactly one <name>.jdaw.bak rather than a
      * growing pile. Copy (not rename) so the live .jdaw survives if the new
@@ -1195,6 +1200,10 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
             jackdaw_track_fx_remove(p->master_track, 0);
         project_load_fx(kf, p->master_track, "master");
     }
+
+    /* MIDI control-surface mappings (cleared + reloaded so sessions don't leak
+     * mappings into each other). Targets are re-validated at dispatch time. */
+    midicontrol_load_keyfile(kf);
 
     g_key_file_free(kf);
     g_free(projdir);

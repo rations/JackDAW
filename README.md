@@ -299,9 +299,3 @@ A background thread then prints one line per second with xrun counts, callback
 timing versus the buffer deadline, and the worst-case `process()` time per
 plugin. When unset, the per-cycle cost is a couple of branch checks.
 
----
-
-## License
-
-JackDAW is distributed under the **GNU General Public License, version 2**.
-See [LICENSE](LICENSE) for the full text.

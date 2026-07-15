@@ -40,9 +40,11 @@ struct _JackDawMainWindow {
     GtkWidget *metro_window;   /* metronome settings window; NULL until created */
     GtkWidget *countin_window; /* count-in settings window; NULL until created */
     GtkWidget *io_window;      /* Inputs/Outputs settings window; NULL until created */
+    GtkWidget *midictl_window; /* MIDI control-surface window; NULL until created */
 
     guint      track_counter;   /* incremented for "Track N" names */
     guint      transport_timer; /* 100 ms source id for time display */
+    guint      midictl_timer;   /* control-surface drain timer source id */
 };
 
 struct _JackDawMainWindowClass {

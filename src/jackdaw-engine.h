@@ -184,6 +184,21 @@ gboolean jackdaw_engine_set_audio_source_l(JackDawTrack *t, const gchar *port_na
 gboolean jackdaw_engine_set_audio_source_r(JackDawTrack *t, const gchar *port_name);
 gboolean jackdaw_engine_set_midi_source (JackDawTrack *t, const gchar *port_name);
 
+/* --- MIDI control surface input (main thread only) ---
+ * jackdaw registers a dedicated MIDI input port "control_in", entirely separate
+ * from track recording/instrument routing. A footswitch / control device is
+ * connected here; the process callback copies its events into a lock-free ring
+ * that the main thread drains (see midicontrol.c). */
+typedef struct { guint8 size; guint8 data[3]; } JackDawCtlEvent;
+/* Dequeue one buffered control event. Returns FALSE when none are pending. */
+gboolean     jackdaw_engine_control_poll(JackDawCtlEvent *out);
+/* Connect (port_name) or disconnect (NULL/empty) an external MIDI source to
+ * control_in. port_name comes only from jackdaw_engine_list_midi_sources().
+ * Returns FALSE on success, TRUE on failure. */
+gboolean     jackdaw_engine_set_control_source(const gchar *port_name);
+/* The currently connected control source port name, or NULL. Borrowed. */
+const gchar *jackdaw_engine_get_control_source(void);
+
 G_END_DECLS
 
 #endif /* JACKDAW_ENGINE_H_INCLUDED */

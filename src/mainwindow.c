@@ -12,6 +12,8 @@
 #include "message.h"
 #include "settings.h"
 #include "fxwindow.h"
+#include "pluginhost.h"
+#include "midicontrol.h"
 #include "render.h"
 #include "render_dialog.h"
 
@@ -1387,6 +1389,469 @@ static void menu_item(GtkWidget *menu, const gchar *label,
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
 }
 
+/* ---- MIDI control-surface window (Options -> MIDI Control) ---------------- */
+
+static const char *const midictl_action_labels[] = {
+    "Toggle FX Bypass",
+    "Momentary FX Bypass",
+    "Set Wet/Dry Mix",
+    "Set FX Parameter",
+    "Toggle Track Mute",
+    "Switch Group (gapless)",
+    "Transport: Play/Stop",
+    "Transport: Stop",
+    "Transport: Record",
+};
+
+/* Forward decls (the row callbacks and the rebuild are mutually recursive). */
+static void mw_midictl_rebuild         (JackDawMainWindow *win);
+static void mw_midictl_schedule_rebuild(JackDawMainWindow *win);
+static void mw_midictl_populate_devices(JackDawMainWindow *win);
+
+static void midictl_trigger_text(const MidiCtlMapping *m, char *buf, gsize n)
+{
+    if (m->msg_type == MIDI_CTL_UNLEARNED) {
+        g_strlcpy(buf, "(unlearned)", n);
+        return;
+    }
+    const char *t = m->msg_type == MIDI_CTL_CC      ? "CC"   :
+                    m->msg_type == MIDI_CTL_NOTE    ? "Note" :
+                    m->msg_type == MIDI_CTL_PROGRAM ? "PGM"  : "Bend";
+    if (m->msg_type == MIDI_CTL_PITCHBEND) {
+        if (m->channel < 0) g_snprintf(buf, n, "%s (any ch)", t);
+        else                g_snprintf(buf, n, "%s ch%d", t, m->channel + 1);
+    } else if (m->channel < 0) {
+        g_snprintf(buf, n, "%s %d (any ch)", t, m->number);
+    } else {
+        g_snprintf(buf, n, "%s %d ch%d", t, m->number, m->channel + 1);
+    }
+}
+
+/* Resolve a mapping's track from the live project (for the FX/param combos). */
+static JackDawTrack *midictl_row_track(JackDawMainWindow *win, MidiCtlMapping *m)
+{
+    if (m->track_index < 0 ||
+        (guint)m->track_index >= jackdaw_project_track_count(win->project))
+        return NULL;
+    return jackdaw_project_get_track(win->project, (guint)m->track_index);
+}
+
+static void mw_midictl_learn_clicked(GtkButton *b, gpointer data)
+{
+    (void)data;
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "row"));
+    midicontrol_set_learn(i);
+    gtk_button_set_label(b, "Press a control…");
+}
+
+static void mw_midictl_action_changed(GtkComboBox *c, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(c), "row"));
+    MidiCtlMapping *m = midicontrol_get((guint)i);
+    if (!m) return;
+    gint a = gtk_combo_box_get_active(c);
+    if (a < 0) return;
+    m->action = (guint8)a;
+    if (a == ACT_SWITCH_GROUP && m->switch_group < 0) m->switch_group = 0;
+    mw_midictl_schedule_rebuild(win);
+}
+
+static void mw_midictl_track_changed(GtkComboBox *c, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(c), "row"));
+    MidiCtlMapping *m = midicontrol_get((guint)i);
+    if (!m) return;
+    gint a = gtk_combo_box_get_active(c);   /* 0 = None */
+    m->track_index = a - 1;
+    m->fx_index    = -1;                     /* FX slot is track-relative */
+    m->param_index = -1;
+    mw_midictl_schedule_rebuild(win);
+}
+
+static void mw_midictl_fx_changed(GtkComboBox *c, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(c), "row"));
+    MidiCtlMapping *m = midicontrol_get((guint)i);
+    if (!m) return;
+    gint a = gtk_combo_box_get_active(c);   /* 0 = None */
+    m->fx_index    = a - 1;
+    m->param_index = -1;
+    mw_midictl_schedule_rebuild(win);
+}
+
+static void mw_midictl_param_changed(GtkComboBox *c, gpointer data)
+{
+    (void)data;
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(c), "row"));
+    MidiCtlMapping *m = midicontrol_get((guint)i);
+    if (!m) return;
+    m->param_index = gtk_combo_box_get_active(c) - 1;  /* 0 = None */
+}
+
+static void mw_midictl_group_changed(GtkSpinButton *sb, gpointer data)
+{
+    (void)data;
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(sb), "row"));
+    MidiCtlMapping *m = midicontrol_get((guint)i);
+    if (m) m->switch_group = gtk_spin_button_get_value_as_int(sb);
+}
+
+static void mw_midictl_remove_clicked(GtkButton *b, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gint i = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "row"));
+    midicontrol_remove((guint)i);
+    mw_midictl_schedule_rebuild(win);
+}
+
+static void mw_midictl_add_clicked(GtkButton *b, gpointer data)
+{
+    (void)b;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    midicontrol_add(NULL);
+    mw_midictl_schedule_rebuild(win);
+}
+
+/* Build one mapping row's widgets. External strings (track / plugin / param
+ * names) go through plain-text combo appends — never markup (security rule). */
+static void mw_midictl_build_row(JackDawMainWindow *win, guint i)
+{
+    GtkWidget *box = g_object_get_data(G_OBJECT(win->midictl_window), "rows-box");
+    MidiCtlMapping *m = midicontrol_get(i);
+    if (!box || !m) return;
+
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+
+    char tb[64];
+    midictl_trigger_text(m, tb, sizeof tb);
+    GtkWidget *trig = gtk_label_new(NULL);
+    gtk_label_set_text(GTK_LABEL(trig), tb);
+    gtk_widget_set_size_request(trig, 120, -1);
+    gtk_widget_set_halign(trig, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(row), trig, FALSE, FALSE, 0);
+
+    GtkWidget *learn = gtk_button_new_with_label(
+        midicontrol_get_learn() == (gint)i ? "Press a control…" : "Learn");
+    g_object_set_data(G_OBJECT(learn), "row", GINT_TO_POINTER(i));
+    g_signal_connect(learn, "clicked",
+                     G_CALLBACK(mw_midictl_learn_clicked), win);
+    gtk_box_pack_start(GTK_BOX(row), learn, FALSE, FALSE, 0);
+
+    /* Action combo. set_active before connect so the resync isn't a real edit. */
+    GtkWidget *act = gtk_combo_box_text_new();
+    for (guint a = 0; a < G_N_ELEMENTS(midictl_action_labels); a++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(act),
+                                       midictl_action_labels[a]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(act), m->action);
+    g_object_set_data(G_OBJECT(act), "row", GINT_TO_POINTER(i));
+    g_signal_connect(act, "changed",
+                     G_CALLBACK(mw_midictl_action_changed), win);
+    gtk_box_pack_start(GTK_BOX(row), act, FALSE, FALSE, 0);
+
+    gboolean is_transport = (m->action >= ACT_TRANSPORT_PLAY);
+    gboolean track_only   = (m->action == ACT_TOGGLE_MUTE ||
+                             m->action == ACT_SWITCH_GROUP);
+
+    /* Track combo (everything except transport targets a track). */
+    if (!is_transport) {
+        GtkWidget *trk = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(trk), "None");
+        guint tc = jackdaw_project_track_count(win->project);
+        for (guint t = 0; t < tc; t++) {
+            JackDawTrack *tt = jackdaw_project_get_track(win->project, t);
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(trk),
+                                           jackdaw_track_get_name(tt));
+        }
+        gint sel = (m->track_index >= 0 && (guint)m->track_index < tc)
+                   ? m->track_index + 1 : 0;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(trk), sel);
+        g_object_set_data(G_OBJECT(trk), "row", GINT_TO_POINTER(i));
+        g_signal_connect(trk, "changed",
+                         G_CALLBACK(mw_midictl_track_changed), win);
+        gtk_box_pack_start(GTK_BOX(row), trk, FALSE, FALSE, 0);
+    }
+
+    /* FX slot combo (FX actions only). */
+    if (!is_transport && !track_only) {
+        GtkWidget *fx = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fx), "None");
+        JackDawTrack *tt = midictl_row_track(win, m);
+        guint fc = tt ? jackdaw_track_fx_count(tt) : 0;
+        for (guint f = 0; f < fc; f++) {
+            PluginInstance *inst = jackdaw_track_fx_get(tt, f);
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(fx),
+                inst ? pluginhost_name(inst) : "?");
+        }
+        gint sel = (m->fx_index >= 0 && (guint)m->fx_index < fc)
+                   ? m->fx_index + 1 : 0;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(fx), sel);
+        g_object_set_data(G_OBJECT(fx), "row", GINT_TO_POINTER(i));
+        g_signal_connect(fx, "changed",
+                         G_CALLBACK(mw_midictl_fx_changed), win);
+        gtk_box_pack_start(GTK_BOX(row), fx, FALSE, FALSE, 0);
+    }
+
+    /* Parameter combo (Set FX Parameter only). */
+    if (m->action == ACT_SET_PARAM) {
+        GtkWidget *par = gtk_combo_box_text_new();
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(par), "None");
+        JackDawTrack *tt = midictl_row_track(win, m);
+        PluginInstance *inst = (tt && m->fx_index >= 0 &&
+                                (guint)m->fx_index < jackdaw_track_fx_count(tt))
+                               ? jackdaw_track_fx_get(tt, (guint)m->fx_index)
+                               : NULL;
+        guint pc = inst ? pluginhost_param_count(inst) : 0;
+        for (guint pi = 0; pi < pc && pi < 512; pi++) {
+            const char *pn = pluginhost_param_name(inst, pi);
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(par),
+                                           pn ? pn : "?");
+        }
+        gint sel = (m->param_index >= 0 && (guint)m->param_index < pc)
+                   ? m->param_index + 1 : 0;
+        gtk_combo_box_set_active(GTK_COMBO_BOX(par), sel);
+        g_object_set_data(G_OBJECT(par), "row", GINT_TO_POINTER(i));
+        g_signal_connect(par, "changed",
+                         G_CALLBACK(mw_midictl_param_changed), win);
+        gtk_box_pack_start(GTK_BOX(row), par, FALSE, FALSE, 0);
+    }
+
+    /* Switch-group selector (Switch Group only). */
+    if (m->action == ACT_SWITCH_GROUP) {
+        gtk_box_pack_start(GTK_BOX(row), gtk_label_new("Group"),
+                           FALSE, FALSE, 0);
+        GtkWidget *grp = gtk_spin_button_new_with_range(0, 63, 1);
+        gtk_spin_button_set_value(GTK_SPIN_BUTTON(grp),
+                                  m->switch_group >= 0 ? m->switch_group : 0);
+        g_object_set_data(G_OBJECT(grp), "row", GINT_TO_POINTER(i));
+        g_signal_connect(grp, "value-changed",
+                         G_CALLBACK(mw_midictl_group_changed), win);
+        gtk_box_pack_start(GTK_BOX(row), grp, FALSE, FALSE, 0);
+    }
+
+    GtkWidget *rm = gtk_button_new_with_label("✕");
+    gtk_widget_set_tooltip_text(rm, "Remove mapping");
+    g_object_set_data(G_OBJECT(rm), "row", GINT_TO_POINTER(i));
+    g_signal_connect(rm, "clicked",
+                     G_CALLBACK(mw_midictl_remove_clicked), win);
+    gtk_box_pack_end(GTK_BOX(row), rm, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
+}
+
+static void mw_midictl_rebuild(JackDawMainWindow *win)
+{
+    if (!win->midictl_window) return;
+    GtkWidget *box = g_object_get_data(G_OBJECT(win->midictl_window), "rows-box");
+    if (!box) return;
+
+    GList *kids = gtk_container_get_children(GTK_CONTAINER(box));
+    for (GList *l = kids; l; l = l->next)
+        gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(kids);
+
+    guint n = midicontrol_count();
+    for (guint i = 0; i < n; i++)
+        mw_midictl_build_row(win, i);
+
+    gtk_widget_show_all(box);
+}
+
+/* Rebuilding tears down the very widget whose signal we're handling, so defer
+ * it to an idle (one pending rebuild at a time). */
+static gboolean mw_midictl_rebuild_idle(gpointer data)
+{
+    JackDawMainWindow *win = data;
+    if (JACKDAW_IS_MAIN_WINDOW(win) && win->midictl_window) {
+        g_object_set_data(G_OBJECT(win->midictl_window),
+                          "rebuild-pending", NULL);
+        mw_midictl_rebuild(win);
+    }
+    return G_SOURCE_REMOVE;
+}
+
+static void mw_midictl_schedule_rebuild(JackDawMainWindow *win)
+{
+    if (!win->midictl_window) return;
+    if (g_object_get_data(G_OBJECT(win->midictl_window), "rebuild-pending"))
+        return;
+    g_object_set_data(G_OBJECT(win->midictl_window),
+                      "rebuild-pending", GINT_TO_POINTER(1));
+    g_idle_add(mw_midictl_rebuild_idle, win);
+}
+
+/* midicontrol fires this after a learn capture: refresh the list (which also
+ * re-labels the armed Learn button back to "Learn"). */
+static void mw_midictl_changed_cb(gpointer data)
+{
+    mw_midictl_schedule_rebuild(JACKDAW_MAIN_WINDOW(data));
+}
+
+/* midicontrol transport hook: drive the toolbar buttons so the UI stays in
+ * sync (mirrors the Transport menu callbacks). */
+static void mw_midictl_transport(int which, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    switch (which) {
+    case ACT_TRANSPORT_PLAY: {
+        GtkToggleButton *b = GTK_TOGGLE_BUTTON(win->play_button);
+        gtk_toggle_button_set_active(b, !gtk_toggle_button_get_active(b));
+        break;
+    }
+    case ACT_TRANSPORT_REC: {
+        GtkToggleButton *b = GTK_TOGGLE_BUTTON(win->record_button);
+        gtk_toggle_button_set_active(b, !gtk_toggle_button_get_active(b));
+        break;
+    }
+    case ACT_TRANSPORT_STOP:
+        jackdaw_engine_stop_playback();
+        jackdaw_engine_stop_recording();
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->play_button),   FALSE);
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(win->record_button), FALSE);
+        break;
+    }
+}
+
+static void mw_midictl_device_changed(GtkComboBox *c, gpointer data)
+{
+    (void)data;
+    gchar *txt = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(c));
+    if (!txt) return;
+    if (g_strcmp0(txt, "None") == 0) {
+        jackdaw_engine_set_control_source(NULL);
+        settings_set_string("control_in_source", "");
+    } else {
+        jackdaw_engine_set_control_source(txt);
+        settings_set_string("control_in_source", txt);
+    }
+    settings_save();
+    g_free(txt);
+}
+
+static void mw_midictl_populate_devices(JackDawMainWindow *win)
+{
+    GtkWidget *combo =
+        g_object_get_data(G_OBJECT(win->midictl_window), "dev-combo");
+    if (!combo) return;
+
+    g_signal_handlers_block_by_func(combo,
+        G_CALLBACK(mw_midictl_device_changed), win);
+    gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(combo));
+    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), "None");
+
+    const gchar *cur   = jackdaw_engine_get_control_source();
+    gchar       *saved = settings_get_string("control_in_source", "");
+    const gchar *want  = (cur && *cur) ? cur :
+                         (saved && *saved ? saved : NULL);
+
+    gint sel = 0, idx = 1;
+    gchar **srcs = jackdaw_engine_list_midi_sources();
+    if (srcs) {
+        for (gchar **s = srcs; *s; s++, idx++) {
+            gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo), *s);
+            if (want && g_strcmp0(*s, want) == 0) sel = idx;
+        }
+        g_strfreev(srcs);
+    }
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo), sel);
+    g_free(saved);
+    g_signal_handlers_unblock_by_func(combo,
+        G_CALLBACK(mw_midictl_device_changed), win);
+}
+
+static void mw_midictl_ports_changed(JackDawProject *p, gpointer data)
+{
+    (void)p;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (win->midictl_window) mw_midictl_populate_devices(win);
+}
+
+static gboolean mw_midictl_window_delete_cb(GtkWidget *w, GdkEvent *e, gpointer d)
+{
+    (void)e; (void)d;
+    gtk_widget_hide(w);
+    midicontrol_set_learn(-1);   /* disarm any pending learn */
+    return TRUE;                 /* keep the singleton alive */
+}
+
+static void mw_open_midictl_window(JackDawMainWindow *win)
+{
+    if (!win->midictl_window) {
+        win->midictl_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win->midictl_window), "MIDI Control");
+        gtk_window_set_default_size(GTK_WINDOW(win->midictl_window), 680, 380);
+        gtk_window_set_transient_for(GTK_WINDOW(win->midictl_window),
+                                     GTK_WINDOW(win));
+        g_signal_connect(win->midictl_window, "delete-event",
+                         G_CALLBACK(mw_midictl_window_delete_cb), win);
+
+        GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+        gtk_container_set_border_width(GTK_CONTAINER(vbox), 10);
+        gtk_container_add(GTK_CONTAINER(win->midictl_window), vbox);
+
+        GtkWidget *drow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+        gtk_box_pack_start(GTK_BOX(drow), gtk_label_new("Control device:"),
+                           FALSE, FALSE, 0);
+        GtkWidget *dev = gtk_combo_box_text_new();
+        g_object_set_data(G_OBJECT(win->midictl_window), "dev-combo", dev);
+        g_signal_connect(dev, "changed",
+                         G_CALLBACK(mw_midictl_device_changed), win);
+        gtk_box_pack_start(GTK_BOX(drow), dev, TRUE, TRUE, 0);
+        gtk_box_pack_start(GTK_BOX(vbox), drow, FALSE, FALSE, 0);
+
+        GtkWidget *hint = gtk_label_new(
+            "Connect a footswitch / controller above, then map its buttons and "
+            "pedals below. Click Learn and move the control to bind it.");
+        gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
+        gtk_widget_set_halign(hint, GTK_ALIGN_START);
+        gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);
+
+        GtkWidget *scroll = gtk_scrolled_window_new(NULL, NULL);
+        gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll),
+                                       GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        gtk_box_pack_start(GTK_BOX(vbox), scroll, TRUE, TRUE, 0);
+        GtkWidget *rows = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+        gtk_container_add(GTK_CONTAINER(scroll), rows);
+        g_object_set_data(G_OBJECT(win->midictl_window), "rows-box", rows);
+
+        GtkWidget *add = gtk_button_new_with_label("Add Mapping");
+        gtk_widget_set_halign(add, GTK_ALIGN_START);
+        g_signal_connect(add, "clicked",
+                         G_CALLBACK(mw_midictl_add_clicked), win);
+        gtk_box_pack_start(GTK_BOX(vbox), add, FALSE, FALSE, 0);
+
+        /* Refresh the device list when JACK ports come and go; refresh the row
+         * list when a learn capture lands. Connected once, for the app's life. */
+        g_signal_connect(win->project, "ports-changed",
+                         G_CALLBACK(mw_midictl_ports_changed), win);
+        midicontrol_set_changed_cb(mw_midictl_changed_cb, win);
+    }
+
+    mw_midictl_populate_devices(win);
+    mw_midictl_rebuild(win);
+    gtk_widget_show_all(win->midictl_window);
+    gtk_window_present(GTK_WINDOW(win->midictl_window));
+}
+
+static void mw_midictl_menu_cb(GtkMenuItem *m, gpointer data)
+{
+    (void)m;
+    mw_open_midictl_window(JACKDAW_MAIN_WINDOW(data));
+}
+
+/* Drain control-surface events queued by the RT thread and dispatch them. */
+static gboolean mw_midictl_timer(gpointer data)
+{
+    JackDawMainWindow *win = data;
+    if (!JACKDAW_IS_MAIN_WINDOW(win)) return G_SOURCE_REMOVE;
+    JackDawCtlEvent ev;
+    while (jackdaw_engine_control_poll(&ev))
+        midicontrol_dispatch_event(win->project, ev.data, ev.size);
+    return G_SOURCE_CONTINUE;
+}
+
 /* ---- GObject boilerplate ---- */
 
 static void jackdaw_main_window_finalize(GObject *obj)
@@ -1396,6 +1861,12 @@ static void jackdaw_main_window_finalize(GObject *obj)
         g_source_remove(win->transport_timer);
         win->transport_timer = 0;
     }
+    if (win->midictl_timer) {
+        g_source_remove(win->midictl_timer);
+        win->midictl_timer = 0;
+    }
+    midicontrol_set_changed_cb(NULL, NULL);
+    midicontrol_set_transport_cb(NULL, NULL);
     g_object_unref(win->project);
     G_OBJECT_CLASS(jackdaw_main_window_parent_class)->finalize(obj);
 }
@@ -1421,6 +1892,8 @@ static void jackdaw_main_window_init(JackDawMainWindow *win)
     win->mixer_in_window = FALSE;
     win->track_counter   = 0;
     win->transport_timer = 0;
+    win->midictl_window  = NULL;
+    win->midictl_timer   = 0;
 }
 
 /* ---- Constructor ---- */
@@ -1551,6 +2024,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
               G_CALLBACK(mw_io_menu_cb), win, 0, 0, ag);
     menu_item(m, "_Plugins…",
               G_CALLBACK(mw_plugins_menu_cb), win, 0, 0, ag);
+    menu_item(m, "_MIDI Control…",
+              G_CALLBACK(mw_midictl_menu_cb), win, 0, 0, ag);
 
     /* ---- Transport toolbar ---- */
     GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
@@ -1714,6 +2189,11 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
                      G_CALLBACK(mw_tracks_box_press_cb), win);
 
     win->transport_timer = g_timeout_add(100, mw_transport_timer, win);
+
+    /* Control-surface drain: poll the RT->main ring at ~15 ms so a footswitch
+     * press feels immediate, and route transport actions through the toolbar. */
+    midicontrol_set_transport_cb(mw_midictl_transport, win);
+    win->midictl_timer = g_timeout_add(15, mw_midictl_timer, win);
 
     gtk_widget_show_all(GTK_WIDGET(win));
     /* Mixer hidden until toggled on */

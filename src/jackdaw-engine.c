@@ -55,6 +55,11 @@ typedef struct {
     jack_port_t **midi_in;
     jack_port_t **midi_out;
 
+    /* Dedicated control-surface MIDI input (footswitch / CC mappings). Read on
+     * the RT thread, drained on the main thread. Separate from track routing. */
+    jack_port_t  *control_in;
+    gchar        *control_src_port;  /* connected source name, or NULL */
+
     guint audio_in_count;
     guint audio_out_count;
     guint midi_in_count;
@@ -786,6 +791,7 @@ static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS];   /* 1 = all-notes-off 
 #define ENG_PREVIEW_MAX 32                    /* per-slot events drained per cycle */
 typedef struct { gint32 slot; guint8 data[3]; } EngPrevMsg;
 static jack_ringbuffer_t *eng_preview_rb;     /* SPSC: main -> RT */
+static jack_ringbuffer_t *eng_control_rb;     /* SPSC: RT -> main (control surface) */
 static guint8 eng_preview_data[JACKDAW_MAX_TRACKS][ENG_PREVIEW_MAX][3];
 static int    eng_preview_n[JACKDAW_MAX_TRACKS];
 
@@ -1185,6 +1191,25 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 guint8 *d = eng_preview_data[msg.slot][eng_preview_n[msg.slot]++];
                 d[0] = msg.data[0]; d[1] = msg.data[1]; d[2] = msg.data[2];
             }
+        }
+    }
+
+    /* Drain the dedicated control-surface input into the RT->main ring; the main
+     * thread interprets the mappings. RT side only does a bounded lock-free
+     * write (drops on overflow) — no malloc/lock/log here. */
+    if (engine.control_in && eng_control_rb) {
+        void *cbuf = jack_port_get_buffer(engine.control_in, nframes);
+        uint32_t cn = jack_midi_get_event_count(cbuf);
+        for (uint32_t c = 0; c < cn; c++) {
+            jack_midi_event_t ev;
+            if (jack_midi_event_get(&ev, cbuf, c) != 0 || ev.size < 1) continue;
+            JackDawCtlEvent cm;
+            cm.size    = (guint8)(ev.size > 3 ? 3 : ev.size);
+            cm.data[0] = ev.buffer[0];
+            cm.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
+            cm.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
+            if (jack_ringbuffer_write_space(eng_control_rb) >= sizeof cm)
+                jack_ringbuffer_write(eng_control_rb, (const char *)&cm, sizeof cm);
         }
     }
 
@@ -1838,6 +1863,11 @@ gboolean jackdaw_engine_init(JackDawProject *project)
         if (!engine.midi_out[i]) goto fail;
     }
 
+    /* Dedicated control-surface MIDI input. Literal name (never user input). */
+    engine.control_in = jack_port_register(engine.client, "control_in",
+        JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
+    if (!engine.control_in) goto fail;
+
     /* Register audio input ports: in_1 .. in_N (mono by default). The matching
      * right-channel port in_NR is registered lazily, per track, only when that
      * track is switched to stereo — so mono tracks stay single in the patchbay
@@ -1869,6 +1899,11 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     /* Preview-note queue (main thread -> RT). Sized for many in-flight clicks. */
     eng_preview_rb = jack_ringbuffer_create(256 * sizeof(EngPrevMsg));
     if (eng_preview_rb) jack_ringbuffer_mlock(eng_preview_rb);
+
+    /* Control-surface input queue (RT -> main). Footswitch events are sparse;
+     * 1024 slots is ample and the RT side drops on overflow, never blocks. */
+    eng_control_rb = jack_ringbuffer_create(1024 * sizeof(JackDawCtlEvent));
+    if (eng_control_rb) jack_ringbuffer_mlock(eng_control_rb);
 
     /* Activate — after this the process callback can be called at any time */
     if (jack_activate(engine.client) != 0) {
@@ -2039,6 +2074,42 @@ void jackdaw_engine_quit(void)
     g_free(engine.midi_out);  engine.midi_out  = NULL;
 
     if (eng_preview_rb) { jack_ringbuffer_free(eng_preview_rb); eng_preview_rb = NULL; }
+    if (eng_control_rb) { jack_ringbuffer_free(eng_control_rb); eng_control_rb = NULL; }
+    engine.control_in = NULL;   /* unregistered by jack_client_close above */
+    g_clear_pointer(&engine.control_src_port, g_free);
+}
+
+/* ---- MIDI control surface ---- */
+
+gboolean jackdaw_engine_control_poll(JackDawCtlEvent *out)
+{
+    if (!eng_control_rb || !out) return FALSE;
+    if (jack_ringbuffer_read_space(eng_control_rb) < sizeof(JackDawCtlEvent))
+        return FALSE;
+    jack_ringbuffer_read(eng_control_rb, (char *)out, sizeof(JackDawCtlEvent));
+    return TRUE;
+}
+
+gboolean jackdaw_engine_set_control_source(const gchar *port_name)
+{
+    if (!engine.active || !engine.client || !engine.control_in) return TRUE;
+    const char *dst = jack_port_name(engine.control_in);
+
+    if (engine.control_src_port) {
+        jack_disconnect(engine.client, engine.control_src_port, dst);
+        g_clear_pointer(&engine.control_src_port, g_free);
+    }
+    if (port_name && *port_name) {
+        int r = jack_connect(engine.client, port_name, dst);
+        if (r != 0 && r != EEXIST) return TRUE;
+        engine.control_src_port = g_strdup(port_name);
+    }
+    return FALSE;
+}
+
+const gchar *jackdaw_engine_get_control_source(void)
+{
+    return engine.control_src_port;
 }
 
 void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
