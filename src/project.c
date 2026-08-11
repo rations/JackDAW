@@ -5,6 +5,7 @@
 #include <glib/gstdio.h>
 
 #include "project.h"
+#include "tempomap.h"
 #include "settings.h"
 #include "track.h"
 #include "audio_clip.h"
@@ -116,6 +117,7 @@ static void jackdaw_project_init(JackDawProject *p)
     p->beats_per_bar     = 4;
     p->beat_unit         = 4;
     p->grid_enabled      = FALSE;
+    p->grid_unit         = TEMPOMAP_GRID_BEAT;
     p->snap_enabled      = FALSE;
     p->metronome_enabled = FALSE;
     p->metronome_volume_db = 0.0;  /* unity; loaded per-project from save file */
@@ -566,16 +568,30 @@ gdouble jackdaw_project_frames_per_bar(JackDawProject *p, guint32 sample_rate)
            (gdouble)(p->beats_per_bar ? p->beats_per_bar : 1);
 }
 
+void jackdaw_project_set_grid_unit(JackDawProject *p, gint unit)
+{
+    g_return_if_fail(JACKDAW_IS_PROJECT(p));
+    p->grid_unit = CLAMP(unit, 0, TEMPOMAP_GRID_LAST - 1);
+    jackdaw_project_emit_timing_changed(p);
+}
+
+gint jackdaw_project_get_grid_unit(JackDawProject *p)
+{
+    g_return_val_if_fail(JACKDAW_IS_PROJECT(p), TEMPOMAP_GRID_BEAT);
+    return p->grid_unit;
+}
+
+/* Snapping used to be hardcoded to whole beats; it now honours grid_unit
+ * (bar / beat / half / triplet / quarter) through the shared tempo map, so the
+ * ruler, the drawn grid and snapping cannot disagree about where the lines are. */
 off_t jackdaw_project_snap_frame(JackDawProject *p, off_t frame,
                                  guint32 sample_rate)
 {
     g_return_val_if_fail(JACKDAW_IS_PROJECT(p), frame);
     if (!p->snap_enabled) return frame;
-    gdouble fpb = jackdaw_project_frames_per_beat(p, sample_rate);
-    if (fpb <= 0.0) return frame;
-    gdouble n = (gdouble)frame / fpb;
-    off_t snapped = (off_t)(floor(n + 0.5) * fpb);
-    return snapped < 0 ? 0 : snapped;
+    TempoMap tm;
+    tempomap_from_project(&tm, p, sample_rate);
+    return tempomap_snap_frame(&tm, frame, (TempoMapGrid)p->grid_unit);
 }
 
 /* ============================ Save / Load ===============================
@@ -869,6 +885,7 @@ gboolean jackdaw_project_save(JackDawProject *p, const gchar *path)
     g_key_file_set_double (kf, "project", "master_volume",
                            jackdaw_track_get_volume(p->master_track));
     g_key_file_set_boolean(kf, "project", "grid", p->grid_enabled);
+    g_key_file_set_integer(kf, "project", "grid_unit", p->grid_unit);
     g_key_file_set_boolean(kf, "project", "snap", p->snap_enabled);
     g_key_file_set_boolean(kf, "project", "metronome", p->metronome_enabled);
     g_key_file_set_double (kf, "project", "metronome_volume", p->metronome_volume_db);
@@ -1043,6 +1060,9 @@ gboolean jackdaw_project_load(JackDawProject *p, const gchar *path)
     p->beat_unit     = CLAMP(kf_int(kf, "project", "beat_unit", 4), 1, 32);
     p->master_volume = CLAMP(kf_dbl(kf, "project", "master_volume", 1.0), 0.0, 2.0);
     p->grid_enabled      = kf_bool(kf, "project", "grid", FALSE);
+    p->grid_unit         = CLAMP(kf_int(kf, "project", "grid_unit",
+                                        TEMPOMAP_GRID_BEAT),
+                                 0, TEMPOMAP_GRID_LAST - 1);
     p->snap_enabled      = kf_bool(kf, "project", "snap", FALSE);
     p->metronome_enabled = kf_bool(kf, "project", "metronome", FALSE);
     p->metronome_volume_db =

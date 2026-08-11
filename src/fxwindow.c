@@ -340,6 +340,8 @@ typedef struct {
     GtkWidget      *shown;       /* currently displayed GUI (owned by instance) */
     GtkWidget      *mix_scale;   /* wet/dry for the selected effect */
     GtkWidget      *mix_row;     /* the dry/wet header (hidden when none selected) */
+    GtkWidget      *file_row;    /* Load Model / Load IR (only for plug-ins that
+                                  * expose a file-loading interface) */
     guint           sel_index;   /* index of the selected effect */
     guint           fit_id;      /* deferred "fit window to plugin" timer */
     int             fit_ticks;   /* retries left to catch late-negotiating UIs */
@@ -350,6 +352,7 @@ typedef struct {
 } FxWindow;
 
 static void fxwin_rebuild_list(FxWindow *fw);
+static void fxwin_update_file_buttons(FxWindow *fw);
 
 /* Release (free) every effect's native editor before the window dies. Like jalv
  * (jalv_close -> suil_instance_free), the suil instance and its idle/push timers
@@ -426,10 +429,12 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
 {
     gpointer inst = jackdaw_track_fx_get(fw->track, index);
     if (!inst) {
-        if (fw->mix_row) gtk_widget_hide(fw->mix_row);
+        if (fw->mix_row)  gtk_widget_hide(fw->mix_row);
+        if (fw->file_row) gtk_widget_hide(fw->file_row);
         return;
     }
     fw->sel_index = index;
+    fxwin_update_file_buttons(fw);
 
     /* Reflect this effect's wet/dry without retriggering the change handler. */
     if (fw->mix_scale) {
@@ -621,6 +626,127 @@ static void fxrow_enable_toggled(GtkToggleButton *b, gpointer data)
                                     gtk_toggle_button_get_active(b));
 }
 
+/* Reclaim the removed plugin once the RT thread has cycled past the chain that
+ * referenced it. Retries until it succeeds; holds a ref so the track cannot be
+ * finalized underneath the pending collect. Without this the instance survived
+ * until the next FX edit on the same track or until app exit — which for a
+ * bridged VST3 meant its helper process stayed running that whole time. */
+static gboolean fx_collect_cb(gpointer data)
+{
+    JackDawTrack *t = data;
+    if (!jackdaw_track_fx_collect(t)) return G_SOURCE_CONTINUE;
+    g_object_unref(t);
+    return G_SOURCE_REMOVE;
+}
+
+static void fx_schedule_collect(JackDawTrack *t)
+{
+    if (!t) return;
+    g_timeout_add(250, fx_collect_cb, g_object_ref(t));
+}
+
+/* ---- Presets (selected effect) ---- */
+
+static void fxwin_preset_msg(FxWindow *fw, GtkMessageType type, const char *msg)
+{
+    GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(fw->window),
+        GTK_DIALOG_MODAL, type, GTK_BUTTONS_OK, "%s", msg);
+    gtk_dialog_run(GTK_DIALOG(d));
+    gtk_widget_destroy(d);
+}
+
+static void fxwin_preset_save_clicked(GtkButton *b, gpointer data)
+{
+    (void)b;
+    FxWindow *fw = data;
+    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
+    if (!inst) return;
+
+    GtkWidget *ch = gtk_file_chooser_dialog_new("Save Preset",
+        GTK_WINDOW(fw->window), GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(ch), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(ch), "preset.jdpreset");
+
+    if (gtk_dialog_run(GTK_DIALOG(ch)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(ch));
+        gboolean ok = path && pluginhost_preset_save(inst, path);
+        g_free(path);
+        gtk_widget_destroy(ch);
+        if (!ok)
+            fxwin_preset_msg(fw, GTK_MESSAGE_ERROR,
+                "Could not save a preset for this effect.\n\n"
+                "This plugin format does not expose a saveable state chunk.");
+        return;
+    }
+    gtk_widget_destroy(ch);
+}
+
+static void fxwin_preset_load_clicked(GtkButton *b, gpointer data)
+{
+    (void)b;
+    FxWindow *fw = data;
+    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
+    if (!inst) return;
+
+    GtkWidget *ch = gtk_file_chooser_dialog_new("Load Preset",
+        GTK_WINDOW(fw->window), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+
+    if (gtk_dialog_run(GTK_DIALOG(ch)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(ch));
+        gboolean ok = path && pluginhost_preset_load(inst, path);
+        g_free(path);
+        gtk_widget_destroy(ch);
+        if (!ok)
+            fxwin_preset_msg(fw, GTK_MESSAGE_ERROR,
+                "Could not load that preset.\n\n"
+                "Presets can only be loaded into the same plugin they were "
+                "saved from.");
+        return;
+    }
+    gtk_widget_destroy(ch);
+}
+
+/* ---- File-loading plug-ins (e.g. NAMku: "Load Model" / "Load IR") ----
+ * A path cannot be a VST3 parameter, so such plug-ins expose a dedicated
+ * interface. The buttons only appear for plug-ins that implement it. */
+static void fxwin_file_clicked(GtkButton *b, gpointer data)
+{
+    FxWindow *fw = data;
+    int which = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "ph-file-which"));
+    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
+    if (!inst || !pluginhost_has_file_loader(inst)) return;
+
+    GtkWidget *ch = gtk_file_chooser_dialog_new(
+        which == PH_FILE_MODEL ? "Load Model" : "Load Impulse Response",
+        GTK_WINDOW(fw->window), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
+
+    /* Start at the currently loaded file, if any. */
+    char cur[PATH_MAX];
+    if (pluginhost_file_get(inst, which, cur, sizeof cur) && cur[0])
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(ch), cur);
+
+    if (gtk_dialog_run(GTK_DIALOG(ch)) == GTK_RESPONSE_ACCEPT) {
+        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(ch));
+        if (path) pluginhost_file_set(inst, which, path);
+        g_free(path);
+    }
+    gtk_widget_destroy(ch);
+}
+
+/* Show/hide the file buttons for whichever effect is now selected. */
+static void fxwin_update_file_buttons(FxWindow *fw)
+{
+    if (!fw->file_row) return;
+    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
+    if (inst && pluginhost_has_file_loader(inst))
+        gtk_widget_show_all(fw->file_row);
+    else
+        gtk_widget_hide(fw->file_row);
+}
+
 static void fxrow_remove_clicked(GtkButton *b, gpointer data)
 {
     (void)b;
@@ -634,6 +760,7 @@ static void fxrow_remove_clicked(GtkButton *b, gpointer data)
     jackdaw_engine_set_suspended(TRUE);
     jackdaw_track_fx_remove(fw->track, rl->index);
     jackdaw_engine_set_suspended(FALSE);
+    fx_schedule_collect(fw->track);
     fxwin_rebuild_list(fw);
     guint n = jackdaw_track_fx_count(fw->track);
     if (n) fxwin_show_gui(fw, n - 1);
@@ -808,7 +935,35 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
                      G_CALLBACK(fxwin_mix_changed), fw);
     gtk_box_pack_start(GTK_BOX(fw->mix_row), mix_lbl, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(fw->mix_row), fw->mix_scale, TRUE, TRUE, 0);
+
+    /* Preset save/load for the selected effect. Only meaningful for backends
+     * with opaque state; the buttons report plainly when one has none. */
+    GtkWidget *psave = gtk_button_new_with_label("Save Preset\342\200\246");
+    GtkWidget *pload = gtk_button_new_with_label("Load Preset\342\200\246");
+    gtk_widget_set_tooltip_text(psave, "Save this effect's full state to a file");
+    gtk_widget_set_tooltip_text(pload, "Load a preset saved from this same effect");
+    g_signal_connect(psave, "clicked", G_CALLBACK(fxwin_preset_save_clicked), fw);
+    g_signal_connect(pload, "clicked", G_CALLBACK(fxwin_preset_load_clicked), fw);
+    gtk_box_pack_start(GTK_BOX(fw->mix_row), psave, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(fw->mix_row), pload, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(right), fw->mix_row, FALSE, FALSE, 0);
+
+    fw->file_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_container_set_border_width(GTK_CONTAINER(fw->file_row), 4);
+    {
+        GtkWidget *bm = gtk_button_new_with_label("Load Model\342\200\246");
+        GtkWidget *bi = gtk_button_new_with_label("Load IR\342\200\246");
+        g_object_set_data(G_OBJECT(bm), "ph-file-which",
+                          GINT_TO_POINTER(PH_FILE_MODEL));
+        g_object_set_data(G_OBJECT(bi), "ph-file-which",
+                          GINT_TO_POINTER(PH_FILE_IR));
+        g_signal_connect(bm, "clicked", G_CALLBACK(fxwin_file_clicked), fw);
+        g_signal_connect(bi, "clicked", G_CALLBACK(fxwin_file_clicked), fw);
+        gtk_box_pack_start(GTK_BOX(fw->file_row), bm, FALSE, FALSE, 0);
+        gtk_box_pack_start(GTK_BOX(fw->file_row), bi, FALSE, FALSE, 0);
+    }
+    gtk_box_pack_start(GTK_BOX(right), fw->file_row, FALSE, FALSE, 0);
 
     /* A stack so each effect's editor is added once and shown by switching the
      * visible child — never reparented (which would blank a native X11 UI). */

@@ -91,6 +91,8 @@ SRCS_C := \
     $(SRCDIR)/message.c \
     $(SRCDIR)/audio_clip.c \
     $(SRCDIR)/clipregion.c \
+    $(SRCDIR)/tempomap.c \
+    $(SRCDIR)/glib_check.c \
     $(SRCDIR)/midiclip.c \
     $(SRCDIR)/track.c \
     $(SRCDIR)/undo.c \

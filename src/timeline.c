@@ -9,6 +9,14 @@
 #include "midiwindow.h"
 #include "fxwindow.h"
 #include "main.h"
+#include "tempomap.h"
+
+/* Frozen-pane colours, as cairo_set_source_rgb argument lists. The lane tone
+ * matches wave_view_draw's own background so the empty area below the last
+ * track is continuous with the lanes above it. */
+#define TL_HEADER_BG  0.227, 0.227, 0.243
+#define TL_LANE_BG    0.12,  0.12,  0.12
+#define TL_DIVIDER    0.45,  0.45,  0.47
 
 /* ========================================================================
  * JackDawTimeRuler
@@ -265,22 +273,38 @@ static void wave_view_draw_grid(JackDawWaveView *wv, cairo_t *cr,
 {
     if (!wv->project || !wv->project->grid_enabled || spp <= 0.0)
         return;
-    guint32 sr  = (guint32)jackdaw_engine_get_sample_rate();
-    gdouble fpb = jackdaw_project_frames_per_beat(wv->project, sr);
-    if (fpb <= 0.0) return;
-    guint bpb = wv->project->beats_per_bar ? wv->project->beats_per_bar : 4;
+    guint32 sr = (guint32)jackdaw_engine_get_sample_rate();
+    TempoMap tm;
+    tempomap_from_project(&tm, wv->project, sr);
 
-    long b0 = (long)floor(start / fpb);
-    if (b0 < 0) b0 = 0;
+    gdouble fpb  = tempomap_frames_per_beat(&tm);
+    /* Draw the grid the user actually snaps to, not always whole beats. */
+    gdouble step = tempomap_grid_frames(&tm,
+                       (TempoMapGrid)wv->project->grid_unit);
+    if (fpb <= 0.0 || step <= 0.0) return;
+    /* Below a few pixels apart the lines are noise, not a grid. */
+    if (step / spp < 4.0) step = fpb;
+    if (step / spp < 4.0) return;
+
+    gdouble fpbar = tempomap_frames_per_bar(&tm);
+
+    long g0 = (long)floor(start / step);
+    if (g0 < 0) g0 = 0;
     cairo_set_line_width(cr, 1.0);
-    for (long b = b0; ; b++) {
-        double x = ((gdouble)b * fpb - start) / spp;
+    for (long g = g0; ; g++) {
+        gdouble f = (gdouble)g * step;
+        double  x = (f - start) / spp;
         if (x > (double)w) break;
         if (x < 0.0) continue;
-        if ((b % bpb) == 0)
-            cairo_set_source_rgba(cr, 0.50, 0.50, 0.56, 0.50); /* bar */
+        /* Emphasis: bar line > beat line > subdivision. */
+        gdouble mod_bar  = fmod(f, fpbar);
+        gdouble mod_beat = fmod(f, fpb);
+        if (fpbar > 0.0 && (mod_bar < 1.0 || fpbar - mod_bar < 1.0))
+            cairo_set_source_rgba(cr, 0.50, 0.50, 0.56, 0.50);   /* bar */
+        else if (mod_beat < 1.0 || fpb - mod_beat < 1.0)
+            cairo_set_source_rgba(cr, 0.30, 0.30, 0.33, 0.40);   /* beat */
         else
-            cairo_set_source_rgba(cr, 0.30, 0.30, 0.33, 0.40); /* beat */
+            cairo_set_source_rgba(cr, 0.26, 0.26, 0.29, 0.25);   /* subdivision */
         cairo_move_to(cr, floor(x) + 0.5, 0);
         cairo_line_to(cr, floor(x) + 0.5, h);
         cairo_stroke(cr);
@@ -1269,10 +1293,12 @@ static void menu_split_cb(GtkMenuItem *item, gpointer data)
     timeline_split_track_at_playhead(tl, tl->menu_track);
 }
 
-static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
+/* Delete the current selection. `fallback` is the track the rubber-band range
+ * applies to when there is no section selection — the right-clicked track from
+ * the context menu, the focused track from the Edit menu. */
+static void timeline_delete_selection(JackDawTimeline *tl,
+                                      JackDawTrack *fallback)
 {
-    (void)item;
-    JackDawTimeline *tl = data;
     int sr = (int)timeline_jack_sr();
 
     /* Instrument track: remove the selected MIDI sections outright. */
@@ -1310,14 +1336,26 @@ static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
         return;
     }
 
-    if (!tl->menu_track || !tl->sel_active) return;
+    if (!fallback || !tl->sel_active) return;
     off_t a = tl->sel_start, b = tl->sel_end;
     if (b < a) { off_t tmp = a; a = b; b = tmp; }
-    timeline_push_undo(tl, tl->menu_track);
-    clip_region_list_delete_range(jackdaw_track_get_regions(tl->menu_track),
-                                  a, b, sr);
-    jackdaw_track_commit_regions(tl->menu_track);
+    timeline_push_undo(tl, fallback);
+    clip_region_list_delete_range(jackdaw_track_get_regions(fallback), a, b, sr);
+    jackdaw_track_commit_regions(fallback);
     jackdaw_timeline_redraw_all(tl);
+}
+
+static void menu_delete_sel_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    JackDawTimeline *tl = data;
+    timeline_delete_selection(tl, tl->menu_track);
+}
+
+void jackdaw_timeline_delete_selection(JackDawTimeline *tl)
+{
+    g_return_if_fail(JACKDAW_IS_TIMELINE(tl));
+    timeline_delete_selection(tl, tl->focused_track);
 }
 
 /* Replace the clipboard with `regs` (consumed): copies normalized so the
@@ -1341,13 +1379,42 @@ static void timeline_clipboard_set(JackDawTimeline *tl, GPtrArray *regs)
 /* Copy the selected area to the clipboard.  Mirrors menu_delete_sel_cb's
  * selection model: prefer the section selection, else the rubber-band range
  * (sliced sample-rate-correctly out of `range_track`). */
+/* Replace the MIDI clipboard with copies of `regs` (MidiRegion*), normalized so
+ * the earliest starts at frame 0.
+ *
+ * The copies are frozen (auto_grow = FALSE) so a pasted section keeps the size
+ * it was copied at, instead of silently expanding to cover every note in the
+ * shared source clip the way an untouched full-clip region does. */
+static void timeline_midi_clipboard_set(JackDawTimeline *tl, GPtrArray *regs)
+{
+    g_ptr_array_set_size(tl->midi_clipboard, 0);
+    if (!regs || regs->len == 0) return;
+
+    off_t origin = ((MidiRegion *)g_ptr_array_index(regs, 0))->tl_pos;
+    for (guint i = 1; i < regs->len; i++) {
+        off_t p = ((MidiRegion *)g_ptr_array_index(regs, i))->tl_pos;
+        if (p < origin) origin = p;
+    }
+    for (guint i = 0; i < regs->len; i++) {
+        MidiRegion *c = midi_region_copy(g_ptr_array_index(regs, i));
+        c->tl_pos  -= origin;
+        c->auto_grow = FALSE;
+        g_ptr_array_add(tl->midi_clipboard, c);
+    }
+}
+
 static void timeline_copy_selection(JackDawTimeline *tl, JackDawTrack *range_track)
 {
     int sr = (int)timeline_jack_sr();
 
     if (tl->sel_track && tl->sel_regions && tl->sel_regions->len > 0) {
-        if (jackdaw_track_is_instrument(tl->sel_track)) return;  /* audio only */
+        if (jackdaw_track_is_instrument(tl->sel_track)) {
+            timeline_midi_clipboard_set(tl, tl->sel_regions);
+            g_ptr_array_set_size(tl->clipboard, 0);   /* one clipboard is live */
+            return;
+        }
         timeline_clipboard_set(tl, tl->sel_regions);
+        g_ptr_array_set_size(tl->midi_clipboard, 0);
         return;
     }
 
@@ -1367,11 +1434,61 @@ static void timeline_copy_selection(JackDawTimeline *tl, JackDawTrack *range_tra
     g_ptr_array_unref(tmp);
 }
 
+/* Paste the MIDI clipboard onto an instrument track at the playhead, overwriting
+ * the paste span: split the existing sections at both edges, drop whatever now
+ * falls entirely inside, then place the copies. */
+static void timeline_paste_midi_to_track(JackDawTimeline *tl, JackDawTrack *dest)
+{
+    if (!tl->midi_clipboard || tl->midi_clipboard->len == 0) return;
+
+    double fpt = timeline_frames_per_tick(tl);
+    if (fpt <= 0.0) return;
+
+    off_t at = (off_t)gtk_adjustment_get_value(tl->cursor_adj);
+    if (at < 0) at = 0;
+
+    off_t span = 0;                    /* normalized width of the clipboard */
+    for (guint i = 0; i < tl->midi_clipboard->len; i++) {
+        off_t end = midi_region_end(g_ptr_array_index(tl->midi_clipboard, i), fpt);
+        if (end > span) span = end;
+    }
+    if (span <= 0) return;
+
+    GPtrArray *regs = jackdaw_track_get_midi_regions(dest);
+    timeline_push_undo(tl, dest);
+
+    midi_region_list_split_at(regs, at,        fpt);
+    midi_region_list_split_at(regs, at + span, fpt);
+
+    /* Drop the sections now wholly inside the paste span. One tick of slack
+     * absorbs the rounding in the tick<->frame conversion at the split edges. */
+    off_t eps = (off_t)fpt + 1;
+    for (guint i = regs->len; i > 0; ) {
+        MidiRegion *r = g_ptr_array_index(regs, --i);
+        off_t s = r->tl_pos, e = midi_region_end(r, fpt);
+        if (s >= at - eps && e <= at + span + eps)
+            g_ptr_array_remove_index(regs, i);
+    }
+
+    for (guint i = 0; i < tl->midi_clipboard->len; i++) {
+        MidiRegion *c = midi_region_copy(g_ptr_array_index(tl->midi_clipboard, i));
+        c->tl_pos += at;
+        g_ptr_array_add(regs, c);
+    }
+    midi_region_list_sort(regs);
+    track_commit_sections(tl, dest);
+    jackdaw_timeline_redraw_all(tl);
+}
+
 /* Paste the clipboard onto `dest`, anchored at the playhead.  The paste span is
  * cleared first (overwrite) so no regions overlap. */
 static void timeline_paste_to_track(JackDawTimeline *tl, JackDawTrack *dest)
 {
-    if (!dest || jackdaw_track_is_instrument(dest)) return;
+    if (!dest) return;
+    if (jackdaw_track_is_instrument(dest)) {
+        timeline_paste_midi_to_track(tl, dest);
+        return;
+    }
     if (!tl->clipboard || tl->clipboard->len == 0) return;
 
     off_t at = (off_t)gtk_adjustment_get_value(tl->cursor_adj);
@@ -1542,20 +1659,30 @@ static void timeline_show_context_menu(JackDawTimeline *tl, GdkEventButton *ev)
 {
     GtkWidget *menu = gtk_menu_new();
     /* The track the section ops will act on (selection track, else the one under
-     * the pointer). Copy/Paste/Gain/Group are audio-only — disable on MIDI. */
+     * the pointer). Gain/Group remain audio-only; Copy/Paste now work on MIDI
+     * sections too, through a separate clipboard. */
     JackDawTrack *op_track = (tl->sel_regions && tl->sel_regions->len > 0)
         ? tl->sel_track : tl->menu_track;
     gboolean op_audio = op_track && !jackdaw_track_is_instrument(op_track);
+    gboolean op_midi  = op_track && jackdaw_track_is_instrument(op_track);
     gboolean have_sel = (tl->sel_regions && tl->sel_regions->len > 0) ||
                         tl->sel_active;
     gboolean can_group = tl->sel_regions && tl->sel_regions->len >= 2 && op_audio;
-    gboolean can_paste = tl->clipboard && tl->clipboard->len > 0 &&
-                         tl->menu_track &&
-                         !jackdaw_track_is_instrument(tl->menu_track);
+
+    /* A MIDI copy only pastes onto an instrument track, an audio copy only onto
+     * an audio track — the source material and the destination must agree. */
+    gboolean can_copy = have_sel &&
+                        (op_audio ||
+                         (op_midi && tl->sel_regions && tl->sel_regions->len > 0));
+    gboolean dest_midi = tl->menu_track &&
+                         jackdaw_track_is_instrument(tl->menu_track);
+    gboolean can_paste = tl->menu_track &&
+        (dest_midi ? (tl->midi_clipboard && tl->midi_clipboard->len > 0)
+                   : (tl->clipboard      && tl->clipboard->len      > 0));
     struct { const char *label; GCallback cb; gboolean sens; } items[] = {
         { "Split at Playhead",   G_CALLBACK(menu_split_cb),         TRUE },
         { "Delete Selected Area",G_CALLBACK(menu_delete_sel_cb),    have_sel },
-        { "Copy",                G_CALLBACK(menu_copy_cb),          have_sel && op_audio },
+        { "Copy",                G_CALLBACK(menu_copy_cb),          can_copy },
         { "Paste at Playhead",   G_CALLBACK(menu_paste_cb),         can_paste },
         { "Set Selection Gain…", G_CALLBACK(menu_gain_cb),          have_sel && op_audio },
         { "Group Sections",      G_CALLBACK(menu_group_cb),         can_group },
@@ -1915,6 +2042,8 @@ static gboolean timeline_wave_scroll(GtkWidget *widget,
 /* 50 ms timer: update playhead and auto-scroll to follow it */
 static void master_vu_tick(JackDawTimeline *tl);   /* defined with master row */
 
+static GtkWidget *timeline_lane_ref(JackDawTimeline *tl);
+
 static gboolean timeline_update_timer(gpointer data)
 {
     JackDawTimeline *tl = data;
@@ -1922,10 +2051,16 @@ static gboolean timeline_update_timer(gpointer data)
 
     master_vu_tick(tl);   /* refresh the master header meter (decays when idle) */
 
-    /* Keep the horizontal scrollbar's range in sync with content + view. */
+    /* Keep the horizontal scrollbar's range in sync with content + view.
+     *
+     * Measure a lane, not the ruler. The two are inset to the same width now,
+     * but the visible time span is a property of the lanes; deriving the page
+     * size from the ruler is what let the scrollbar range and the drawn
+     * waveforms disagree whenever the two widths drifted apart. Fall back to
+     * the ruler when there are no tracks to measure. */
     {
         GtkAllocation ra;
-        gtk_widget_get_allocation(GTK_WIDGET(tl->ruler), &ra);
+        gtk_widget_get_allocation(timeline_lane_ref(tl), &ra);
         if (ra.width > 0) {
             gdouble spp  = gtk_adjustment_get_value(tl->zoom_adj);
             gdouble page = (gdouble)ra.width * spp;
@@ -2193,6 +2328,7 @@ static void jackdaw_timeline_finalize(GObject *obj)
     if (tl->move_pre) g_hash_table_destroy(tl->move_pre);
     if (tl->sel_regions) g_ptr_array_unref(tl->sel_regions);
     if (tl->clipboard) g_ptr_array_unref(tl->clipboard);
+    if (tl->midi_clipboard) g_ptr_array_unref(tl->midi_clipboard);
     g_free(tl->move_orig);
 
     G_OBJECT_CLASS(jackdaw_timeline_parent_class)->finalize(obj);
@@ -2223,6 +2359,7 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->cursor_adj         = NULL;
     tl->ruler              = NULL;
     tl->tracks_scroll      = NULL;
+    tl->tracks_bg          = NULL;
     tl->tracks_box         = NULL;
     tl->focused_track      = NULL;
     tl->header_size_group  = NULL;
@@ -2257,6 +2394,8 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     tl->menu_frame    = 0;
     tl->clipboard     = g_ptr_array_new_with_free_func(
                             (GDestroyNotify)clip_region_free);
+    tl->midi_clipboard = g_ptr_array_new_with_free_func(
+                            (GDestroyNotify)midi_region_free);
     tl->hscroll       = NULL;
 
     gtk_orientable_set_orientation(GTK_ORIENTABLE(tl),
@@ -2264,7 +2403,24 @@ static void jackdaw_timeline_init(JackDawTimeline *tl)
     gtk_box_set_spacing(GTK_BOX(tl), 0);
 }
 
+static gboolean tracks_box_draw_bg   (GtkWidget *w, cairo_t *cr, gpointer data);
 static gboolean tracks_box_draw_after(GtkWidget *w, cairo_t *cr, gpointer data);
+static gboolean tracks_bg_button_press(GtkWidget *w, GdkEventButton *ev,
+                                       gpointer data);
+
+/* Width the vertical scrollbar takes out of the track area. The ruler and the
+ * horizontal scrollbar are inset by the same amount so that the moment the
+ * track list overflows and the scrollbar appears, the lanes do not shrink out
+ * from under the ruler. Overlay scrolling is disabled and the policy is ALWAYS
+ * so this is a constant, not a function of how many tracks exist. */
+static gint timeline_vscrollbar_width(GtkWidget *scrolled)
+{
+    GtkWidget *vsb = gtk_scrolled_window_get_vscrollbar(
+        GTK_SCROLLED_WINDOW(scrolled));
+    gint min = 0, nat = 0;
+    if (vsb) gtk_widget_get_preferred_width(vsb, &min, &nat);
+    return (nat > 0) ? nat : (min > 0 ? min : 13);
+}
 
 GtkWidget *jackdaw_timeline_new(JackDawProject *project)
 {
@@ -2273,15 +2429,27 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
     JackDawTimeline *tl = g_object_new(JACKDAW_TYPE_TIMELINE, NULL);
     tl->project = project;
 
-    tl->time_adj   = gtk_adjustment_new(0.0, 0.0, (gdouble)G_MAXINT64,
-                                        1024.0, 4096.0, 0.0);
-    tl->zoom_adj   = gtk_adjustment_new(1000.0, 1.0, 2000000.0,
-                                        100.0, 1000.0, 0.0);
-    tl->cursor_adj = gtk_adjustment_new(0.0, 0.0, (gdouble)G_MAXINT64,
-                                        1.0, 1.0, 0.0);
+    /* ref_sink, not a bare assignment: gtk_adjustment_new() returns a FLOATING
+     * reference, and gtk_scrollbar_new() below sinks it and takes ownership of
+     * time_adj. The timeline's own finalize then unref'd an adjustment it did
+     * not hold a reference to — once the scrollbar and the last wave view were
+     * destroyed the object was already gone, and shutdown ended in
+     * "g_object_unref: assertion 'G_IS_OBJECT (object)' failed". Sinking here
+     * gives the timeline a real reference to match that unref, whatever the
+     * children do with theirs. */
+    tl->time_adj   = g_object_ref_sink(gtk_adjustment_new(
+                         0.0, 0.0, (gdouble)G_MAXINT64, 1024.0, 4096.0, 0.0));
+    tl->zoom_adj   = g_object_ref_sink(gtk_adjustment_new(
+                         1000.0, 1.0, 2000000.0, 100.0, 1000.0, 0.0));
+    tl->cursor_adj = g_object_ref_sink(gtk_adjustment_new(
+                         0.0, 0.0, (gdouble)G_MAXINT64, 1.0, 1.0, 0.0));
 
-    /* Size group: keeps ruler spacer and every track strip at the same width.
-     * No fixed pixel values needed — GTK negotiates based on actual content. */
+    /* Size group: keeps the ruler spacer and every track strip at the same
+     * width. Every member is independently pinned to TIMELINE_HEADER_WIDTH
+     * (the strip via its get_preferred_width* overrides, the spacers via a size
+     * request) — the group only guarantees they stay in step, it must never be
+     * the thing that decides the width, or one over-wide strip would drag the
+     * whole column and the ruler with it. */
     tl->header_size_group = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
 
     /* ---- Ruler row ---- */
@@ -2289,6 +2457,7 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
 
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_size_request(spacer, TIMELINE_HEADER_WIDTH, -1);
+    gtk_widget_set_hexpand(spacer, FALSE);
     gtk_size_group_add_widget(tl->header_size_group, spacer);
 
     guint32 sr = jackdaw_engine_is_running()
@@ -2309,28 +2478,72 @@ GtkWidget *jackdaw_timeline_new(JackDawProject *project)
     g_signal_connect(GTK_WIDGET(tl->ruler), "button-release-event",
         G_CALLBACK(ruler_button_release_cb), tl);
 
-    gtk_box_pack_start(GTK_BOX(ruler_row), spacer,         FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(ruler_row), GTK_WIDGET(tl->ruler), TRUE, TRUE, 0);
-
     /* ---- Scrolled window for track rows ---- */
     tl->tracks_scroll = gtk_scrolled_window_new(NULL, NULL);
+    /* ALWAYS + no overlay scrolling: the gutter is a constant the ruler and the
+     * horizontal scrollbar can be inset by. With AUTOMATIC the bar appears the
+     * moment the track list overflows and silently narrows every lane (the
+     * ruler, being outside this scrolled window, does not narrow) — the lanes
+     * visibly resized and drifted out of register with the ruler by the
+     * scrollbar's width as soon as one track too many was added. */
     gtk_scrolled_window_set_policy(
         GTK_SCROLLED_WINDOW(tl->tracks_scroll),
-        GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+        GTK_POLICY_NEVER, GTK_POLICY_ALWAYS);
+    gtk_scrolled_window_set_overlay_scrolling(
+        GTK_SCROLLED_WINDOW(tl->tracks_scroll), FALSE);
 
-    tl->tracks_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 1);
-    gtk_container_add(GTK_CONTAINER(tl->tracks_scroll), tl->tracks_box);
-    /* Drawn after children so the reorder insertion line sits on top. */
+    gint gutter = timeline_vscrollbar_width(tl->tracks_scroll);
+
+    GtkWidget *ruler_gutter = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(ruler_gutter, gutter, -1);
+    gtk_widget_set_hexpand(ruler_gutter, FALSE);
+
+    gtk_box_pack_start(GTK_BOX(ruler_row), spacer,         FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(ruler_row), GTK_WIDGET(tl->ruler), TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(ruler_row), ruler_gutter,   FALSE, FALSE, 0);
+
+    /* Spacing 0: a 1px gap between rows was a full-width band of bare theme
+     * colour that cut straight through the header column and its divider. */
+    tl->tracks_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_vexpand(tl->tracks_box, TRUE);
+    /* Background under the rows, divider + reorder insertion line over them. */
+    g_signal_connect(tl->tracks_box, "draw",
+                     G_CALLBACK(tracks_box_draw_bg), tl);
     g_signal_connect_after(tl->tracks_box, "draw",
                            G_CALLBACK(tracks_box_draw_after), tl);
+
+    /* Input-only wrapper: picks up clicks that land in the header column or the
+     * lane area below the last track, where there is no strip or wave view to
+     * receive them. Invisible, so it cannot paint over the background above. */
+    tl->tracks_bg = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(tl->tracks_bg), FALSE);
+    gtk_widget_add_events(tl->tracks_bg, GDK_BUTTON_PRESS_MASK);
+    g_signal_connect(tl->tracks_bg, "button-press-event",
+                     G_CALLBACK(tracks_bg_button_press), tl);
+    gtk_container_add(GTK_CONTAINER(tl->tracks_bg), tl->tracks_box);
+    gtk_container_add(GTK_CONTAINER(tl->tracks_scroll), tl->tracks_bg);
 
     gtk_box_pack_start(GTK_BOX(tl), ruler_row,         FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(tl), tl->tracks_scroll, TRUE,  TRUE,  0);
 
     /* Horizontal scrollbar bound to the shared time adjustment. Its bounds
-     * are kept in sync with the project length by the update timer. */
+     * are kept in sync with the project length by the update timer. Inset to
+     * span exactly the lane area, so the thumb position is honest about which
+     * part of the timeline is on screen. */
+    GtkWidget *hscroll_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    GtkWidget *hs_spacer   = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(hs_spacer, TIMELINE_HEADER_WIDTH, -1);
+    gtk_widget_set_hexpand(hs_spacer, FALSE);
+    gtk_size_group_add_widget(tl->header_size_group, hs_spacer);
+    GtkWidget *hs_gutter = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_set_size_request(hs_gutter, gutter, -1);
+    gtk_widget_set_hexpand(hs_gutter, FALSE);
+
     tl->hscroll = gtk_scrollbar_new(GTK_ORIENTATION_HORIZONTAL, tl->time_adj);
-    gtk_box_pack_start(GTK_BOX(tl), tl->hscroll, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hscroll_row), hs_spacer,   FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(hscroll_row), tl->hscroll, TRUE,  TRUE,  0);
+    gtk_box_pack_start(GTK_BOX(hscroll_row), hs_gutter,   FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(tl), hscroll_row, FALSE, FALSE, 0);
 
     gtk_widget_show_all(GTK_WIDGET(tl));
 
@@ -2516,13 +2729,48 @@ static void track_drag_data_received(GtkWidget *w, GdkDragContext *ctx,
     gtk_drag_finish(ctx, ok, FALSE, time);
 }
 
-/* Insertion line drawn across the whole track column during a reorder drag. */
+/* Frozen-pane background, painted UNDER the track rows for the full height of
+ * the track area — not just the span the rows happen to occupy.
+ *
+ * Track strips are per-row cells, so before this existed there was no header
+ * *column* at all: with zero tracks, or in the space below the last track, the
+ * bare window background showed through and the timeline read as one
+ * undifferentiated surface with no boundary between the strips and the lanes.
+ * Filling both bands here makes the divider (stroked on top in
+ * tracks_box_draw_after) present regardless of track count. */
+static gboolean tracks_box_draw_bg(GtkWidget *w, cairo_t *cr, gpointer data)
+{
+    (void)data;
+    GtkAllocation a;
+    gtk_widget_get_allocation(w, &a);
+
+    cairo_set_source_rgb(cr, TL_HEADER_BG);
+    cairo_rectangle(cr, 0, 0, TIMELINE_HEADER_WIDTH, a.height);
+    cairo_fill(cr);
+
+    cairo_set_source_rgb(cr, TL_LANE_BG);
+    cairo_rectangle(cr, TIMELINE_HEADER_WIDTH, 0,
+                    a.width - TIMELINE_HEADER_WIDTH, a.height);
+    cairo_fill(cr);
+
+    return FALSE;   /* let the rows draw on top */
+}
+
+/* Column divider (always) + the reorder insertion line (during a drag), both
+ * drawn after the rows so neither can be painted over by a strip background. */
 static gboolean tracks_box_draw_after(GtkWidget *w, cairo_t *cr, gpointer data)
 {
     JackDawTimeline *tl = data;
-    if (!tl->drop_active) return FALSE;
     GtkAllocation a;
     gtk_widget_get_allocation(w, &a);
+
+    cairo_set_source_rgb(cr, TL_DIVIDER);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, TIMELINE_HEADER_WIDTH - 0.5, 0);
+    cairo_line_to(cr, TIMELINE_HEADER_WIDTH - 0.5, a.height);
+    cairo_stroke(cr);
+
+    if (!tl->drop_active) return FALSE;
     double yy = tl->drop_y + 0.5;
     cairo_set_source_rgb(cr, 0.20, 0.55, 1.0);     /* accent blue */
     cairo_set_line_width(cr, 2.0);
@@ -2534,6 +2782,41 @@ static gboolean tracks_box_draw_after(GtkWidget *w, cairo_t *cr, gpointer data)
     cairo_arc(cr, a.width - 3, yy, 3, 0, 2 * G_PI);
     cairo_fill(cr);
     return FALSE;
+}
+
+/* A widget whose width equals the visible lane span: any wave view, else the
+ * ruler (which is inset to the same width) when the project has no tracks. */
+static GtkWidget *timeline_lane_ref(JackDawTimeline *tl)
+{
+    GHashTableIter it;
+    gpointer k, v;
+    g_hash_table_iter_init(&it, tl->wave_views);
+    if (g_hash_table_iter_next(&it, &k, &v))
+        return GTK_WIDGET(v);
+    return GTK_WIDGET(tl->ruler);
+}
+
+/* Clicks in the empty part of the track area. Strips, wave views and resize
+ * handles all own their own GdkWindows, so anything that reaches the input-only
+ * wrapper landed on genuinely empty space — the header column, or the lane area
+ * below the last track.
+ *
+ * Left-click drops the current selection, matching a click on empty canvas
+ * elsewhere. Everything else is left unhandled so it propagates up to the
+ * viewport, where the main window already provides the Add Track / Add MIDI
+ * Track / Show Master Track menu on button 3. */
+static gboolean tracks_bg_button_press(GtkWidget *w, GdkEventButton *ev,
+                                       gpointer data)
+{
+    (void)w;
+    JackDawTimeline *tl = data;
+
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 1) return FALSE;
+
+    timeline_clear_section_sel(tl);
+    tl->sel_active = FALSE;
+    jackdaw_timeline_redraw_all(tl);
+    return TRUE;
 }
 
 /* Make `w` a drag grip (source + drop target) for the track described by td. */
@@ -2622,6 +2905,11 @@ void jackdaw_timeline_add_track(JackDawTimeline *tl, JackDawTrack *track)
     GtkWidget *strip  = jackdaw_track_strip_new(track, tl->project);
     GtkWidget *strip_box = gtk_event_box_new();
     gtk_container_add(GTK_CONTAINER(strip_box), strip);
+    /* Pin the wrapper too, and refuse to expand: the size group keeps the
+     * column members in step, but each one must fix its own width so no single
+     * over-wide strip can widen the column (and the ruler spacer with it). */
+    gtk_widget_set_size_request(strip_box, TIMELINE_HEADER_WIDTH, -1);
+    gtk_widget_set_hexpand(strip_box, FALSE);
     gtk_size_group_add_widget(tl->header_size_group, strip_box);
     /* Right-click the strip header → per-track context menu (Delete Track). */
     g_signal_connect(strip_box, "button-press-event",
@@ -2796,6 +3084,10 @@ void jackdaw_timeline_set_master_visible(JackDawTimeline *tl, gboolean show)
      * an L/R level meter on the right, like a normal track strip. */
     GtkWidget *hdr = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 2);
     gtk_container_set_border_width(GTK_CONTAINER(hdr), 4);
+    /* Pinned like every other column member: its content is measured, so
+     * without this the master row alone could widen the whole header column. */
+    gtk_widget_set_size_request(hdr, TIMELINE_HEADER_WIDTH, -1);
+    gtk_widget_set_hexpand(hdr, FALSE);
     gtk_size_group_add_widget(tl->header_size_group, hdr);
 
     GtkWidget *lbl = gtk_label_new("Master");

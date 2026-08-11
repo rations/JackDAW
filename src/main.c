@@ -8,6 +8,7 @@
 #include <malloc.h>     /* mallopt */
 
 #include "main.h"
+#include "glib_check.h"
 #include "settings.h"
 #include "project.h"
 #include "jackdaw-engine.h"
@@ -204,6 +205,13 @@ int main(int argc, char **argv)
      * process during scanning. */
     if (argc >= 4 && !strcmp(argv[1], "--scan-plugin"))
         return pluginhost_scan_helper_main(argc, argv);
+
+    /* Fail fast and legibly on a broken glib: header/runtime version skew, a
+     * GObject type system that cannot instantiate, or broken atomics (which the
+     * whole main<->RT thread protocol depends on). Without this, any of those
+     * surfaces much later as an unexplained crash. */
+    if (jackdaw_glib_check() != 0)
+        return 1;
 
     /* Real-time memory hardening (the main process only — never the throwaway
      * scanner above). The JACK process thread must never take a major page fault

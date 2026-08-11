@@ -17,6 +17,7 @@
 #include <lv2/log/log.h>
 #include <lv2/instance-access/instance-access.h>
 #include <lv2/data-access/data-access.h>
+#include <lv2/state/state.h>
 #include <jack/ringbuffer.h>
 #include <semaphore.h>
 #include <stdint.h>
@@ -767,6 +768,116 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi) { (void)pi; return NULL; }
 static void lv2_destroy_gui(PluginInstance *pi) { (void)pi; }
 #endif
 
+/* ---- Opaque state (project save/reload) ----
+ *
+ * The control-port values alone are NOT an LV2 plugin's full state: anything
+ * behind state:interface — a convolver's loaded IR, a sampler's loaded file, a
+ * neural amp model — lives only in the plugin's own state. Without these ops
+ * project_save_fx() wrote no `state` blob for LV2 at all, so every such plugin
+ * came back empty on reload. Serialised as Turtle text via lilv, which is what
+ * lilv_state_new_from_string() consumes on the way back in. */
+
+#define LV2_STATE_MAX (16u << 20)   /* bound untrusted project-file input */
+
+/* Port symbol for a control-port index, or NULL. */
+static const char *lv2_port_sym(Lv2Backend *b, guint port_index)
+{
+    const LilvPort *p = lilv_plugin_get_port_by_index(b->plugin, port_index);
+    const LilvNode *s = p ? lilv_port_get_symbol(b->plugin, p) : NULL;
+    return s ? lilv_node_as_string(s) : NULL;
+}
+
+static const void *lv2_get_port_value(const char *sym, void *user,
+                                      uint32_t *size, uint32_t *type)
+{
+    PluginInstance *pi = user;
+    Lv2Backend *b = pi->backend;
+    for (guint i = 0; i < b->n_params; i++) {
+        const char *s = lv2_port_sym(b, b->params[i].port_index);
+        if (s && !strcmp(s, sym)) {
+            *size = sizeof(float);
+            *type = urid_map_cb(NULL, LV2_ATOM__Float);
+            return &b->ctl[b->params[i].port_index];
+        }
+    }
+    *size = 0; *type = 0;
+    return NULL;
+}
+
+static void lv2_set_port_value(const char *sym, void *user, const void *value,
+                               uint32_t size, uint32_t type)
+{
+    PluginInstance *pi = user;
+    Lv2Backend *b = pi->backend;
+    float v;
+
+    if (type == urid_map_cb(NULL, LV2_ATOM__Float) && size == sizeof(float))
+        v = *(const float *)value;
+    else if (type == urid_map_cb(NULL, LV2_ATOM__Int) && size == sizeof(int32_t))
+        v = (float)*(const int32_t *)value;
+    else if (type == urid_map_cb(NULL, LV2_ATOM__Double) && size == sizeof(double))
+        v = (float)*(const double *)value;
+    else if (type == urid_map_cb(NULL, LV2_ATOM__Bool) && size == sizeof(int32_t))
+        v = (*(const int32_t *)value) ? 1.0f : 0.0f;
+    else
+        return;                                   /* unknown encoding: ignore */
+
+    for (guint i = 0; i < b->n_params; i++) {
+        const char *s = lv2_port_sym(b, b->params[i].port_index);
+        if (s && !strcmp(s, sym)) {
+            b->ctl[b->params[i].port_index] =
+                CLAMP(v, b->params[i].min, b->params[i].max);
+            return;
+        }
+    }
+}
+
+static gboolean lv2_state_save(PluginInstance *pi, void **out, gsize *out_len)
+{
+    Lv2Backend *b = pi->backend;
+    if (!b || !b->inst[0] || !out || !out_len) return FALSE;
+
+    LilvState *st = lilv_state_new_from_instance(
+        b->plugin, b->inst[0], &urid_map,
+        NULL, NULL, NULL, NULL,
+        lv2_get_port_value, pi,
+        LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE, NULL);
+    if (!st) return FALSE;
+
+    char *str = lilv_state_to_string(world, &urid_map, &urid_unmap, st,
+                                     "urn:jackdaw:state", NULL);
+    lilv_state_free(st);
+    if (!str) return FALSE;
+
+    gsize len = strlen(str);
+    *out = g_memdup2(str, len);
+    *out_len = len;
+    lilv_free(str);
+    return *out != NULL;
+}
+
+static gboolean lv2_state_load(PluginInstance *pi, const void *data, gsize len)
+{
+    Lv2Backend *b = pi->backend;
+    if (!b || !b->inst[0] || !data || len == 0 || len > LV2_STATE_MAX)
+        return FALSE;
+
+    /* Untrusted project-file input: bounded above, and NUL-terminated in a
+     * private copy before the Turtle parser sees it. */
+    char *str = g_malloc(len + 1);
+    memcpy(str, data, len);
+    str[len] = 0;
+
+    LilvState *st = lilv_state_new_from_string(world, &urid_map, str);
+    g_free(str);
+    if (!st) return FALSE;
+
+    for (int k = 0; k < b->n_inst; k++)
+        lilv_state_restore(st, b->inst[k], lv2_set_port_value, pi, 0, NULL);
+    lilv_state_free(st);
+    return TRUE;
+}
+
 static const PhOps lv2_ops = {
     .process     = lv2_process,
     .process_midi = lv2_process_midi,
@@ -779,6 +890,8 @@ static const PhOps lv2_ops = {
     .param_set   = lv2_param_set,
     .param_range = lv2_param_range,
     .reset       = lv2_reset,
+    .state_save  = lv2_state_save,
+    .state_load  = lv2_state_load,
 };
 
 /* ---- Instantiate ---- */

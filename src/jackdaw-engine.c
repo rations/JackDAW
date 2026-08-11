@@ -35,6 +35,19 @@
 /* Diagnostics (JACKDAW_DIAG) — declared up here so engine_process() can write
  * them; the xrun callback + reporter thread live near jackdaw_engine_init(). */
 static volatile gint   g_diag_xruns      = 0;
+
+/* Per-plugin worst-case process() time (microseconds) for the current reporting
+ * second, indexed [track slot][chain position]. Written by the RT thread that
+ * owns the slot, drained by the diag thread. A plain compare-and-store rather
+ * than a CAS loop: two threads racing on one element can at worst drop a sample
+ * from a diagnostic maximum, which is not worth a CAS on the audio path. */
+/* Ceilings for the JACK port pools. The arrays are allocated at these sizes once
+ * and never resized, so the RT callback never indexes through a reallocation. */
+#define ENG_MAX_AUDIO_PORTS 64
+#define ENG_MAX_MIDI_PORTS  16
+
+#define ENG_DIAG_FX_SLOTS 8
+static volatile gint   g_diag_fx_us[JACKDAW_MAX_TRACKS][ENG_DIAG_FX_SLOTS];
 static volatile gint64 g_diag_cb_last_us = 0;
 static volatile gint64 g_diag_cb_max_us  = 0;
 static volatile gint64 g_diag_period_us  = 0;
@@ -60,10 +73,13 @@ typedef struct {
     jack_port_t  *control_in;
     gchar        *control_src_port;  /* connected source name, or NULL */
 
-    guint audio_in_count;
-    guint audio_out_count;
-    guint midi_in_count;
-    guint midi_out_count;
+    /* Live port counts. Read by the RT callback, changed from the main thread
+     * via the ordered publish in the set_*_count functions — volatile so the
+     * callback re-reads them rather than caching a stale bound. */
+    volatile guint audio_in_count;
+    volatile guint audio_out_count;
+    volatile guint midi_in_count;
+    volatile guint midi_out_count;
 
     /* Pre-allocated mix buffers (sized to max buffer size at init) */
     float *master_L;
@@ -784,6 +800,15 @@ static void recorder_stop(void)
 static guint8        eng_active_notes[JACKDAW_MAX_TRACKS][16][128];
 static volatile gint eng_midi_flush[JACKDAW_MAX_TRACKS];   /* 1 = all-notes-off */
 
+/* This cycle's merged MIDI block per slot: flushed note-offs + sequenced clip
+ * events + live thru + preview, sorted by time. Gathered once by the worker
+ * that owns the slot, then consumed twice — fed to the track's instrument
+ * plugin, and written to the track's JACK MIDI output port by the JACK thread
+ * after the barrier, so external hardware hears the same notes as the plugin.
+ * Preallocated: nothing here is sized at RT time. */
+static PhMidiEvent   eng_block_ev[JACKDAW_MAX_TRACKS][ENG_MIDI_MAX_EV];
+static int           eng_block_nev[JACKDAW_MAX_TRACKS];
+
 /* ---- Preview-note injection (main thread -> RT) ----
  * The main thread queues short MIDI messages tagged with a track slot; the RT
  * thread drains the ring once per cycle into per-slot scratch, and the gather
@@ -860,6 +885,11 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
         for (uint32_t m = 0; m < mc && nev < cap; m++) {
             jack_midi_event_t ev;
             if (jack_midi_event_get(&ev, mbuf, m) != 0 || ev.size < 1) continue;
+            /* Drop realtime messages (clock, start/stop, active sensing, reset).
+             * These get echoed straight back out midi_out below, and the common
+             * wiring has midi_out looped to the same device the events came
+             * from, which feeds the source its own clock. */
+            if (ev.buffer[0] >= 0xF8) continue;
             mev[nev].time = ev.time;
             mev[nev].size = (guint8)(ev.size > 3 ? 3 : ev.size);
             mev[nev].data[0] = ev.buffer[0];
@@ -935,7 +965,21 @@ static volatile jack_nframes_t g_rt_nframes;
 static volatile gint   g_rt_flags;
 static volatile off_t  g_rt_blk_start;
 static volatile gint   g_rt_any_soloed;
-static volatile gint   g_rt_task_next;   /* work-stealing slot index */
+static volatile gint   g_rt_task_next;   /* next index into g_rt_task_slot */
+
+/* This cycle's occupied slots, compacted. Stealing used to walk all
+ * JACKDAW_MAX_TRACKS indices to find the few that hold a track, so a one-track
+ * project still ran up to 64 contended atomic increments per worker per cycle
+ * against one cache line, plus a full pool wake — pure dispatch overhead
+ * measured in the same order as the audio work itself. */
+static int             g_rt_task_slot[JACKDAW_MAX_TRACKS];
+static volatile gint   g_rt_task_count;
+
+/* Monotonic RT cycle counter, incremented once per process callback. Used off
+ * the RT thread to establish that the audio thread has moved past a retired
+ * object (see jackdaw_track_fx_collect). Wraps harmlessly: readers compare
+ * unsigned differences. */
+static volatile gint   g_rt_cycle;
 
 /* Port buffers pre-fetched on the JACK thread (only it may call
  * jack_port_get_buffer); workers read these cached pointers. */
@@ -1011,11 +1055,16 @@ static void engine_process_track(int i)
     /* Per-track FX chain (in place on bL/bR). */
     JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
     if (instr) {
-        PhMidiEvent mev[ENG_MIDI_MAX_EV];
+        /* Gathered into per-slot storage rather than a local, so the JACK thread
+         * can also write this block to the track's MIDI output port after the
+         * worker barrier (see the midi_out loop in engine_process). Each worker
+         * owns exactly one slot per cycle, so there is no sharing. */
+        PhMidiEvent *mev = eng_block_ev[i];
         int nev = eng_gather_instrument_midi(i, t, blk_start, nframes,
                                              (flags & ENGINE_PLAYING) != 0,
                                              (tflags & TRACK_ARMED) != 0,
                                              mev, ENG_MIDI_MAX_EV);
+        eng_block_nev[i] = nev;
         if (chain && chain->n > 0) {
             pluginhost_process_midi((PluginInstance *)chain->fx[0], mev, nev,
                                     bL, bR, (int)nframes);
@@ -1027,6 +1076,22 @@ static void engine_process_track(int i)
         for (int fi = 0; fi < chain->n; fi++)
             pluginhost_process((PluginInstance *)chain->fx[fi], bL, bR,
                                (int)nframes);
+    }
+
+    /* Fold this cycle's per-plugin timings into the diag table here, on the RT
+     * thread that just produced them, while the chain snapshot is provably
+     * alive. The diag thread used to walk t->rt_chain itself and call into each
+     * PluginInstance — but an FX remove can retire and free those instances at
+     * any moment, so that read raced a use-after-free. It now touches only
+     * atomics in this table. */
+    if (g_diag_on && chain) {
+        for (int di = 0; di < chain->n; di++) {
+            gint us = (gint)pluginhost_diag_take_max_us(
+                (PluginInstance *)chain->fx[di]);
+            int fs = (di < ENG_DIAG_FX_SLOTS) ? di : ENG_DIAG_FX_SLOTS - 1;
+            if (us > g_atomic_int_get(&g_diag_fx_us[i][fs]))
+                g_atomic_int_set(&g_diag_fx_us[i][fs], us);
+        }
     }
 
     /* Constant-power pan + fader, written in place; meter post-fader. */
@@ -1082,9 +1147,9 @@ static void engine_process_track(int i)
 static void rt_run_tasks(void)
 {
     int idx;
-    while ((idx = g_atomic_int_add(&g_rt_task_next, 1)) < JACKDAW_MAX_TRACKS) {
-        if (engine.slots[idx]) engine_process_track(idx);
-    }
+    const int n = g_atomic_int_get(&g_rt_task_count);
+    while ((idx = g_atomic_int_add(&g_rt_task_next, 1)) < n)
+        engine_process_track(g_rt_task_slot[idx]);
 }
 
 static void rt_sem_wait(sem_t *s)
@@ -1113,6 +1178,10 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     gboolean any_soloed = FALSE;
     float *port_buf;
     jack_nframes_t k;
+
+    /* One increment per cycle. Off-RT code reads this to prove the audio thread
+     * has moved past a retired FX chain before freeing the instances in it. */
+    g_atomic_int_inc((gint *)&g_rt_cycle);
 
     /* Diagnostics: mark this thread as the RT callback (so the VST3 host context
      * can flag plugins that allocate here) and time the whole cycle. */
@@ -1314,11 +1383,32 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     g_rt_flags      = flags;
     g_rt_blk_start  = blk_start;
     g_rt_any_soloed = any_soloed ? 1 : 0;
+    /* Clear every slot's MIDI block up front; only instrument tracks refill it,
+     * so a slot that is empty or non-instrument this cycle writes nothing out. */
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++) eng_block_nev[i] = 0;
+
+    /* Compact this cycle's occupied slots so stealing scans only real work. */
+    int ntasks = 0;
+    for (i = 0; i < JACKDAW_MAX_TRACKS; i++)
+        if (engine.slots[i]) g_rt_task_slot[ntasks++] = (int)i;
+    g_atomic_int_set(&g_rt_task_count, ntasks);
     g_atomic_int_set(&g_rt_task_next, 0);
-    if (g_rt_nworkers > 0) {
-        for (int w = 0; w < g_rt_nworkers; w++) sem_post(&g_rt_sem_go);
+
+    /* Wake only as many workers as there is parallel work for: the JACK thread
+     * takes one track itself, so N tracks need at most N-1 helpers. Waking the
+     * whole pool for a one- or two-track project cost two semaphore round-trips
+     * per worker per cycle and had every woken thread contend for a task list it
+     * would find empty — enough wall-clock to push a heavy plugin past its
+     * deadline even though the CPU work was unchanged. With one track nobody is
+     * woken and the barrier is skipped entirely. */
+    int wake = ntasks - 1;
+    if (wake > g_rt_nworkers) wake = g_rt_nworkers;
+    if (wake < 0)             wake = 0;
+
+    if (wake > 0) {
+        for (int w = 0; w < wake; w++) sem_post(&g_rt_sem_go);
         rt_run_tasks();
-        for (int w = 0; w < g_rt_nworkers; w++) rt_sem_wait(&g_rt_sem_done);
+        for (int w = 0; w < wake; w++) rt_sem_wait(&g_rt_sem_done);
     } else {
         rt_run_tasks();
     }
@@ -1451,6 +1541,13 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 for (k = 0; k < nframes; k++) {
                     off_t a = base + (off_t)k;
                     if (a < 0) continue;
+                    /* The pre-roll sounds exactly `beats` clicks: the click at
+                     * the resolution point (count-in position countin_len)
+                     * belongs to the project's first downbeat, which the
+                     * hand-off cycle plays from play_pos. Sounding it here too
+                     * produced a doubled click — an audible flam/pop right at
+                     * the count-in -> transport transition. */
+                    if (preroll && a >= engine.countin_len) break;
                     off_t beat     = (off_t)((double)a / fpb);
                     off_t boundary = (off_t)((double)beat * fpb + 0.5);
                     off_t off      = a - boundary;
@@ -1473,30 +1570,55 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         jack_midi_clear_buffer(mbuf);
     }
 
-    /* MIDI thru: for each armed track, copy midi_in_N → midi_out_N. Several
-     * tracks may share one midi_in (same hardware source), so thru each input
-     * port at most once per block — otherwise its events would be written to the
-     * matching output multiple times. midi_in_count ≤ 16, so a u32 mask covers
-     * every index. */
-    guint32 thru_done = 0;
+    /* MIDI output, midi_out_N, where N is the track's own input index so the
+     * in_N/out_N pair belongs to one track. Two kinds of source, and a given
+     * output port must only be written by one of them per block:
+     *
+     *  - Instrument tracks emit the whole block gathered above: sequenced clip
+     *    notes, live thru, preview notes and any flushed note-offs, already
+     *    merged and sorted by time. Without this, clip playback reached the
+     *    track's instrument plugin and nothing else — an external synth or
+     *    hardware module wired to midi_out heard silence.
+     *  - Armed non-instrument tracks have no gathered block, so they still get
+     *    the plain thru copy from midi_in_N.
+     *
+     * Several tracks may share one midi_in (same hardware source), so each
+     * output index is written at most once per block; midi_in_count <= 16, so a
+     * u32 mask covers every index. */
+    guint32 out_done = 0;
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
-        gint tflags = g_atomic_int_get(&t->state_flags);
-        if (!(tflags & TRACK_ARMED)) continue;
         gint mi = t->midi_in_idx;
-        if (mi < 0 || (guint)mi >= engine.midi_in_count  || !engine.midi_in[mi])  continue;
-        if (              (guint)mi >= engine.midi_out_count || !engine.midi_out[mi]) continue;
-        if (thru_done & (1u << mi)) continue;
-        thru_done |= (1u << mi);
+        if (mi < 0 || (guint)mi >= engine.midi_out_count || !engine.midi_out[mi])
+            continue;
+        if (out_done & (1u << mi)) continue;
 
-        void *ibuf = jack_port_get_buffer(engine.midi_in[mi],  nframes);
+        gboolean instr = jackdaw_track_is_instrument(t);
+        gint tflags = g_atomic_int_get(&t->state_flags);
+        if (!instr && !(tflags & TRACK_ARMED)) continue;
+
         void *obuf = jack_port_get_buffer(engine.midi_out[mi], nframes);
+        out_done |= (1u << mi);
+
+        if (instr) {
+            for (int e = 0; e < eng_block_nev[i]; e++)
+                jack_midi_event_write(obuf, eng_block_ev[i][e].time,
+                                      eng_block_ev[i][e].data,
+                                      eng_block_ev[i][e].size);
+            continue;
+        }
+
+        if ((guint)mi >= engine.midi_in_count || !engine.midi_in[mi]) continue;
+        void *ibuf = jack_port_get_buffer(engine.midi_in[mi], nframes);
         uint32_t mc = jack_midi_get_event_count(ibuf);
         uint32_t m;
         for (m = 0; m < mc; m++) {
             jack_midi_event_t ev;
-            if (jack_midi_event_get(&ev, ibuf, m) != 0) continue;
+            if (jack_midi_event_get(&ev, ibuf, m) != 0 || ev.size < 1) continue;
+            /* Same realtime-message filter as the instrument path: the default
+             * wiring loops midi_out back to the source device. */
+            if (ev.buffer[0] >= 0xF8) continue;
             jack_midi_event_write(obuf, ev.time, ev.buffer, ev.size);
         }
     }
@@ -1725,18 +1847,20 @@ static gpointer diag_thread_func(gpointer arg)
             dx, x, (long)g_diag_cb_last_us, (long)cb_max, (long)period,
             (unsigned long)da);
 
-        /* Per-plugin worst-case process() time this second. */
+        /* Per-plugin worst case for the last second, as microseconds and as a
+         * share of the period budget — this is what attributes an xrun to one
+         * plugin rather than to the callback as a whole. Read from the table the
+         * RT thread fills; no chain snapshot or PluginInstance is touched here,
+         * because either may be freed by an FX edit at any time. */
         for (int i = 0; i < JACKDAW_MAX_TRACKS; i++) {
-            JackDawTrack *t = engine.slots[i];
-            if (!t) continue;
-            JackDawFxChain *chain = g_atomic_pointer_get(&t->rt_chain);
-            if (!chain) continue;
-            for (int fi = 0; fi < chain->n; fi++) {
-                PluginInstance *pi = (PluginInstance *)chain->fx[fi];
-                gint64 us = pluginhost_diag_take_max_us(pi);
-                if (us > 0)
-                    g_string_append_printf(s, "\n        track%d fx%d \"%s\": %ldus",
-                                           i, fi, pluginhost_name(pi), (long)us);
+            for (int fi = 0; fi < ENG_DIAG_FX_SLOTS; fi++) {
+                gint us = g_atomic_int_get(&g_diag_fx_us[i][fi]);
+                if (us <= 0) continue;
+                g_atomic_int_set(&g_diag_fx_us[i][fi], 0);
+                g_string_append_printf(s,
+                    "\n        track%d fx%d: %ldus (%.1f%% of period)",
+                    i, fi, (long)us,
+                    period > 0 ? 100.0 * (double)us / (double)period : 0.0);
             }
         }
         g_message("%s", s->str);
@@ -1845,8 +1969,10 @@ gboolean jackdaw_engine_init(JackDawProject *project)
      * (JACK lists ports by registration order). Audio ports — which the user
      * can grow at runtime — then always appear below the MIDI ports. */
 
-    /* Register MIDI input ports: midi_in_1 .. midi_in_M */
-    engine.midi_in = g_new0(jack_port_t *, engine.midi_in_count);
+    /* Every port array is allocated at its ceiling and never resized, so the RT
+     * callback can index it without ever racing a reallocation when the user
+     * changes a port count (see the set_*_count functions). */
+    engine.midi_in = g_new0(jack_port_t *, ENG_MAX_MIDI_PORTS);
     for (i = 0; i < engine.midi_in_count; i++) {
         g_snprintf(name, sizeof(name), "midi_in_%u", i + 1);
         engine.midi_in[i] = jack_port_register(engine.client, name,
@@ -1855,7 +1981,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     }
 
     /* Register MIDI output ports: midi_out_1 .. midi_out_M */
-    engine.midi_out = g_new0(jack_port_t *, engine.midi_out_count);
+    engine.midi_out = g_new0(jack_port_t *, ENG_MAX_MIDI_PORTS);
     for (i = 0; i < engine.midi_out_count; i++) {
         g_snprintf(name, sizeof(name), "midi_out_%u", i + 1);
         engine.midi_out[i] = jack_port_register(engine.client, name,
@@ -1872,8 +1998,8 @@ gboolean jackdaw_engine_init(JackDawProject *project)
      * right-channel port in_NR is registered lazily, per track, only when that
      * track is switched to stereo — so mono tracks stay single in the patchbay
      * and only stereo tracks appear as a pair. */
-    engine.audio_in   = g_new0(jack_port_t *, engine.audio_in_count);
-    engine.audio_in_r = g_new0(jack_port_t *, engine.audio_in_count);
+    engine.audio_in   = g_new0(jack_port_t *, ENG_MAX_AUDIO_PORTS);
+    engine.audio_in_r = g_new0(jack_port_t *, ENG_MAX_AUDIO_PORTS);
     for (i = 0; i < engine.audio_in_count; i++) {
         g_snprintf(name, sizeof(name), "in_%u", i + 1);
         engine.audio_in[i] = jack_port_register(engine.client, name,
@@ -1882,7 +2008,7 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     }
 
     /* Register audio output ports: out_1 .. out_N */
-    engine.audio_out = g_new0(jack_port_t *, engine.audio_out_count);
+    engine.audio_out = g_new0(jack_port_t *, ENG_MAX_AUDIO_PORTS);
     for (i = 0; i < engine.audio_out_count; i++) {
         g_snprintf(name, sizeof(name), "out_%u", i + 1);
         engine.audio_out[i] = jack_port_register(engine.client, name,
@@ -2113,14 +2239,15 @@ const gchar *jackdaw_engine_get_control_source(void)
 }
 
 void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
-                                 guint8 velocity, gboolean on)
+                                 guint8 velocity, guint8 channel, gboolean on)
 {
     if (!engine.active || !eng_preview_rb || !t) return;
     if (t->slot >= JACKDAW_MAX_TRACKS) return;   /* not registered with engine */
 
     EngPrevMsg msg;
+    guint8 ch   = (guint8)(channel & 0x0F);
     msg.slot    = (gint32)t->slot;
-    msg.data[0] = on ? 0x90 : 0x80;              /* note-on / note-off, channel 0 */
+    msg.data[0] = (guint8)((on ? 0x90 : 0x80) | ch);
     msg.data[1] = (guint8)(pitch & 0x7F);
     msg.data[2] = on ? (velocity ? velocity : 1) : 0;
 
@@ -2133,6 +2260,29 @@ gboolean jackdaw_engine_is_running(void)
     return engine.active;
 }
 
+gboolean jackdaw_engine_is_counting_in(void)
+{
+    return g_atomic_int_get(&engine.countin_active) != 0;
+}
+
+guint jackdaw_engine_get_cycle_count(void)
+{
+    return (guint)g_atomic_int_get((gint *)&g_rt_cycle);
+}
+
+/* TRUE while the JACK client is active, i.e. while the RT callback can still be
+ * running. When this is FALSE nothing reads the published FX chains at all. */
+gboolean jackdaw_engine_is_processing(void)
+{
+    return engine.active && engine.client != NULL &&
+           !g_atomic_int_get(&engine.render_suspend);
+}
+
+guint jackdaw_engine_get_xrun_count(void)
+{
+    return (guint)g_atomic_int_get(&g_diag_xruns);
+}
+
 gboolean jackdaw_engine_is_recording(void)
 {
     return (g_atomic_int_get(&engine.transport_flags) & ENGINE_RECORDING) != 0;
@@ -2143,33 +2293,63 @@ gboolean jackdaw_engine_is_playing(void)
     return (g_atomic_int_get(&engine.transport_flags) & ENGINE_PLAYING) != 0;
 }
 
-/* ---- Port count management ---- */
+/* ---- Port count management ----
+ *
+ * The port arrays are allocated once at their ceiling (ENG_MAX_AUDIO_PORTS /
+ * ENG_MAX_MIDI_PORTS) and never resized, and the count is published in the
+ * order that keeps the RT callback safe at every instant:
+ *
+ *   grow   — register the new ports FIRST, then raise the count.
+ *   shrink — lower the count FIRST, then unregister the ports it dropped.
+ *
+ * The old code did the opposite on both counts: it g_renew()'d the arrays the
+ * callback was indexing (so a concurrent cycle could read through a freed
+ * pointer) and unregistered shrinking ports before lowering the count (so the
+ * callback could jack_port_get_buffer() a port that no longer existed). */
+
+/* Publish a new count with release semantics so the port writes above it are
+ * visible to the RT thread before the count that exposes them. */
+static inline void eng_publish_count(volatile guint *slot, guint n)
+{
+    g_atomic_int_set((gint *)slot, (gint)n);
+}
 
 gboolean jackdaw_engine_set_audio_in_count(guint n)
 {
-    guint i;
+    guint i, old;
     char name[64];
-    n = CLAMP(n, 1, 64);
-    if (!engine.active) { engine.audio_in_count = n; return FALSE; }
+    n = CLAMP(n, 1, ENG_MAX_AUDIO_PORTS);
+    if (!engine.active || !engine.client) {
+        engine.audio_in_count = n;
+        settings_set_uint32("jackAudioInCount", n);
+        return FALSE;
+    }
+    old = engine.audio_in_count;
+    if (n == old) return FALSE;
 
-    /* Unregister ports being removed (left port + any live right port) */
-    for (i = n; i < engine.audio_in_count; i++) {
-        if (engine.audio_in[i])
-            jack_port_unregister(engine.client, engine.audio_in[i]);
-        if (engine.audio_in_r[i])
-            jack_port_unregister(engine.client, engine.audio_in_r[i]);
+    if (n > old) {
+        /* Right ports stay NULL until a track goes stereo (set_track_stereo). */
+        for (i = old; i < n; i++) {
+            engine.audio_in_r[i] = NULL;
+            g_snprintf(name, sizeof(name), "in_%u", i + 1);
+            engine.audio_in[i] = jack_port_register(engine.client, name,
+                JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
+            if (!engine.audio_in[i]) return TRUE;
+        }
+        eng_publish_count(&engine.audio_in_count, n);
+    } else {
+        eng_publish_count(&engine.audio_in_count, n);
+        for (i = n; i < old; i++) {
+            if (engine.audio_in[i]) {
+                jack_port_unregister(engine.client, engine.audio_in[i]);
+                engine.audio_in[i] = NULL;
+            }
+            if (engine.audio_in_r[i]) {
+                jack_port_unregister(engine.client, engine.audio_in_r[i]);
+                engine.audio_in_r[i] = NULL;
+            }
+        }
     }
-    engine.audio_in   = g_renew(jack_port_t *, engine.audio_in,   n);
-    engine.audio_in_r = g_renew(jack_port_t *, engine.audio_in_r, n);
-    /* Register new left ports; right ports stay NULL until a track goes stereo */
-    for (i = engine.audio_in_count; i < n; i++) {
-        g_snprintf(name, sizeof(name), "in_%u", i + 1);
-        engine.audio_in[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-        if (!engine.audio_in[i]) return TRUE;
-        engine.audio_in_r[i] = NULL;
-    }
-    engine.audio_in_count = n;
     settings_set_uint32("jackAudioInCount", n);
     if (engine.project)
         jackdaw_project_emit_ports_changed(engine.project);
@@ -2178,23 +2358,34 @@ gboolean jackdaw_engine_set_audio_in_count(guint n)
 
 gboolean jackdaw_engine_set_audio_out_count(guint n)
 {
-    guint i;
+    guint i, old;
     char name[64];
-    n = CLAMP(n, 1, 64);
-    if (!engine.active) { engine.audio_out_count = n; return FALSE; }
+    n = CLAMP(n, 1, ENG_MAX_AUDIO_PORTS);
+    if (!engine.active || !engine.client) {
+        engine.audio_out_count = n;
+        settings_set_uint32("jackAudioOutCount", n);
+        return FALSE;
+    }
+    old = engine.audio_out_count;
+    if (n == old) return FALSE;
 
-    for (i = n; i < engine.audio_out_count; i++) {
-        if (engine.audio_out[i])
-            jack_port_unregister(engine.client, engine.audio_out[i]);
+    if (n > old) {
+        for (i = old; i < n; i++) {
+            g_snprintf(name, sizeof(name), "out_%u", i + 1);
+            engine.audio_out[i] = jack_port_register(engine.client, name,
+                JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
+            if (!engine.audio_out[i]) return TRUE;
+        }
+        eng_publish_count(&engine.audio_out_count, n);
+    } else {
+        eng_publish_count(&engine.audio_out_count, n);
+        for (i = n; i < old; i++) {
+            if (engine.audio_out[i]) {
+                jack_port_unregister(engine.client, engine.audio_out[i]);
+                engine.audio_out[i] = NULL;
+            }
+        }
     }
-    engine.audio_out = g_renew(jack_port_t *, engine.audio_out, n);
-    for (i = engine.audio_out_count; i < n; i++) {
-        g_snprintf(name, sizeof(name), "out_%u", i + 1);
-        engine.audio_out[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_AUDIO_TYPE, JackPortIsOutput, 0);
-        if (!engine.audio_out[i]) return TRUE;
-    }
-    engine.audio_out_count = n;
     settings_set_uint32("jackAudioOutCount", n);
     if (engine.project)
         jackdaw_project_emit_ports_changed(engine.project);
@@ -2203,23 +2394,34 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
 
 gboolean jackdaw_engine_set_midi_in_count(guint n)
 {
-    guint i;
+    guint i, old;
     char name[64];
-    if (n > 16u) n = 16u;
-    if (!engine.active) { engine.midi_in_count = n; return FALSE; }
+    if (n > ENG_MAX_MIDI_PORTS) n = ENG_MAX_MIDI_PORTS;
+    if (!engine.active || !engine.client) {
+        engine.midi_in_count = n;
+        settings_set_uint32("jackMidiInCount", n);
+        return FALSE;
+    }
+    old = engine.midi_in_count;
+    if (n == old) return FALSE;
 
-    for (i = n; i < engine.midi_in_count; i++) {
-        if (engine.midi_in[i])
-            jack_port_unregister(engine.client, engine.midi_in[i]);
+    if (n > old) {
+        for (i = old; i < n; i++) {
+            g_snprintf(name, sizeof(name), "midi_in_%u", i + 1);
+            engine.midi_in[i] = jack_port_register(engine.client, name,
+                JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
+            if (!engine.midi_in[i]) return TRUE;
+        }
+        eng_publish_count(&engine.midi_in_count, n);
+    } else {
+        eng_publish_count(&engine.midi_in_count, n);
+        for (i = n; i < old; i++) {
+            if (engine.midi_in[i]) {
+                jack_port_unregister(engine.client, engine.midi_in[i]);
+                engine.midi_in[i] = NULL;
+            }
+        }
     }
-    engine.midi_in = g_renew(jack_port_t *, engine.midi_in, n);
-    for (i = engine.midi_in_count; i < n; i++) {
-        g_snprintf(name, sizeof(name), "midi_in_%u", i + 1);
-        engine.midi_in[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
-        if (!engine.midi_in[i]) return TRUE;
-    }
-    engine.midi_in_count = n;
     settings_set_uint32("jackMidiInCount", n);
     if (engine.project)
         jackdaw_project_emit_ports_changed(engine.project);
@@ -2228,23 +2430,34 @@ gboolean jackdaw_engine_set_midi_in_count(guint n)
 
 gboolean jackdaw_engine_set_midi_out_count(guint n)
 {
-    guint i;
+    guint i, old;
     char name[64];
-    n = CLAMP(n, 1, 16);
-    if (!engine.active) { engine.midi_out_count = n; return FALSE; }
+    n = CLAMP(n, 1, ENG_MAX_MIDI_PORTS);
+    if (!engine.active || !engine.client) {
+        engine.midi_out_count = n;
+        settings_set_uint32("jackMidiOutCount", n);
+        return FALSE;
+    }
+    old = engine.midi_out_count;
+    if (n == old) return FALSE;
 
-    for (i = n; i < engine.midi_out_count; i++) {
-        if (engine.midi_out[i])
-            jack_port_unregister(engine.client, engine.midi_out[i]);
+    if (n > old) {
+        for (i = old; i < n; i++) {
+            g_snprintf(name, sizeof(name), "midi_out_%u", i + 1);
+            engine.midi_out[i] = jack_port_register(engine.client, name,
+                JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
+            if (!engine.midi_out[i]) return TRUE;
+        }
+        eng_publish_count(&engine.midi_out_count, n);
+    } else {
+        eng_publish_count(&engine.midi_out_count, n);
+        for (i = n; i < old; i++) {
+            if (engine.midi_out[i]) {
+                jack_port_unregister(engine.client, engine.midi_out[i]);
+                engine.midi_out[i] = NULL;
+            }
+        }
     }
-    engine.midi_out = g_renew(jack_port_t *, engine.midi_out, n);
-    for (i = engine.midi_out_count; i < n; i++) {
-        g_snprintf(name, sizeof(name), "midi_out_%u", i + 1);
-        engine.midi_out[i] = jack_port_register(engine.client, name,
-            JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
-        if (!engine.midi_out[i]) return TRUE;
-    }
-    engine.midi_out_count = n;
     settings_set_uint32("jackMidiOutCount", n);
     if (engine.project)
         jackdaw_project_emit_ports_changed(engine.project);
@@ -2420,11 +2633,26 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
         /* MIDI: the capture→midi_in wiring is system-wide (auto-connected at
          * startup, and possibly shared by other tracks), so removing a track
          * must NOT tear it down — just detaching the slot is enough. */
+
+        /* Release the lazily-registered right capture port. It is created only
+         * when this track goes stereo (set_track_stereo) and belongs to the
+         * track holding this index, exactly as the mono path there assumes —
+         * but removing the track used to leave it registered, so every
+         * add/stereo/remove cycle leaked a JACK port. */
+        if (track->audio_in_idx >= 0 &&
+            (guint)track->audio_in_idx < engine.audio_in_count &&
+            engine.audio_in_r[(guint)track->audio_in_idx]) {
+            jack_port_unregister(engine.client,
+                                 engine.audio_in_r[(guint)track->audio_in_idx]);
+            engine.audio_in_r[(guint)track->audio_in_idx] = NULL;
+        }
     }
     g_clear_pointer(&track->audio_src_port,   g_free);
     g_clear_pointer(&track->audio_src_port_r, g_free);
     g_clear_pointer(&track->midi_src_port,    g_free);
 
+    track->audio_in_idx = -1;
+    track->midi_in_idx  = -1;
     track->slot = G_MAXUINT;
 }
 
@@ -2664,7 +2892,6 @@ static gboolean midi_finalize_idle(gpointer data)
             for (int p = 0; p < 128; p++) on_frame[ch][p] = -1;
 
         MidiClip *c = midi_clip_new(0);
-        guint32   max_end    = 0;
         gint64    last_frame = origin;
 
         MidiRecEvent r;
@@ -2683,24 +2910,27 @@ static gboolean midi_finalize_idle(gpointer data)
                                (guint8)p, on_vel[ch][p], (guint8)ch };
                 if (n.length < 1) n.length = 1;
                 midi_clip_add_note(c, n);
-                if (n.start + n.length > max_end) max_end = n.start + n.length;
                 on_frame[ch][p] = -1;
             }
         }
 
-        /* Close notes still held at the stop point (no note-off was captured). */
+        /* Close notes still held at the stop point (no note-off was captured).
+         *
+         * Notes are stored at ABSOLUTE ticks (tick 0 = timeline frame 0), which
+         * is what the paired-note path above does. This path used to subtract
+         * `origin`, so a note still held when recording stopped landed earlier
+         * than the notes around it by the whole record start offset. */
         off_t close_frame = (cut > last_frame) ? cut : last_frame;
         for (int ch = 0; ch < 16; ch++)
             for (int p = 0; p < 128; p++) {
                 if (on_frame[ch][p] < 0) continue;
-                gint64 sf = on_frame[ch][p] - origin;       if (sf < 0) sf = 0;
-                gint64 ef = (gint64)close_frame - origin;   if (ef < sf) ef = sf;
+                gint64 sf = on_frame[ch][p];
+                gint64 ef = (gint64)close_frame;   if (ef < sf) ef = sf;
                 MidiNote n = { (guint32)((double)sf / f_per_tick),
                                (guint32)((double)(ef - sf) / f_per_tick),
                                (guint8)p, on_vel[ch][p], (guint8)ch };
                 if (n.length < 1) n.length = 1;
                 midi_clip_add_note(c, n);
-                if (n.start + n.length > max_end) max_end = n.start + n.length;
             }
 
         if (midi_clip_note_count(c) == 0) { midi_clip_free(c); continue; }
@@ -2790,6 +3020,13 @@ void jackdaw_engine_stop_recording(void)
         recorder_slots[i].expected_frames = exp > 0 ? exp : 0;
         g_atomic_int_set(&recorder_slots[i].finalize_req, 1);
     }
+
+    /* Silence anything still sounding on an instrument track before the take is
+     * handed over. Stopping the transport flushes note-offs, but stopping only
+     * the *recording* did not, so a key held at the stop point left the note
+     * ringing on the plugin (and on any external synth) until the next flush. */
+    for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++)
+        g_atomic_int_set(&eng_midi_flush[i], 1);
 
     /* Convert any captured MIDI into clips on the main thread (RT has stopped
      * writing the capture buffer now that RECORDING is cleared). */

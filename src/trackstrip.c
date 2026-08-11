@@ -540,15 +540,49 @@ void jackdaw_track_strip_refresh_ports(JackDawTrackStrip *strip)
  * Internal alignment (knob columns lining up across tracks) is the value
  * labels' job: they reserve a fixed width-chars below, so digit count no
  * longer shifts the layout inside this fixed envelope either. */
+/* The width this vfunc must report so the strip ends up exactly
+ * TIMELINE_HEADER_WIDTH wide.
+ *
+ * GtkContainer::adjust_size_request adds 2 * border_width to whatever the
+ * get_preferred_width vfunc returns, *after* it returns — so reporting the
+ * target width flat actually yielded 235 + 2 = 237, and the header column
+ * grew by two pixels the moment the first track was added (measurable as
+ * spacer 235 -> 237, ruler 950 -> 948). Subtract the border here so the
+ * adjustment lands back on the target. */
+static gint strip_pinned_width(GtkWidget *widget)
+{
+    guint border = gtk_container_get_border_width(GTK_CONTAINER(widget));
+    gint w = TIMELINE_HEADER_WIDTH - 2 * (gint)border;
+    return (w > 0) ? w : 0;
+}
+
 static void jackdaw_track_strip_get_preferred_width(GtkWidget *widget,
                                                      gint *minimum,
                                                      gint *natural)
 {
-    gint cmin = 0, cnat = 0;
-    GTK_WIDGET_CLASS(jackdaw_track_strip_parent_class)
-        ->get_preferred_width(widget, &cmin, &cnat);
-    (void)cmin; (void)cnat;
-    *minimum = *natural = TIMELINE_HEADER_WIDTH;
+    *minimum = *natural = strip_pinned_width(widget);
+}
+
+/* Overriding get_preferred_width alone is not enough: GTK also has a
+ * height-for-width path, and a container that takes it would fall straight back
+ * to GtkBox's content-derived width. One strip measuring wider than the pin
+ * (a long JACK port name in the input button, a long track name) would then drag
+ * the shared header GtkSizeGroup — and with it the ruler spacer — wider, which is
+ * exactly the "header resizes when a track is added" symptom. Pin both paths and
+ * declare the width content-independent. */
+static void jackdaw_track_strip_get_preferred_width_for_height(GtkWidget *widget,
+                                                                gint height,
+                                                                gint *minimum,
+                                                                gint *natural)
+{
+    (void)height;
+    *minimum = *natural = strip_pinned_width(widget);
+}
+
+static GtkSizeRequestMode jackdaw_track_strip_get_request_mode(GtkWidget *widget)
+{
+    (void)widget;
+    return GTK_SIZE_REQUEST_CONSTANT_SIZE;
 }
 
 /* ---- GObject boilerplate ------------------------------------------------ */
@@ -572,6 +606,10 @@ static void jackdaw_track_strip_class_init(JackDawTrackStripClass *klass)
     G_OBJECT_CLASS(klass)->finalize = jackdaw_track_strip_finalize;
     GTK_WIDGET_CLASS(klass)->get_preferred_width =
         jackdaw_track_strip_get_preferred_width;
+    GTK_WIDGET_CLASS(klass)->get_preferred_width_for_height =
+        jackdaw_track_strip_get_preferred_width_for_height;
+    GTK_WIDGET_CLASS(klass)->get_request_mode =
+        jackdaw_track_strip_get_request_mode;
 }
 
 static void jackdaw_track_strip_init(JackDawTrackStrip *strip)

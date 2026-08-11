@@ -208,6 +208,23 @@ static float clap_param_get(PluginInstance *pi, guint i)
     return (float)v;
 }
 
+/* CLAP exposes real engineering units, but the plug-in's own value_to_text
+ * renders them with the right suffix and enum names. */
+static gboolean clap_param_display(PluginInstance *pi, guint i, char *buf, gsize len)
+{
+    ClapBackend *b = (ClapBackend *)pi->backend;
+    if (!b->params || i >= b->n_params || !b->params->value_to_text) return FALSE;
+    double v = 0.0;
+    if (!b->params->get_value(b->plugin, b->param_ids[i], &v)) return FALSE;
+    char tmp[128];
+    tmp[0] = 0;
+    if (!b->params->value_to_text(b->plugin, b->param_ids[i], v, tmp, sizeof tmp))
+        return FALSE;
+    if (!tmp[0]) return FALSE;
+    g_strlcpy(buf, tmp, len);
+    return TRUE;
+}
+
 static void clap_param_set(PluginInstance *pi, guint i, float v)
 {
     ClapBackend *b = (ClapBackend *)pi->backend;
@@ -292,10 +309,21 @@ static gboolean clap_state_load(PluginInstance *pi, const void *data, gsize len)
 }
 
 static const PhOps clap_ops = {
-    clap_process_cb, NULL /*process_midi*/, clap_destroy, NULL, NULL,
-    clap_param_count, clap_param_name, clap_param_get, clap_param_set,
-    clap_param_range, clap_reset,
-    clap_state_save, clap_state_load
+    .process      = clap_process_cb,
+    .process_midi = NULL,
+    .destroy      = clap_destroy,
+    .make_gui     = NULL,
+    .destroy_gui  = NULL,
+    .param_count  = clap_param_count,
+    .param_name   = clap_param_name,
+    .param_get    = clap_param_get,
+    .param_set    = clap_param_set,
+    .param_range  = clap_param_range,
+    .param_display = clap_param_display,
+    .param_is_stepped = NULL,
+    .reset        = clap_reset,
+    .state_save   = clap_state_save,
+    .state_load   = clap_state_load,
 };
 
 /* ---- Instantiate ---- */

@@ -74,6 +74,9 @@ typedef struct {
     /* piano keyboard (left column) */
     int      hl_pitch;          /* highlighted lane pitch (0..127), -1 = none */
     int      key_playing;       /* pitch currently auditioned via mouse, -1 = none */
+    guint8   key_channel;       /* channel the auditioned note was sent on, so the
+                                 * note-off matches the note-on even if the clip's
+                                 * dominant channel changes mid-audition */
 
     /* playhead */
     double   play_tick;         /* clip-relative tick of playhead; -1 = off / before region */
@@ -479,15 +482,40 @@ static gboolean keys_draw(GtkWidget *w, cairo_t *cr, gpointer data)
 
 /* ---- piano keyboard interaction ---- */
 
+/* The channel new and auditioned notes should use: whichever channel the clip's
+ * existing notes mostly sit on, defaulting to 0 for an empty clip.
+ *
+ * Notes used to be created and previewed on channel 0 unconditionally, so a
+ * take recorded from a drum kit on channel 10 could be edited but every added
+ * or auditioned note went to a different voice on the connected module. */
+static guint8 clip_default_channel(MidiClip *clip)
+{
+    if (!clip) return 0;
+    guint n = midi_clip_note_count(clip);
+    if (n == 0) return 0;
+
+    guint count[16] = { 0 };
+    for (guint i = 0; i < n; i++)
+        count[midi_clip_note(clip, i)->channel & 0x0F]++;
+
+    guint8 best = 0;
+    for (guint8 c = 1; c < 16; c++)
+        if (count[c] > count[best]) best = c;
+    return best;
+}
+
 /* Light up `pitch`'s lane and audition it on the track's instrument. */
 static void keys_play(MidiWindow *mw, int pitch)
 {
     if (mw->key_playing == pitch) return;
+    guint8 ch = clip_default_channel(mw->clip);
     if (mw->key_playing >= 0)
-        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0, FALSE);
+        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0,
+                                    mw->key_channel, FALSE);
     mw->key_playing = pitch;
+    mw->key_channel = ch;
     mw->hl_pitch    = pitch;
-    jackdaw_engine_preview_note(mw->track, (guint8)pitch, DEFAULT_VEL, TRUE);
+    jackdaw_engine_preview_note(mw->track, (guint8)pitch, DEFAULT_VEL, ch, TRUE);
     gtk_widget_queue_draw(mw->keys);
     gtk_widget_queue_draw(mw->roll);
 }
@@ -495,7 +523,8 @@ static void keys_play(MidiWindow *mw, int pitch)
 static void keys_stop(MidiWindow *mw)
 {
     if (mw->key_playing >= 0) {
-        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0, FALSE);
+        jackdaw_engine_preview_note(mw->track, (guint8)mw->key_playing, 0,
+                                    mw->key_channel, FALSE);
         mw->key_playing = -1;
     }
 }
@@ -985,7 +1014,7 @@ static gboolean roll_press(GtkWidget *w, GdkEventButton *e, gpointer data)
         n.length   = snap_step(mw) > 1 ? (guint32)snap_step(mw) : JACKDAW_PPQ / 4;
         n.pitch    = (guint8)y_to_pitch(mw, e->y);
         n.velocity = DEFAULT_VEL;
-        n.channel  = 0;
+        n.channel  = clip_default_channel(mw->clip);   /* follow the clip's content */
         idx = (int)midi_clip_add_note(mw->clip, n);
         mw->drag_mode = 1;
     } else {
@@ -1389,7 +1418,10 @@ static gboolean mw_key_press(GtkWidget *w, GdkEventKey *e, gpointer data)
     case GDK_KEY_z:
     case GDK_KEY_Z:
         if (e->state & GDK_CONTROL_MASK) {
-            jackdaw_project_undo(mw->project); return TRUE;
+            /* Ctrl+Shift+Z is the other common redo binding, alongside Ctrl+Y. */
+            if (e->state & GDK_SHIFT_MASK) jackdaw_project_redo(mw->project);
+            else                           jackdaw_project_undo(mw->project);
+            return TRUE;
         }
         break;
     case GDK_KEY_y:
@@ -1452,7 +1484,7 @@ void jackdaw_midi_window_open(JackDawTrack *track, JackDawProject *project)
     mw->project = project;
     mw->tpx = 20.0; mw->key_h = DEFAULT_KEYH;
     mw->drag_note = -1; mw->ctx_note_idx = -1;
-    mw->hl_pitch = -1; mw->key_playing = -1;
+    mw->hl_pitch = -1; mw->key_playing = -1; mw->key_channel = 0;
     mw->play_tick = -1.0; mw->prev_play_pos = -1;
 
     mw->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);

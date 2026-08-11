@@ -202,10 +202,21 @@ static void lad_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
   if (i < b->n_params) { if (mn) *mn = b->params[i].min; if (mx) *mx = b->params[i].max; } }
 
 static const PhOps lad_ops = {
-    lad_process, NULL /*process_midi*/, lad_destroy, NULL, NULL,
-    lad_param_count, lad_param_name, lad_param_get, lad_param_set, lad_param_range,
-    lad_reset,
-    NULL /*state_save*/, NULL /*state_load*/   /* params are LADSPA's full state */
+    .process      = lad_process,
+    .process_midi = NULL,
+    .destroy      = lad_destroy,
+    .make_gui     = NULL,
+    .destroy_gui  = NULL,
+    .param_count  = lad_param_count,
+    .param_name   = lad_param_name,
+    .param_get    = lad_param_get,
+    .param_set    = lad_param_set,
+    .param_range  = lad_param_range,
+    .param_display = NULL,        /* plain values already read correctly */
+    .param_is_stepped = NULL,
+    .reset        = lad_reset,
+    .state_save   = NULL,         /* params are LADSPA's full state */
+    .state_load   = NULL,
 };
 
 /* ---- Instantiate ---- */

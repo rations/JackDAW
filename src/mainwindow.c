@@ -4,6 +4,7 @@
 #include <math.h>
 
 #include "mainwindow.h"
+#include "tempomap.h"
 #include "jackdaw-engine.h"
 #include "audio_clip.h"
 #include "clipregion.h"
@@ -640,6 +641,13 @@ static void mw_snap_toggled(GtkToggleButton *b, gpointer data)
                                      gtk_toggle_button_get_active(b));
 }
 
+static void mw_grid_unit_changed(GtkComboBox *c, gpointer data)
+{
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    gint a = gtk_combo_box_get_active(c);
+    if (a >= 0) jackdaw_project_set_grid_unit(win->project, a);
+}
+
 static void mw_metro_toggled(GtkToggleButton *b, gpointer data)
 {
     JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
@@ -1182,6 +1190,40 @@ static void mw_redo_cb(GtkMenuItem *item, gpointer data)
     jackdaw_project_redo(win->project);
 }
 
+/* Region operations on the Edit menu. All of these already had keyboard
+ * bindings (mw_key_press) and context-menu entries on the timeline, but were
+ * unreachable — and undiscoverable — from the menu bar. They act on the current
+ * selection and the focused track, exactly as the key bindings do. */
+static void mw_edit_copy_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_copy_selection(mw_timeline(GTK_WIDGET(data)));
+}
+
+static void mw_edit_paste_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_paste_at_cursor(mw_timeline(GTK_WIDGET(data)));
+}
+
+static void mw_edit_delete_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_delete_selection(mw_timeline(GTK_WIDGET(data)));
+}
+
+static void mw_edit_group_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_group_selection(mw_timeline(GTK_WIDGET(data)));
+}
+
+static void mw_edit_split_cb(GtkMenuItem *item, gpointer data)
+{
+    (void)item;
+    jackdaw_timeline_split_at_cursor(mw_timeline(GTK_WIDGET(data)));
+}
+
 /* ---- View menu ---- */
 
 static void mw_zoom_in_cb(GtkMenuItem *item, gpointer data)
@@ -1234,7 +1276,18 @@ static gboolean mw_transport_timer(gpointer data)
                  : 48000u;
     off_t pos = jackdaw_engine_get_play_pos();
     gchar tbuf[64];
-    format_timecode(sr, pos, pos, tbuf, default_timescale_mode);
+    /* Honour the ruler mode the user already chose with the Bars toggle: in
+     * bars mode the readout is bars.beats.ticks, matching what the ruler shows.
+     * It used to print timecode unconditionally, so the two disagreed. */
+    if (win->project && win->project->ruler_mode == JACKDAW_RULER_BARS) {
+        TempoMap tm;
+        TempoMapBBT bbt;
+        tempomap_from_project(&tm, win->project, sr);
+        tempomap_frame_to_bbt(&tm, pos, &bbt);
+        g_snprintf(tbuf, sizeof tbuf, "%u.%u.%03u", bbt.bar, bbt.beat, bbt.tick);
+    } else {
+        format_timecode(sr, pos, pos, tbuf, default_timescale_mode);
+    }
     gtk_label_set_text(GTK_LABEL(win->time_label), tbuf);
 
     /* Keep the loop toggle in sync (it may be toggled from the MIDI window). */
@@ -1962,13 +2015,31 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     menu_item(m, "_Redo",
               G_CALLBACK(mw_redo_cb), win,
               GDK_KEY_y, GDK_CONTROL_MASK, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
+    /* Ctrl+C / Ctrl+V are shown as hints rather than registered as accelerators:
+     * mw_key_press deliberately declines them while a text entry has focus so
+     * entries keep their own clipboard, and a real accelerator would fire in
+     * that case anyway and copy the timeline selection out from under the user. */
+    menu_item(m, "_Copy  [Ctrl+C]",
+              G_CALLBACK(mw_edit_copy_cb), win, 0, 0, ag);
+    menu_item(m, "_Paste at Playhead  [Ctrl+V]",
+              G_CALLBACK(mw_edit_paste_cb), win, 0, 0, ag);
+    menu_item(m, "_Delete Selected Area",
+              G_CALLBACK(mw_edit_delete_cb), win, 0, 0, ag);
+    menu_item(m, "_Group Sections  [G]",
+              G_CALLBACK(mw_edit_group_cb), win, 0, 0, ag);
+    menu_item(m, NULL, NULL, NULL, 0, 0, ag);
+    menu_item(m, "Split at Play_head  [S]",
+              G_CALLBACK(mw_edit_split_cb), win, 0, 0, ag);
 
     /* Track */
     m = make_submenu_item(menubar, "_Track");
     menu_item(m, "_Add Empty Track",
-              G_CALLBACK(mw_add_track_cb), win, 0, 0, ag);
+              G_CALLBACK(mw_add_track_cb), win,
+              GDK_KEY_t, GDK_CONTROL_MASK, ag);
     menu_item(m, "Add _MIDI Track",
-              G_CALLBACK(mw_add_instrument_track_cb), win, 0, 0, ag);
+              G_CALLBACK(mw_add_instrument_track_cb), win,
+              GDK_KEY_t, GDK_CONTROL_MASK | GDK_SHIFT_MASK, ag);
     menu_item(m, "_Load File as New Track…",
               G_CALLBACK(mw_load_file_cb), win, 0, 0, ag);
     menu_item(m, NULL, NULL, NULL, 0, 0, ag);
@@ -2128,6 +2199,18 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     GtkWidget *tg_snap = gtk_toggle_button_new_with_label("Snap");
     g_signal_connect(tg_snap, "toggled", G_CALLBACK(mw_snap_toggled), win);
     gtk_box_pack_start(GTK_BOX(ftb), tg_snap, FALSE, FALSE, 0);
+
+    /* Grid/snap resolution. Snapping was fixed at whole beats before this. */
+    GtkWidget *grid_unit = gtk_combo_box_text_new();
+    for (int gi = 0; gi < TEMPOMAP_GRID_LAST; gi++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(grid_unit),
+                                       tempomap_grid_name((TempoMapGrid)gi));
+    gtk_combo_box_set_active(GTK_COMBO_BOX(grid_unit),
+                             jackdaw_project_get_grid_unit(project));
+    gtk_widget_set_tooltip_text(grid_unit, "Grid / snap resolution");
+    g_signal_connect(grid_unit, "changed",
+                     G_CALLBACK(mw_grid_unit_changed), win);
+    gtk_box_pack_start(GTK_BOX(ftb), grid_unit, FALSE, FALSE, 0);
 
     GtkWidget *tg_metro = gtk_toggle_button_new_with_label("Metro");
     gtk_widget_set_tooltip_text(tg_metro,

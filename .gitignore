@@ -1,6 +1,7 @@
 # Claude Code project instructions (local dev tool, not source)
 CLAUDE.md
-
+RULES.md
+task.md
 # Build artifacts
 *.o
 *.d

@@ -109,6 +109,36 @@ void            pluginhost_reset(PluginInstance *inst);
  * of *out_len bytes. pluginhost_state_load: apply such a blob (also syncs the
  * native editor where applicable, so a reopened GUI reflects the restored state).
  * Both main-thread only; safe before the instance is added to an RT chain. */
+/* --- File-loading plug-ins ---
+ * Some plug-ins' real "parameter" is a PATH (a neural amp model, an impulse
+ * response) which cannot travel as a normalised float, so they expose a
+ * dedicated interface for it. Hosts that find it can offer a file picker;
+ * has_file_loader is FALSE for everything else. */
+enum { PH_FILE_MODEL = 0, PH_FILE_IR = 1 };
+
+gboolean        pluginhost_has_file_loader(PluginInstance *inst);
+gboolean        pluginhost_file_get(PluginInstance *inst, int which,
+                                    char *buf, int buflen);
+gboolean        pluginhost_file_set(PluginInstance *inst, int which,
+                                    const char *path);
+
+/* Save/load the plug-in's full state to a standalone preset file. Only works
+ * for backends that implement opaque state (VST2/VST3/CLAP/LV2); returns FALSE
+ * otherwise, and refuses to load a preset saved from a different plug-in. */
+gboolean        pluginhost_preset_save(PluginInstance *inst, const char *path);
+gboolean        pluginhost_preset_load(PluginInstance *inst, const char *path);
+
+/* The plug-in's own rendering of a parameter's current value ("-6.0 dB",
+ * "Sine"). Always writes something into buf; returns TRUE when the text came
+ * from the plug-in rather than the raw-number fallback. Plug-in-supplied text:
+ * display it with gtk_label_set_text, never set_markup. */
+gboolean        pluginhost_param_display(PluginInstance *inst, guint i,
+                                         char *buf, gsize len);
+
+/* TRUE if the parameter is discrete; *n_steps gets the number of positions. */
+gboolean        pluginhost_param_is_stepped(PluginInstance *inst, guint i,
+                                            int *n_steps);
+
 gboolean        pluginhost_state_save(PluginInstance *inst,
                                       void **out, gsize *out_len);
 gboolean        pluginhost_state_load(PluginInstance *inst,

@@ -19,6 +19,14 @@ typedef struct {
     float       (*param_get)  (PluginInstance *, guint);
     void        (*param_set)  (PluginInstance *, guint, float);
     void        (*param_range)(PluginInstance *, guint, float *, float *);
+    /* Optional: the plug-in's own rendering of a parameter's current value —
+     * "-6.0 dB", "Sine", "440 Hz". Writes into `buf`; TRUE if it produced
+     * something. NULL means the host falls back to printing the raw number,
+     * which is meaningless for normalised (VST3) or enumerated parameters. */
+    gboolean    (*param_display)(PluginInstance *, guint, char *buf, gsize len);
+    /* Optional: TRUE if the parameter takes discrete steps (an enum, a switch)
+     * rather than a continuous range, so the UI can round to whole steps. */
+    gboolean    (*param_is_stepped)(PluginInstance *, guint, int *n_steps);
     /* Optional: clear internal DSP state (reverb/delay buffers, synth voices)
      * without changing parameters. NULL if the backend offers no reset. */
     void        (*reset)      (PluginInstance *);
@@ -104,6 +112,12 @@ void  ph_lv2_ctl_ports(PluginInstance *, gboolean outputs,
 PluginInstance *ph_lv2_instantiate   (const PluginInfo *, double sr, int max_block);
 PluginInstance *ph_vst2_instantiate  (const PluginInfo *, double sr, int max_block);
 PluginInstance *ph_vst3_instantiate  (const PluginInfo *, double sr, int max_block);
+
+/* VST3-only file-loading interface (see pluginhost.h PH_FILE_*). FALSE for any
+ * plug-in that does not implement it. */
+gboolean ph_vst3_has_file_loader(PluginInstance *inst);
+gboolean ph_vst3_file_get(PluginInstance *inst, int which, char *buf, int buflen);
+gboolean ph_vst3_file_set(PluginInstance *inst, int which, const char *path);
 PluginInstance *ph_clap_instantiate  (const PluginInfo *, double sr, int max_block);
 PluginInstance *ph_ladspa_instantiate(const PluginInfo *, double sr, int max_block);
 

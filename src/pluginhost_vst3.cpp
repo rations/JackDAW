@@ -21,6 +21,8 @@
 #include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/base/funknownimpl.h"
 
+#include "inamfileloader.h"
+
 #include "pluginhost_internal.h"
 
 /* X11 + raw-fd watches come LAST: <gdk/gdkx.h> pulls in Xlib, whose macros
@@ -33,6 +35,10 @@
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
+
+/* inamfileloader.h only DECLAREs the interface IID; it must be DEFINEd in
+ * exactly one translation unit, and this is the only one that queries it. */
+DEF_CLASS_IID(NAMku::INamFileLoader)
 
 /* Diagnostics (JACKDAW_DIAG): count IHostApplication::createInstance calls a
  * plug-in makes while the JACK RT thread is inside the process callback. Those
@@ -157,21 +163,33 @@ struct Vst3Backend {
     IPtr<IAudioProcessor>          processor;
     HostProcessData                data;
     ProcessContext                 ctx;
-    ParameterChanges               in_params;
+    ParameterChanges               in_params;   /* RT-thread-only */
+    /* Lock-free UI -> RT parameter hand-off.
+     *
+     * in_params is the ParameterChanges object process() iterates on the audio
+     * thread. The generic panel and the plug-in's own editor used to call
+     * addParameterData()/addPoint() on it directly from the UI thread, which can
+     * grow the queue list while the RT thread is reading it. Writes now go into
+     * this SDK ring buffer and are drained into in_params on the RT thread. */
+    ParameterChangeTransfer        param_xfer{2048};
     EventList                      in_events{256};   /* MIDI for instruments */
     int                            max_block = 0;
     std::vector<ParamID>           param_ids;
     HostComponentHandler           handler;            /* set on the controller */
     Vst3Editor                    *editor = nullptr;   /* live native editor, if any */
+    /* Optional: the plug-in's file-loading interface (NAMku and friends). VST3
+     * parameters are normalised floats, so a model/IR PATH cannot travel as one;
+     * plug-ins that need it expose this on the controller. NULL when absent. */
+    NAMku::INamFileLoader         *file_loader = nullptr;
 };
 
 tresult PLUGIN_API HostComponentHandler::performEdit(ParamID id, ParamValue value)
 {
     if (!b) return kResultOk;
     if (b->controller) b->controller->setParamNormalized(id, value);
-    int32 idx = 0;
-    IParamValueQueue *q = b->in_params.addParameterData(id, idx);
-    if (q) { int32 pidx = 0; q->addPoint(0, value, pidx); }
+    /* Called from the plug-in's editor thread — queue rather than touching the
+     * ParameterChanges the RT thread is reading. */
+    b->param_xfer.addChange(id, value, 0);
     return kResultOk;
 }
 
@@ -247,6 +265,9 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
         for (int ch = 0; ch < b->data.outputs[0].numChannels; ch++)
             memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
     }
+    /* Drain the UI's queued parameter changes into in_params here, on the RT
+     * thread, so nothing else ever mutates the object process() reads. */
+    b->param_xfer.transferChangesTo(b->in_params);
     b->data.inputParameterChanges = &b->in_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
@@ -309,6 +330,9 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
         for (int ch = 0; ch < b->data.outputs[0].numChannels; ch++)
             memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
 
+    /* Drain the UI's queued parameter changes into in_params here, on the RT
+     * thread, so nothing else ever mutates the object process() reads. */
+    b->param_xfer.transferChangesTo(b->in_params);
     b->data.inputParameterChanges = &b->in_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
@@ -384,13 +408,46 @@ static void vst3_param_set(PluginInstance *pi, guint i, float v)
     Vst3Backend *b = (Vst3Backend *)pi->backend;
     if (!b->controller || i >= b->param_ids.size()) return;
     b->controller->setParamNormalized(b->param_ids[i], v);
-    int32 idx = 0;
-    IParamValueQueue *q = b->in_params.addParameterData(b->param_ids[i], idx);
-    if (q) { int32 pidx = 0; q->addPoint(0, v, pidx); }
+    /* Main thread: queue for the RT thread to drain (see param_xfer). */
+    b->param_xfer.addChange(b->param_ids[i], v, 0);
 }
 
 static void vst3_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
 { (void)pi; (void)i; if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; } /* normalised */
+
+/* VST3 parameters are all normalised 0..1, so the slider position on its own
+ * tells the user nothing. Ask the controller to render the real value. */
+static gboolean vst3_param_display(PluginInstance *pi, guint i,
+                                   char *buf, gsize len)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (!b->controller || i >= b->param_ids.size()) return FALSE;
+
+    ParamValue v = b->controller->getParamNormalized(b->param_ids[i]);
+    String128 s{};
+    if (b->controller->getParamStringByValue(b->param_ids[i], v, s) != kResultOk)
+        return FALSE;
+
+    /* String128 is UTF-16; convert rather than truncating to Latin-1. */
+    gchar *utf8 = g_utf16_to_utf8((const gunichar2 *)s, -1, NULL, NULL, NULL);
+    if (!utf8) return FALSE;
+    g_strlcpy(buf, utf8, len);
+    g_free(utf8);
+    return TRUE;
+}
+
+static gboolean vst3_param_is_stepped(PluginInstance *pi, guint i, int *n_steps)
+{
+    Vst3Backend *b = (Vst3Backend *)pi->backend;
+    if (n_steps) *n_steps = 0;
+    if (!b->controller || i >= b->param_ids.size()) return FALSE;
+
+    ParameterInfo info{};
+    if (b->controller->getParameterInfo((int32)i, info) != kResultOk) return FALSE;
+    if (info.stepCount <= 0) return FALSE;
+    if (n_steps) *n_steps = (int)info.stepCount + 1;   /* stepCount is intervals */
+    return TRUE;
+}
 
 /* ---- Opaque state (project save/reload) ----
  * The normalised parameter list does NOT capture a VST3 plug-in's full state:
@@ -460,9 +517,7 @@ static gboolean vst3_state_load(PluginInstance *pi, const void *data, gsize len)
     if (b->controller) {
         for (size_t i = 0; i < b->param_ids.size(); i++) {
             ParamValue v = b->controller->getParamNormalized(b->param_ids[i]);
-            int32 idx = 0;
-            IParamValueQueue *q = b->in_params.addParameterData(b->param_ids[i], idx);
-            if (q) { int32 pidx = 0; q->addPoint(0, v, pidx); }
+            b->param_xfer.addChange(b->param_ids[i], v, 0);
         }
     }
     return TRUE;
@@ -628,12 +683,55 @@ static void vst3_destroy_gui(PluginInstance *pi)
     b->editor = nullptr;
 }
 
+/* ---- File loading (INamFileLoader) ----
+ * Exposed to the host layer as plain C so fxwindow.c can offer file pickers for
+ * plug-ins whose real "parameter" is a path (a NAM model, an impulse response).
+ * Returns FALSE for every plug-in that does not implement the interface. */
+
+extern "C" gboolean ph_vst3_has_file_loader(PluginInstance *inst)
+{
+    if (!inst || inst->format != PH_VST3 || !inst->backend) return FALSE;
+    return ((Vst3Backend *)inst->backend)->file_loader != nullptr;
+}
+
+extern "C" gboolean ph_vst3_file_get(PluginInstance *inst, int which,
+                                     char *buf, int buflen)
+{
+    if (!buf || buflen <= 0) return FALSE;
+    buf[0] = 0;
+    if (!ph_vst3_has_file_loader(inst)) return FALSE;
+    NAMku::INamFileLoader *fl = ((Vst3Backend *)inst->backend)->file_loader;
+    tresult r = (which == PH_FILE_MODEL) ? fl->getModelFile(buf, buflen)
+                                         : fl->getIrFile(buf, buflen);
+    return r == kResultOk;
+}
+
+extern "C" gboolean ph_vst3_file_set(PluginInstance *inst, int which,
+                                     const char *path)
+{
+    if (!ph_vst3_has_file_loader(inst)) return FALSE;
+    NAMku::INamFileLoader *fl = ((Vst3Backend *)inst->backend)->file_loader;
+    tresult r = (which == PH_FILE_MODEL) ? fl->setModelFile(path ? path : "")
+                                         : fl->setIrFile(path ? path : "");
+    return r == kResultOk;
+}
+
 static const PhOps vst3_ops = {
-    vst3_process, vst3_process_midi, vst3_destroy,
-    vst3_make_gui, vst3_destroy_gui,
-    vst3_param_count, vst3_param_name, vst3_param_get, vst3_param_set,
-    vst3_param_range, vst3_reset,
-    vst3_state_save, vst3_state_load
+    .process      = vst3_process,
+    .process_midi = vst3_process_midi,
+    .destroy      = vst3_destroy,
+    .make_gui     = vst3_make_gui,
+    .destroy_gui  = vst3_destroy_gui,
+    .param_count  = vst3_param_count,
+    .param_name   = vst3_param_name,
+    .param_get    = vst3_param_get,
+    .param_set    = vst3_param_set,
+    .param_range  = vst3_param_range,
+    .param_display = vst3_param_display,
+    .param_is_stepped = vst3_param_is_stepped,
+    .reset        = vst3_reset,
+    .state_save   = vst3_state_save,
+    .state_load   = vst3_state_load,
 };
 
 /* ---- Instantiate ---- */
@@ -739,6 +837,12 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
         /* Route editor knob edits to the DSP (needed for native-editor controls). */
         b->handler.b = b;
         b->controller->setComponentHandler(&b->handler);
+
+        /* Optional file-loading interface. Plug-ins that don't implement it
+         * simply fail the query and the host offers no file buttons. */
+        void *fl = nullptr;
+        if (b->controller->queryInterface(NAMku::INamFileLoader::iid, &fl) == kResultOk)
+            b->file_loader = (NAMku::INamFileLoader *)fl;
 
         int32 pc = b->controller->getParameterCount();
         for (int32 i = 0; i < pc; i++) {

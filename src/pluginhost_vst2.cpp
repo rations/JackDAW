@@ -18,6 +18,7 @@
 #define EFF_SET_BLOCK_SIZE  11
 #define EFF_MAINS_CHANGED   12
 #define EFF_GET_PARAM_NAME  8
+#define EFF_GET_PARAM_DISPLAY 7   /* plug-in's rendering of the current value */
 #define EFF_GET_EFFECT_NAME 45
 #define EFF_GET_PLUG_CATEGORY 35
 #define EFF_PROCESS_EVENTS  25
@@ -281,6 +282,20 @@ static float vst2_param_get(PluginInstance *pi, guint i)
     return b->eff->getParameter ? b->eff->getParameter(b->eff, (int)i) : 0.0f;
 }
 
+/* VST2 parameters are normalised 0..1 like VST3, so ask the plug-in to render
+ * the real value ("-6.0 dB") rather than showing the slider position. */
+static gboolean vst2_param_display(PluginInstance *pi, guint i, char *buf, gsize len)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    char tmp[128];
+    tmp[0] = 0;
+    b->eff->dispatcher(b->eff, EFF_GET_PARAM_DISPLAY, (int)i, 0, tmp, 0.0f);
+    if (!tmp[0]) return FALSE;
+    tmp[sizeof(tmp) - 1] = 0;     /* the plug-in may not terminate it */
+    g_strlcpy(buf, tmp, len);
+    return TRUE;
+}
+
 static void vst2_param_set(PluginInstance *pi, guint i, float v)
 {
     Vst2Backend *b = (Vst2Backend *)pi->backend;
@@ -454,11 +469,21 @@ static void vst2_destroy_gui(PluginInstance *pi)
 }
 
 static const PhOps vst2_ops = {
-    vst2_process, vst2_process_midi, vst2_destroy,
-    vst2_make_gui, vst2_destroy_gui,
-    vst2_param_count, vst2_param_name, vst2_param_get, vst2_param_set,
-    vst2_param_range, vst2_reset,
-    vst2_state_save, vst2_state_load
+    .process      = vst2_process,
+    .process_midi = vst2_process_midi,
+    .destroy      = vst2_destroy,
+    .make_gui     = vst2_make_gui,
+    .destroy_gui  = vst2_destroy_gui,
+    .param_count  = vst2_param_count,
+    .param_name   = vst2_param_name,
+    .param_get    = vst2_param_get,
+    .param_set    = vst2_param_set,
+    .param_range  = vst2_param_range,
+    .param_display = vst2_param_display,
+    .param_is_stepped = NULL,
+    .reset        = vst2_reset,
+    .state_save   = vst2_state_save,
+    .state_load   = vst2_state_load,
 };
 
 /* ---- Instantiate ---- */

@@ -156,9 +156,26 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count);
  * instrument, played immediately regardless of transport state. Lock-free: the
  * request is queued to the RT thread via a ringbuffer. Used by the piano-roll
  * keyboard so the user can audition pitches by clicking a key. No-op if the
- * track has no instrument loaded or is not registered with the engine. */
+ * track has no instrument loaded or is not registered with the engine.
+ * `channel` (0-15) should match the material being edited, so auditioning a
+ * drum part recorded on channel 10 reaches the same voice as playback does. */
 void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
-                                 guint8 velocity, gboolean on);
+                                 guint8 velocity, guint8 channel, gboolean on);
+
+/* TRUE while a count-in pre-roll is running (before the transport itself
+ * starts). Lets the UI show the armed/counting state on the transport. */
+gboolean jackdaw_engine_is_counting_in(void);
+
+/* --- RT liveness, for safely reclaiming objects the RT thread may have held ---
+ * get_cycle_count increments once per process callback and wraps; compare
+ * differences as unsigned. is_processing is FALSE when the client is inactive or
+ * suspended, in which case nothing reads the published FX chains at all. */
+guint    jackdaw_engine_get_cycle_count(void);
+gboolean jackdaw_engine_is_processing(void);
+
+/* Total xruns since startup (the xrun callback is always registered, not just
+ * under JACKDAW_DIAG), so the UI can surface a dropout counter. */
+guint    jackdaw_engine_get_xrun_count(void);
 
 /* --- Input port enumeration (main thread only) ---
  * Returns NULL-terminated array of available external JACK audio/MIDI output

@@ -509,6 +509,40 @@ void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R)
 /* Reclaim chains/instances retired by the PREVIOUS edit (the RT thread has had
  * many cycles to move past them by now), then publish a fresh chain built from
  * fx_list and retire the old one. */
+/* Free the retired instance queue. Callers must already have established that
+ * the RT thread cannot reach them (track_retire_is_safe, or finalize). */
+static void track_free_retired_fx(JackDawTrack *t)
+{
+    for (guint i = 0; i < t->retire_fx->len; i++)
+        pluginhost_free(g_ptr_array_index(t->retire_fx, i));
+    g_ptr_array_set_size(t->retire_fx, 0);
+}
+
+/* TRUE once the RT thread has completed a couple of cycles since the retire, so
+ * it can no longer be inside the chain snapshot that referenced these
+ * instances. With the engine stopped or suspended nothing reads the chain. */
+static gboolean track_retire_is_safe(JackDawTrack *t)
+{
+    if (!jackdaw_engine_is_processing()) return TRUE;
+    /* Unsigned wrap-around subtraction: correct across the counter's rollover. */
+    return (guint)(jackdaw_engine_get_cycle_count() - t->retire_cycle) >= 2u;
+}
+
+/* Reclaim retired plugin instances if the RT thread has moved past them.
+ * Returns TRUE when the queue is empty afterwards (nothing left to collect).
+ *
+ * Without this, a removed plugin was only freed by the *next* FX edit on the
+ * same track, or at app exit — so a bridged VST3's helper process stayed alive
+ * long after the user removed it from the chain. */
+gboolean jackdaw_track_fx_collect(JackDawTrack *t)
+{
+    g_return_val_if_fail(JACKDAW_IS_TRACK(t), TRUE);
+    if (t->retire_fx->len == 0) return TRUE;
+    if (!track_retire_is_safe(t)) return FALSE;
+    track_free_retired_fx(t);
+    return TRUE;
+}
+
 static void track_publish_chain(JackDawTrack *t)
 {
     for (guint i = 0; i < t->retire_chains->len; i++) {
@@ -516,9 +550,10 @@ static void track_publish_chain(JackDawTrack *t)
         g_free(c->fx); g_free(c);
     }
     g_ptr_array_set_size(t->retire_chains, 0);
-    for (guint i = 0; i < t->retire_fx->len; i++)
-        pluginhost_free(g_ptr_array_index(t->retire_fx, i));
-    g_ptr_array_set_size(t->retire_fx, 0);
+    /* Instances retired by a PREVIOUS edit: the RT thread has had many cycles to
+     * move past them by now. Anything retired by THIS edit is queued after the
+     * new chain is published and collected later (jackdaw_track_fx_collect). */
+    track_free_retired_fx(t);
 
     JackDawFxChain *nc = g_new0(JackDawFxChain, 1);
     nc->n = (int)t->fx_list->len;
@@ -548,8 +583,10 @@ void jackdaw_track_fx_remove(JackDawTrack *t, guint index)
     gpointer inst = g_ptr_array_index(t->fx_list, index);
     g_ptr_array_remove_index(t->fx_list, index);
     track_publish_chain(t);
-    /* Defer the instance free until the next edit so the retired chain that
-     * still references it is no longer read by the RT thread. */
+    t->retire_cycle = jackdaw_engine_get_cycle_count();
+    /* Defer the instance free until the RT thread has provably cycled past the
+     * chain that still references it — jackdaw_track_fx_collect does the free
+     * once that holds, rather than waiting for the next edit on this track. */
     g_ptr_array_add(t->retire_fx, inst);
 }
 

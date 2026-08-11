@@ -58,6 +58,9 @@ struct _JackDawProject {
     guint            beat_unit;      /* time-sig denominator (default 4) */
     gboolean         grid_enabled;   /* draw beat/bar grid on tracks */
     gboolean         snap_enabled;   /* snap edits/cursor to grid */
+    gint             grid_unit;      /* TempoMapGrid: snap/grid resolution.
+                                      * Default TEMPOMAP_GRID_BEAT, which is
+                                      * what snapping was hardcoded to before. */
     gboolean         metronome_enabled;
     gdouble          metronome_volume_db; /* user-set, -25..+25 dB (0 = unity) */
     gfloat           metronome_gain;      /* linear gain derived from the dB,
@@ -165,6 +168,9 @@ gdouble  jackdaw_project_get_bpm          (JackDawProject *p);
 void     jackdaw_project_set_time_signature(JackDawProject *p,
                                             guint num, guint den);
 void     jackdaw_project_set_grid_enabled (JackDawProject *p, gboolean on);
+/* Snap/grid resolution (a TempoMapGrid value; clamped to the valid range). */
+void     jackdaw_project_set_grid_unit    (JackDawProject *p, gint unit);
+gint     jackdaw_project_get_grid_unit    (JackDawProject *p);
 void     jackdaw_project_set_snap_enabled (JackDawProject *p, gboolean on);
 void     jackdaw_project_set_metronome    (JackDawProject *p, gboolean on);
 /* Metronome click volume in dB (clamped to -25..+25). Updates the linear gain

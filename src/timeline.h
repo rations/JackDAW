@@ -113,6 +113,9 @@ struct _JackDawTimeline {
 
     JackDawTimeRuler *ruler;         /* child widget */
     GtkWidget        *tracks_scroll; /* GtkScrolledWindow child */
+    GtkWidget        *tracks_bg;     /* input-only GtkEventBox wrapping tracks_box;
+                                      * catches clicks in the empty header column
+                                      * and lane area below the last track */
     GtkWidget        *tracks_box;    /* GtkBox vertical inside scroll */
 
     JackDawTrack     *focused_track; /* weak ref; NULL when nothing focused */
@@ -151,6 +154,11 @@ struct _JackDawTimeline {
      * the earliest copied region starts at frame 0.  Paste re-anchors the set at
      * the playhead on the right-clicked track. */
     GPtrArray        *clipboard;
+
+    /* MIDI section clipboard: owned MidiRegion* copies, normalized the same way.
+     * Kept separate from `clipboard` rather than made polymorphic so a MIDI
+     * copy can only ever be pasted onto an instrument track and vice versa. */
+    GPtrArray        *midi_clipboard;
 
     GtkWidget        *hscroll;     /* horizontal scrollbar bound to time_adj */
 
@@ -211,6 +219,7 @@ void          jackdaw_timeline_split_at_cursor(JackDawTimeline *tl);
 void          jackdaw_timeline_group_selection(JackDawTimeline *tl);
 void          jackdaw_timeline_copy_selection (JackDawTimeline *tl);
 void          jackdaw_timeline_paste_at_cursor(JackDawTimeline *tl);
+void          jackdaw_timeline_delete_selection(JackDawTimeline *tl);
 void          jackdaw_timeline_undo           (JackDawTimeline *tl);
 void          jackdaw_timeline_redo           (JackDawTimeline *tl);
 

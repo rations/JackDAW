@@ -122,6 +122,8 @@ struct _JackDawTrack {
     gpointer rt_chain;
     GPtrArray *retire_chains;   /* JackDawFxChain* awaiting free */
     GPtrArray *retire_fx;       /* PluginInstance* awaiting free */
+    guint      retire_cycle;    /* RT cycle count when retire_fx was last added
+                                 * to; the queue is safe to free two cycles on */
 };
 
 /* Immutable FX chain snapshot. fx[i] is a PluginInstance* (opaque here). */
@@ -236,6 +238,12 @@ void jackdaw_track_get_peaks(JackDawTrack *t, gfloat *out_L, gfloat *out_R);
  * avoid pulling GTK/plugin headers into every track.h consumer. */
 void      jackdaw_track_fx_add   (JackDawTrack *t, gpointer instance);
 void      jackdaw_track_fx_remove(JackDawTrack *t, guint index);
+
+/* Free plugin instances retired by a previous fx_remove, once the RT thread has
+ * provably moved past the chain that referenced them. Returns TRUE when the
+ * retire queue is empty (nothing pending), FALSE if the caller should try
+ * again shortly. Safe to call from the main thread at any time. */
+gboolean  jackdaw_track_fx_collect(JackDawTrack *t);
 void      jackdaw_track_fx_move  (JackDawTrack *t, guint from, guint to);
 guint     jackdaw_track_fx_count (JackDawTrack *t);
 gpointer  jackdaw_track_fx_get   (JackDawTrack *t, guint index);

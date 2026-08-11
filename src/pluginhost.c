@@ -4,7 +4,12 @@
 #include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
+#include <dirent.h>
+#include <errno.h>
+#include <poll.h>
+#include <signal.h>
 
 #include "pluginhost.h"
 #include "pluginhost_internal.h"
@@ -236,38 +241,131 @@ static void ph_emit_class(PluginFormat fmt, const char *line, GList **catalog)
     g_strfreev(f);
 }
 
+#define PH_SCAN_TIMEOUT_MS 15000
+#define PH_SCAN_MAX_OUTPUT (1u << 20)   /* untrusted child output, bounded */
+
+/* Newest mtime at or under `path`, recursing into directories (bounded depth).
+ *
+ * A VST3 "file" is a bundle DIRECTORY on Linux, and replacing
+ * Foo.vst3/Contents/x86_64-linux/Foo.so does not touch the directory's own
+ * mtime — so stat()ing the bundle alone left an updated plug-in matching its
+ * stale catalog entry forever. Returns 0 on failure, which never matches a
+ * stored stamp, so an unreadable path simply rescans. */
+static gint64 ph_path_mtime(const char *path, int depth)
+{
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (!S_ISDIR(st.st_mode) || depth >= 8) return (gint64)st.st_mtime;
+
+    gint64 newest = (gint64)st.st_mtime;
+    DIR *d = opendir(path);
+    if (!d) return newest;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
+        char *child = g_build_filename(path, ent->d_name, NULL);
+        gint64 m = ph_path_mtime(child, depth + 1);
+        if (m > newest) newest = m;
+        g_free(child);
+    }
+    closedir(d);
+    return newest;
+}
+
+/* Run the describe helper for one plug-in and return its stdout.
+ *
+ * Returns an empty string when the helper ran but produced nothing usable
+ * (crashed, refused the file, or overran the deadline) — a negative result the
+ * caller caches, so a broken plug-in is not re-probed on every launch. NULL
+ * means the helper could not be started at all, which is not cached.
+ *
+ * The child is read to EOF against a deadline rather than waited on: a
+ * Wine-bridged plug-in spawns a helper that inherits this stdout, so EOF is the
+ * honest "everything it started has finished" signal. The old code used a plain
+ * g_spawn_sync() with no deadline, fetched the exit status and never looked at
+ * it, and captured unbounded output — one plug-in whose static initialiser hung
+ * rather than crashed wedged the whole startup scan behind the modal dialog. */
+static gchar *ph_run_scan_helper(const char *fmt_name, const char *path)
+{
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n <= 0) return NULL;
+    exe[n] = 0;
+
+    /* Explicit argv, never a shell — `path` is filesystem data, not trusted. */
+    gchar *argv[] = { exe, (gchar *)"--scan-plugin",
+                      (gchar *)fmt_name, (gchar *)path, NULL };
+    GPid pid = 0;
+    gint out_fd = -1;
+    GSpawnFlags flags = (GSpawnFlags)(G_SPAWN_DO_NOT_REAP_CHILD |
+                                      G_SPAWN_STDERR_TO_DEV_NULL);
+    if (!g_spawn_async_with_pipes(NULL, argv, NULL, flags, NULL, NULL,
+                                  &pid, NULL, &out_fd, NULL, NULL))
+        return NULL;
+
+    GString *out = g_string_new(NULL);
+    gint64 deadline = g_get_monotonic_time() + (gint64)PH_SCAN_TIMEOUT_MS * 1000;
+    gboolean failed = FALSE;
+
+    for (;;) {
+        gint64 left_us = deadline - g_get_monotonic_time();
+        if (left_us <= 0) { failed = TRUE; break; }
+
+        struct pollfd pfd = { out_fd, POLLIN, 0 };
+        int pr = poll(&pfd, 1, (int)(left_us / 1000));
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            failed = TRUE; break;
+        }
+        if (pr == 0) { failed = TRUE; break; }        /* deadline */
+
+        char buf[4096];
+        ssize_t r = read(out_fd, buf, sizeof buf);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            failed = TRUE; break;
+        }
+        if (r == 0) break;                            /* EOF: child is done */
+        if (out->len + (gsize)r > PH_SCAN_MAX_OUTPUT) { failed = TRUE; break; }
+        g_string_append_len(out, buf, r);
+    }
+    close(out_fd);
+
+    if (failed) kill(pid, SIGKILL);
+
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) { /* retry */ }
+    g_spawn_close_pid(pid);
+
+    if (failed || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        g_string_truncate(out, 0);      /* cache the negative result */
+        if (failed)
+            g_warning("plugin scan: '%s' timed out or misbehaved; skipping", path);
+    }
+    return g_string_free(out, FALSE);
+}
+
 void ph_scan_cached(PluginFormat fmt, const char *path, GList **catalog)
 {
     if (!ph_cache) return;
-    struct stat st;
-    gint64 mtime = (stat(path, &st) == 0) ? (gint64)st.st_mtime : 0;
+    gint64 mtime = ph_path_mtime(path, 0);
     PhCacheEnt *e = g_hash_table_lookup(ph_cache, path);
 
     if (!e || e->mtime != mtime) {                  /* miss -> scan out of process */
         if (ph_progress_cb) ph_progress_cb(path, ph_progress_u);
-        char *self = NULL;
-        char exe[4096];
-        ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
-        if (n > 0) { exe[n] = 0; self = exe; }
-        if (!self) return;
-        char *argv[] = { self, (char *)"--scan-plugin",
-                         (char *)pluginhost_format_name(fmt), (char *)path, NULL };
-        char *sout = NULL; gint status = 0;
-        gboolean ok = g_spawn_sync(NULL, argv, NULL, G_SPAWN_STDERR_TO_DEV_NULL,
-                                   NULL, NULL, &sout, NULL, &status, NULL);
-        if (!ok) { g_free(sout); return; }
+        gchar *sout = ph_run_scan_helper(pluginhost_format_name(fmt), path);
+        if (!sout) return;                          /* could not start: don't cache */
 
         if (!e) { e = g_new0(PhCacheEnt, 1);
                   e->classes = g_ptr_array_new_with_free_func(g_free);
                   g_hash_table_insert(ph_cache, g_strdup(path), e); }
         else g_ptr_array_set_size(e->classes, 0);
         e->mtime = mtime;
-        if (sout) {
-            gchar **rows = g_strsplit(sout, "\n", -1);
-            for (int i = 0; rows[i]; i++)
-                if (rows[i][0]) g_ptr_array_add(e->classes, g_strdup(rows[i]));
-            g_strfreev(rows); g_free(sout);
-        }
+        gchar **rows = g_strsplit(sout, "\n", -1);
+        for (int i = 0; rows[i]; i++)
+            if (rows[i][0]) g_ptr_array_add(e->classes, g_strdup(rows[i]));
+        g_strfreev(rows);
+        g_free(sout);
         ph_cache_dirty = TRUE;
     }
     e->seen = TRUE;
@@ -859,14 +957,155 @@ void pluginhost_param_range(PluginInstance *inst, guint i, float *mn, float *mx)
     else { if (mn) *mn = 0.0f; if (mx) *mx = 1.0f; }
 }
 
+gboolean pluginhost_param_display(PluginInstance *inst, guint i,
+                                  char *buf, gsize len)
+{
+    if (!buf || len == 0) return FALSE;
+    if (inst && inst->ops && inst->ops->param_display &&
+        inst->ops->param_display(inst, i, buf, len))
+        return TRUE;
+    /* Fallback: the raw value, which is at least honest about what was set. */
+    g_snprintf(buf, len, "%.3f", pluginhost_param_get(inst, i));
+    return FALSE;
+}
+
+gboolean pluginhost_param_is_stepped(PluginInstance *inst, guint i, int *n_steps)
+{
+    if (n_steps) *n_steps = 0;
+    return (inst && inst->ops && inst->ops->param_is_stepped)
+           ? inst->ops->param_is_stepped(inst, i, n_steps) : FALSE;
+}
+
+/* ---- File-loading plug-ins (VST3 INamFileLoader) ---- */
+
+gboolean pluginhost_has_file_loader(PluginInstance *inst)
+{
+#ifdef HAVE_VST3
+    return ph_vst3_has_file_loader(inst);
+#else
+    (void)inst; return FALSE;
+#endif
+}
+
+gboolean pluginhost_file_get(PluginInstance *inst, int which,
+                             char *buf, int buflen)
+{
+#ifdef HAVE_VST3
+    return ph_vst3_file_get(inst, which, buf, buflen);
+#else
+    (void)inst; (void)which;
+    if (buf && buflen > 0) buf[0] = 0;
+    return FALSE;
+#endif
+}
+
+gboolean pluginhost_file_set(PluginInstance *inst, int which, const char *path)
+{
+#ifdef HAVE_VST3
+    return ph_vst3_file_set(inst, which, path);
+#else
+    (void)inst; (void)which; (void)path; return FALSE;
+#endif
+}
+
+/* ---- Presets ----
+ *
+ * A preset file is just the plug-in's own opaque state blob with a short header
+ * identifying the plug-in it came from, so loading a preset saved from a
+ * different plug-in fails cleanly instead of feeding it foreign bytes. Only
+ * meaningful for backends that implement state_save/state_load; for the rest the
+ * project's parameter list already is the full state. */
+
+#define PH_PRESET_MAGIC   "JDAWPRST"
+#define PH_PRESET_VERSION 1u
+#define PH_PRESET_MAX     (64u << 20)
+
+gboolean pluginhost_preset_save(PluginInstance *inst, const char *path)
+{
+    if (!inst || !path) return FALSE;
+    void *blob = NULL; gsize blen = 0;
+    if (!pluginhost_state_save(inst, &blob, &blen) || !blob) return FALSE;
+
+    const char *key = inst->key ? inst->key : "";
+    guint32 klen = (guint32)strlen(key);
+
+    GByteArray *out = g_byte_array_new();
+    guint32 ver = PH_PRESET_VERSION, fmt = (guint32)inst->format;
+    g_byte_array_append(out, (const guint8 *)PH_PRESET_MAGIC, 8);
+    g_byte_array_append(out, (const guint8 *)&ver,  sizeof ver);
+    g_byte_array_append(out, (const guint8 *)&fmt,  sizeof fmt);
+    g_byte_array_append(out, (const guint8 *)&klen, sizeof klen);
+    g_byte_array_append(out, (const guint8 *)key,   klen);
+    g_byte_array_append(out, blob, (guint)blen);
+    g_free(blob);
+
+    gboolean ok = g_file_set_contents(path, (const gchar *)out->data,
+                                      (gssize)out->len, NULL);
+    g_byte_array_free(out, TRUE);
+    return ok;
+}
+
+gboolean pluginhost_preset_load(PluginInstance *inst, const char *path)
+{
+    if (!inst || !path) return FALSE;
+    gchar *data = NULL; gsize len = 0;
+    if (!g_file_get_contents(path, &data, &len, NULL)) return FALSE;
+
+    /* Untrusted file: validate every length before using it. */
+    gboolean ok = FALSE;
+    const gsize hdr = 8 + 4 + 4 + 4;
+    if (len < hdr || len > PH_PRESET_MAX) goto out;
+    if (memcmp(data, PH_PRESET_MAGIC, 8) != 0) goto out;
+
+    guint32 ver, fmt, klen;
+    memcpy(&ver,  data + 8,  sizeof ver);
+    memcpy(&fmt,  data + 12, sizeof fmt);
+    memcpy(&klen, data + 16, sizeof klen);
+    if (ver != PH_PRESET_VERSION) goto out;
+    if (fmt != (guint32)inst->format) goto out;
+    if (klen > len - hdr) goto out;
+
+    /* Same plug-in only — a state blob is meaningless to any other. */
+    if (klen != (inst->key ? strlen(inst->key) : 0)) goto out;
+    if (klen && memcmp(data + hdr, inst->key, klen) != 0) goto out;
+
+    ok = pluginhost_state_load(inst, data + hdr + klen, len - hdr - klen);
+out:
+    g_free(data);
+    return ok;
+}
+
 /* ---- Generic parameter panel (fallback GUI) ---- */
 
-typedef struct { PluginInstance *inst; guint idx; } ParamLink;
+typedef struct { PluginInstance *inst; guint idx; GtkWidget *val; } ParamLink;
+
+static void ph_param_update_value_label(ParamLink *pl)
+{
+    if (!pl->val) return;
+    char buf[128];
+    pluginhost_param_display(pl->inst, pl->idx, buf, sizeof buf);
+    /* Plug-in-supplied text: set_text, never set_markup. */
+    gtk_label_set_text(GTK_LABEL(pl->val), buf);
+}
 
 static void ph_param_slider_changed(GtkRange *r, gpointer data)
 {
     ParamLink *pl = data;
-    pluginhost_param_set(pl->inst, pl->idx, (float)gtk_range_get_value(r));
+    double v = gtk_range_get_value(r);
+
+    /* Discrete parameters land on whole steps rather than anywhere in between. */
+    int steps = 0;
+    if (pluginhost_param_is_stepped(pl->inst, pl->idx, &steps) && steps > 1) {
+        float mn = 0.0f, mx = 1.0f;
+        pluginhost_param_range(pl->inst, pl->idx, &mn, &mx);
+        if (mx > mn) {
+            double t = (v - mn) / (mx - mn);
+            double q = floor(t * (steps - 1) + 0.5) / (double)(steps - 1);
+            v = mn + q * (mx - mn);
+        }
+    }
+    pluginhost_param_set(pl->inst, pl->idx, (float)v);
+    ph_param_update_value_label(pl);
 }
 
 GtkWidget *ph_generic_param_panel(PluginInstance *inst)
@@ -883,7 +1122,7 @@ GtkWidget *ph_generic_param_panel(PluginInstance *inst)
     if (n == 0) {
         gtk_grid_attach(GTK_GRID(grid),
             gtk_label_new("This plugin exposes no editable parameters."),
-            0, 0, 2, 1);
+            0, 0, 3, 1);
     }
     for (guint i = 0; i < n; i++) {
         float mn = 0.0f, mx = 1.0f;
@@ -902,14 +1141,23 @@ GtkWidget *ph_generic_param_panel(PluginInstance *inst)
         gtk_widget_set_hexpand(sc, TRUE);
         gtk_widget_set_size_request(sc, 220, -1);
 
+        /* The plug-in's own rendering of the value ("-6.0 dB", "Sine"). Without
+         * it a VST3's normalised 0..1 slider position told the user nothing. */
+        GtkWidget *val = gtk_label_new("");
+        gtk_widget_set_halign(val, GTK_ALIGN_END);
+        gtk_label_set_width_chars(GTK_LABEL(val), 10);
+        gtk_label_set_ellipsize(GTK_LABEL(val), PANGO_ELLIPSIZE_END);
+
         ParamLink *pl = g_new0(ParamLink, 1);
-        pl->inst = inst; pl->idx = i;
+        pl->inst = inst; pl->idx = i; pl->val = val;
         g_object_set_data_full(G_OBJECT(sc), "param-link", pl, g_free);
         g_signal_connect(sc, "value-changed",
                          G_CALLBACK(ph_param_slider_changed), pl);
+        ph_param_update_value_label(pl);
 
         gtk_grid_attach(GTK_GRID(grid), lbl, 0, (int)i, 1, 1);
         gtk_grid_attach(GTK_GRID(grid), sc,  1, (int)i, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), val, 2, (int)i, 1, 1);
     }
 
     gtk_container_add(GTK_CONTAINER(scroll), grid);
