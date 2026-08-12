@@ -33,6 +33,8 @@ for arg in "$@"; do
     esac
 done
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+
 # --------------------------------------------------------------------------- #
 # Prefix selection — must match what install-jackdaw.sh used.
 # --------------------------------------------------------------------------- #
@@ -92,6 +94,41 @@ done
 [ "$removed" -eq 0 ] && warn "nothing found to remove under $PREFIX"
 
 # --------------------------------------------------------------------------- #
+# Leftovers under the OTHER prefix. This run only touched $PREFIX, so a copy
+# installed under a different prefix survives and keeps answering to `jackdaw`
+# and to the application menu — which looks exactly like a failed uninstall.
+# Report it; never remove it, since it was not the prefix we were asked for.
+# --------------------------------------------------------------------------- #
+dir_on_path() {
+    _dop_dir="$1"
+    _dop_ifs="$IFS"
+    IFS=:
+    for _dop_p in $PATH; do
+        if [ "$_dop_p" = "$_dop_dir" ]; then IFS="$_dop_ifs"; return 0; fi
+    done
+    IFS="$_dop_ifs"
+    return 1
+}
+
+check_remaining_install() {
+    for _other in /usr/local "$HOME/.local"; do
+        [ "${_other%/}" = "${PREFIX%/}" ] && continue
+        _obin="$_other/bin/jackdaw"
+        _odesk="$_other/share/applications/jackdaw.desktop"
+        [ -e "$_obin" ] || [ -e "$_odesk" ] || continue
+        warn "JackDAW is STILL installed under $_other (this run only touched $PREFIX):"
+        [ -e "$_obin"  ] && warn "    $_obin"
+        [ -e "$_odesk" ] && warn "    $_odesk"
+        if [ -e "$_obin" ] && dir_on_path "$_other/bin"; then
+            warn "  '$_other/bin' is on PATH — 'jackdaw' still starts that copy."
+        fi
+        [ -e "$_odesk" ] && warn "  its application-menu entry is still in place."
+        warn "  Remove it too with:  PREFIX=$_other $SCRIPT_DIR/uninstall-jackdaw.sh"
+    done
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
 # Refresh caches (guarded, same as install).
 # --------------------------------------------------------------------------- #
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
@@ -123,4 +160,7 @@ if [ "$PURGE" -eq 1 ]; then
     warn "Run the command above manually if you really want to remove the libraries."
 fi
 
-log "JackDAW uninstalled."
+log "JackDAW uninstalled from $PREFIX."
+
+# Last, so a surviving copy under the other prefix is the final thing seen.
+check_remaining_install

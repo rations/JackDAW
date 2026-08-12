@@ -294,6 +294,50 @@ install_desktop() {
     log "Installed launcher to $APPDIR/jackdaw.desktop"
 }
 
+# Echo the 0-based position of directory $1 in PATH, or -1 when absent.
+path_rank() {
+    local dir="$1" i=0 p
+    local IFS=:
+    for p in $PATH; do
+        [ "$p" = "$dir" ] && { echo "$i"; return 0; }
+        i=$((i+1))
+    done
+    echo -1
+}
+
+# An install under a DIFFERENT prefix is never touched by this run, and can
+# still win both lookups: PATH order decides which binary `jackdaw` resolves
+# to, and XDG_DATA_HOME is searched before XDG_DATA_DIRS, so a launcher under
+# $HOME/.local/share outranks a system one with the same basename. Report it;
+# never delete it — a deliberate two-prefix setup is legitimate.
+check_shadow_install() {
+    local other obin odesk r_new r_old found=0
+    for other in /usr/local "$HOME/.local"; do
+        [ "${other%/}" = "${PREFIX%/}" ] && continue
+        obin="$other/bin/jackdaw"
+        odesk="$other/share/applications/jackdaw.desktop"
+        [ -e "$obin" ] || [ -e "$odesk" ] || continue
+        found=1
+        warn "another JackDAW install exists under $other, left untouched by this run:"
+        [ -e "$obin"  ] && warn "    $obin"
+        [ -e "$odesk" ] && warn "    $odesk"
+        if [ -e "$obin" ]; then
+            r_new=$(path_rank "$BINDIR"); r_old=$(path_rank "$other/bin")
+            if [ "$r_old" -ge 0 ] && { [ "$r_new" -lt 0 ] || [ "$r_old" -lt "$r_new" ]; }; then
+                warn "  '$other/bin' precedes '$BINDIR' on PATH:"
+                warn "  typing 'jackdaw' still runs $obin, not the binary just installed."
+            fi
+        fi
+        if [ -e "$odesk" ] && [ "${other%/}" = "${HOME%/}/.local" ]; then
+            warn "  \$HOME/.local/share outranks $DATADIR in XDG lookup:"
+            warn "  your application menu still launches the install under $other."
+        fi
+        warn "  Remove it with:  PREFIX=$other $SCRIPT_DIR/uninstall-jackdaw.sh"
+    done
+    [ "$found" -eq 1 ] && warn "Nothing was removed automatically."
+    return 0
+}
+
 refresh_caches() {
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         run_priv gtk-update-icon-cache -f -t "$ICONROOT" >/dev/null 2>&1 || true
@@ -376,3 +420,6 @@ For low-latency audio, make sure your user can lock memory and is in the
     #   @audio   -  memlock    unlimited
 (Then log out and back in.)
 EOF
+
+# Last, so it is not scrolled away by the package-install output.
+check_shadow_install
