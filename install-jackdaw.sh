@@ -233,7 +233,20 @@ build_from_source() {
     command -v make >/dev/null 2>&1 || die "make not found and build deps could not be installed"
     [ -f Makefile ] || die "no Makefile in $SCRIPT_DIR — cannot build from source"
     local jobs; jobs=$(nproc 2>/dev/null || echo 1)
-    make -j"$jobs" || die "build failed"
+    # VST3 hosting is on by default and compiles the Steinberg SDK from
+    # ext/vst3sdk, which is a git submodule. A clone made without
+    # --recurse-submodules leaves it empty (a release tarball ships it
+    # populated), so probe for a source file that must exist and fall back to a
+    # VST3-less build rather than failing with a screenful of missing headers.
+    local vst3=1
+    if [ ! -f ext/vst3sdk/pluginterfaces/base/funknown.cpp ]; then
+        warn "ext/vst3sdk is empty — building WITHOUT VST3 plugin hosting"
+        warn "to enable it, fetch the SDK and re-run:"
+        warn "  git submodule update --init ext/vst3sdk"
+        warn "  git -C ext/vst3sdk submodule update --init base pluginterfaces public.sdk"
+        vst3=0
+    fi
+    make VST3="$vst3" -j"$jobs" || die "build failed"
     [ -f src/jackdaw ] || die "build finished but src/jackdaw is missing"
     PREBUILT="src/jackdaw"
 }

@@ -3,11 +3,11 @@
 # uninstall-jackdaw.sh — remove a JackDAW install placed by install-jackdaw.sh.
 #
 # Removes the binary, the LV2 UI helpers, the icon set and the .desktop
-# launcher, then refreshes the icon/desktop caches. Distro packages are NOT
-# removed unless --purge is given.
+# launcher, then refreshes the icon/desktop caches. Distro packages are never
+# touched.
 #
 # Usage:
-#   ./uninstall-jackdaw.sh [--purge] [-h|--help]
+#   ./uninstall-jackdaw.sh [-h|--help]
 #
 # Use the SAME prefix you installed with: it prompts interactively, or set
 # PREFIX= in the environment (e.g. PREFIX=$HOME/.local ./uninstall-jackdaw.sh).
@@ -24,10 +24,8 @@ log()  { printf '%s==>%s %s\n'  "$C_GRN" "$C_OFF" "$*" >&2; }
 warn() { printf '%swarning:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
 die()  { printf '%serror:%s %s\n'   "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
 
-PURGE=0
 for arg in "$@"; do
     case "$arg" in
-        --purge) PURGE=1 ;;
         -h|--help) sed -n '2,/^set -eu/{/^set -eu/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
         *) die "unknown argument: $arg (try --help)" ;;
     esac
@@ -141,26 +139,29 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 # --------------------------------------------------------------------------- #
-# Optional package purge (off by default).
+# Per-user data in ~/.jackdaw. Reported, never removed: alongside the settings
+# and the (regenerable) plugin scan caches it holds recordings/, which is
+# captured audio the user may not have copied anywhere else. Deleting that on an
+# uninstall would be destroying work, so print the path and let them decide.
 # --------------------------------------------------------------------------- #
-if [ "$PURGE" -eq 1 ]; then
-    warn "JackDAW's runtime libraries are shared with other applications."
-    warn "Removing them may break other software. Listing only — review carefully."
-    if   command -v apt-get >/dev/null 2>&1; then
-        echo "  sudo apt-get remove libgtk-3-0 libjack-jackd2-0 libsndfile1 libsamplerate0 liblilv-0-0 libsuil-0-0" >&2
-    elif command -v dnf >/dev/null 2>&1; then
-        echo "  sudo dnf remove gtk3 jack-audio-connection-kit libsndfile libsamplerate lilv suil" >&2
-    elif command -v pacman >/dev/null 2>&1; then
-        echo "  sudo pacman -Rs gtk3 jack2 libsndfile libsamplerate lilv suil" >&2
-    elif command -v zypper >/dev/null 2>&1; then
-        echo "  sudo zypper remove libgtk-3-0 libjack0 libsndfile1 libsamplerate0 liblilv-0-0 libsuil-0-0" >&2
-    elif command -v apk >/dev/null 2>&1; then
-        echo "  sudo apk del gtk+3.0 jack libsndfile libsamplerate lilv suil" >&2
+report_user_data() {
+    _ud="$HOME/.jackdaw"
+    [ -d "$_ud" ] || return 0
+    log "Per-user data left in place: $_ud"
+    [ -f "$_ud/config" ]      && log "    config       settings (theme, ports, preferences)"
+    [ -f "$_ud/plugincache" ] && log "    plugincache  plugin scan cache (regenerated on demand)"
+    [ -f "$_ud/pluginindex" ] && log "    pluginindex  plugin scan index (regenerated on demand)"
+    if [ -d "$_ud/recordings" ]; then
+        _n=$(find "$_ud/recordings" -type f 2>/dev/null | wc -l)
+        warn "    recordings/  $_n recorded file(s) — YOUR AUDIO, not removed"
     fi
-    warn "Run the command above manually if you really want to remove the libraries."
-fi
+    log "  Remove it yourself if you want a clean slate:  rm -rf $_ud"
+    return 0
+}
 
 log "JackDAW uninstalled from $PREFIX."
+
+report_user_data
 
 # Last, so a surviving copy under the other prefix is the final thing seen.
 check_remaining_install

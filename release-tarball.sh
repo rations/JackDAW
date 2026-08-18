@@ -63,9 +63,24 @@ for f in Makefile LICENSE README.md jackdawicon.png jackdaw.desktop.in \
 done
 
 # --------------------------------------------------------------------------- #
-# Bundled headers and pre-generated icons (whole trees, header/PNG only)
+# Bundled headers, the VST3 SDK, and pre-generated icons.
+#
+# ext/ carries the vendored vestige/CLAP/LADSPA headers AND ext/vst3sdk, which
+# is a git submodule (Steinberg VST3 SDK, MIT licensed — its LICENSE.txt files
+# are copied along with it, which is what the licence requires). A tarball is
+# not a git checkout, so the submodule's .git pointer files must be stripped:
+# each contains a "gitdir: ../../.git/modules/..." path that does not exist once
+# unpacked, and git tooling run inside the unpacked tree trips over them.
 # --------------------------------------------------------------------------- #
-[ -d ext ]   && cp -a ext   "$DEST/"
+if [ -d ext ]; then
+    cp -a ext "$DEST/"
+    find "$DEST/ext" -name '.git' -exec rm -rf {} + 2>/dev/null || true
+    if [ ! -f "$DEST/ext/vst3sdk/pluginterfaces/base/funknown.cpp" ]; then
+        echo "  warning: ext/vst3sdk is empty — the tarball will only build with VST3=0" >&2
+        echo "           run: git submodule update --init ext/vst3sdk" >&2
+        echo "                git -C ext/vst3sdk submodule update --init base pluginterfaces public.sdk" >&2
+    fi
+fi
 [ -d icons ] && cp -a icons "$DEST/"
 
 # --------------------------------------------------------------------------- #

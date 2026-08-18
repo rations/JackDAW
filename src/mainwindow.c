@@ -63,14 +63,9 @@ static const char MW_CSS_SHARED[] =
     "  background-image:none; background-color:#ffe000; color:#101010; }"
     "button.ts-fx.ts-fx-active {"
     "  background-image:none; background-color:#2980b9; color:#ffffff; }"
-    /* Track strip selected for render ("Selected tracks" source). */
-    "box.ts-selected {"
-    "  background-color:#2d4a6b;"
-    "  border:1px solid #5b9bd5; }"
-    /* The single active/primary track — stronger highlight than ts-selected. */
-    "box.ts-active {"
-    "  background-color:#36608f;"
-    "  border:1px solid #8ec3ff; }"
+    /* box.ts-selected and box.ts-active are mode-dependent: they paint the
+     * strip background, so their colours have to match the chrome they sit on.
+     * They live in MW_CSS_LIGHT / MW_CSS_DARK below. */
     /* Mixer fader: flat horizontal cap (not the theme's round handle)
      * so its centre is a clear reference that lines up with the dB
      * labels. Trough margins = half the cap height so the cap centre
@@ -78,8 +73,7 @@ static const char MW_CSS_SHARED[] =
      * (7px) in mixer.c. */
     "scale.mix-fader { padding:0; }"
     "scale.mix-fader trough {"
-    "  margin:7px 0; min-width:5px;"
-    "  background-image:none; background-color:#262629; }"
+    "  margin:7px 0; min-width:5px; background-image:none; }"
     "scale.mix-fader highlight {"
     "  background-image:none; background-color:#3a6ea5; }"
     "scale.mix-fader slider {"
@@ -88,7 +82,7 @@ static const char MW_CSS_SHARED[] =
     "  background-image:none; background-color:#d2d2d6; }"
     /* Permanent value read-out centered under each track-strip dial. */
     "label.ts-knob-val {"
-    "  font-size:9px; font-family:monospace; color:#ffffff; }"
+    "  font-size:9px; font-family:monospace; }"
     /* Floating real-time dB read-out shown beside the fader. */
     "label.mix-db-pop {"
     "  font-size:11px; font-family:monospace; color:#ffffff;"
@@ -101,7 +95,19 @@ static const char MW_CSS_LIGHT[] =
     "button:checked { background-image:none; background-color:#b8c4d8;"
     "  color:#101010; }"
     "spinbutton, spinbutton entry { color:#101010; }"
-    "label { color:#101010; }";
+    "label { color:#101010; }"
+    /* Mode-dependent counterparts of the rules lifted out of MW_CSS_SHARED.
+     * The dark originals painted #2d4a6b / #36608f strips in BOTH modes, which
+     * put light mode's #101010 text on a dark blue strip at 2.9:1 — and left
+     * label.ts-knob-val white-on-white at 1.04:1, i.e. invisible. */
+    "box.ts-selected {"
+    "  background-color:#cfe0f5;"
+    "  border:1px solid #5b9bd5; }"
+    "box.ts-active {"
+    "  background-color:#a7c8ea;"
+    "  border:1px solid #2f6fb5; }"
+    "scale.mix-fader trough { background-color:#c4c4c8; }"
+    "label.ts-knob-val { color:#101010; }";
 
 /* Generic chrome rules — dark variant (light text on near-black, not gray). */
 static const char MW_CSS_DARK[] =
@@ -114,13 +120,63 @@ static const char MW_CSS_DARK[] =
     "button:checked { background-image:none; background-color:#3a3f4a;"
     "  color:#e6e6e6; }"
     "spinbutton, spinbutton entry { color:#e6e6e6;"
-    "  background-color:#262626; }";
+    "  background-color:#262626; }"
+    /* Mode-dependent counterparts of the rules lifted out of MW_CSS_SHARED —
+     * these are the original values, unchanged. */
+    "box.ts-selected {"
+    "  background-color:#2d4a6b;"
+    "  border:1px solid #5b9bd5; }"
+    "box.ts-active {"
+    "  background-color:#36608f;"
+    "  border:1px solid #8ec3ff; }"
+    "scale.mix-fader trough { background-color:#262629; }"
+    "label.ts-knob-val { color:#ffffff; }"
+    /* View-class widgets (entries, text views, tree/list views) must be styled
+     * explicitly: gtk-application-prefer-dark-theme only takes effect when the
+     * active theme ships a dark variant (a gtk-dark.css), and many themes —
+     * Clearlooks-Phenix-Sapphire among them — do not. Without these rules such
+     * a theme keeps its near-black view text while the backgrounds above are
+     * forced to #1a1a1a, leaving entries and plugin lists unreadable. Themes
+     * that DO have a dark variant are unaffected: these colours match what the
+     * dark variant would have supplied anyway. */
+    "entry, textview, textview text, treeview, treeview.view, .view,"
+    "cell, list, list row {"
+    "  color:#e6e6e6; background-color:#262626; }"
+    "treeview:selected, treeview.view:selected, .view:selected, cell:selected,"
+    "list row:selected, textview text:selected, entry selection {"
+    "  background-color:#3a6ea5; color:#ffffff; }"
+    "treeview header button {"
+    "  color:#e6e6e6; background-color:#2a2a2a; }";
 
 static void mw_apply_theme(gboolean dark)
 {
     GtkSettings *gs = gtk_settings_get_default();
-    if (gs)
-        g_object_set(gs, "gtk-application-prefer-dark-theme", dark, NULL);
+    if (gs) {
+        /* Pin Adwaita as the base in BOTH modes rather than inheriting whatever
+         * the desktop is set to. Adwaita's gtk.css and gtk-dark.css are compiled
+         * into libgtk-3 itself as GResources under /org/gtk/libgtk/theme/Adwaita/
+         * — no theme package, no icon theme, no desktop environment required —
+         * so this resolves identically on every machine that can run a GTK3
+         * binary, and gtk-application-prefer-dark-theme is actually honoured
+         * because Adwaita ships the dark variant it asks for.
+         *
+         * Inheriting the user's theme is what broke both modes, in mirror image:
+         * a theme with no dark variant (Clearlooks-Phenix-Sapphire) left its
+         * near-black text on the dark backgrounds set below, and a dark-only
+         * theme (Arc-Dark, Materia-dark, Nordic) left light mode's #101010 text
+         * on a dark background at 1.8:1 contrast. Neither failure is detectable
+         * at build time: prefer-dark-theme fails silently when a theme has no
+         * dark variant.
+         *
+         * Pinning also fixes what CSS cannot reach at all — combo and spin
+         * arrows, checkmarks, expander triangles, scrollbar sliders, selection
+         * and insensitive colours — because those are drawn by the theme rather
+         * than by our rules. The cost is that JackDAW no longer follows the
+         * desktop theme; for a DAW whose colour coding carries meaning that is
+         * the intended trade. */
+        g_object_set(gs, "gtk-theme-name", "Adwaita",
+                         "gtk-application-prefer-dark-theme", dark, NULL);
+    }
 
     if (!g_app_css) {
         g_app_css = gtk_css_provider_new();
@@ -1244,8 +1300,8 @@ static void mw_dark_mode_cb(GtkCheckMenuItem *item, gpointer data)
     gboolean on = gtk_check_menu_item_get_active(item);
     settings_set_uint32("dark_mode", on ? 1 : 0);
     mw_apply_theme(on);
-    /* Force Cairo-drawn surfaces (e.g. the mixer dB scale, which picks its
-     * text colour from the theme) to repaint with the new scheme. */
+    /* Force Cairo-drawn surfaces (e.g. the mixer dB scale, which branches on
+     * the dark_mode setting rather than on any theme colour) to repaint. */
     gtk_widget_queue_draw(GTK_WIDGET(data));
 }
 
@@ -1964,7 +2020,7 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 700);
 
     /* Transport/track state colours + light-or-dark chrome. Applies the
-     * persisted dark-mode preference (default: light). */
+     * persisted dark-mode preference (default: dark). */
     mw_apply_theme(settings_get_uint32("dark_mode", 1) != 0);
 
     g_signal_connect(win, "delete-event", G_CALLBACK(mw_delete_event), NULL);

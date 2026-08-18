@@ -27,7 +27,9 @@ All IPC is plain UNIX (sockets, files, JACK signalling).
   and live note auditioning through the track's instrument.
 - Metronome with count-in, loop playback, region rendering, and a configurable
   JACK port layout.
-- Light/dark theming.
+- Light/dark theming, rendered against JackDAW's own bundled GTK base rather
+  than the desktop theme, so both modes look the same on every distro and
+  desktop environment.
 
 ---
 
@@ -56,6 +58,31 @@ build is actually needed.
 ---
 
 ## Installation
+
+### Getting the source
+
+Release tarballs unpack ready to build — they ship the VST3 SDK inside `ext/`.
+If you clone from git instead, fetch the submodule too, or the VST3 backend
+cannot be built:
+
+```sh
+git clone --recurse-submodules https://github.com/rations/JackDAW.git
+```
+
+Already cloned without it? Fetch it after the fact:
+
+```sh
+git submodule update --init ext/vst3sdk
+git -C ext/vst3sdk submodule update --init base pluginterfaces public.sdk
+```
+
+Only those three of the SDK's seven nested submodules are needed; skipping the
+rest (`vstgui4`, `doc`, `tutorials`, `cmake`) avoids about 170 MB that JackDAW
+never compiles. The installer detects an empty `ext/vst3sdk` and builds without
+VST3 rather than failing, so a plain `git clone` still produces a working DAW —
+just one that cannot host VST3 plugins.
+
+### Running the installer
 
 The installer is **distro-agnostic** (apt, dnf/yum, pacman, zypper, apk) and
 needs no systemd. From the unpacked release directory:
@@ -110,10 +137,15 @@ If you install to `~/.local`, make sure `~/.local/bin` is on your `PATH`.
 JackDAW uses a plain `Makefile` (not autotools):
 
 ```sh
-make -j"$(nproc)"        # build src/jackdaw (+ LV2 UI helpers)
-make VST3=1 -j"$(nproc)" # also enable VST3 hosting (needs the VST3 SDK)
-make clean
+make -j"$(nproc)"        # build src/jackdaw (+ LV2 UI helpers), VST3 included
+make VST3=0 -j"$(nproc)" # skip the VST3 backend (no SDK needed, faster build)
+make clean               # also removes build/ and any stray SDK objects
 ```
+
+VST3 hosting is **on by default** and compiles the Steinberg SDK from
+`ext/vst3sdk`. Its object files go to `build/`, deliberately outside the
+submodule so the SDK checkout is never left dirty. Use `VST3=0` if you have not
+fetched the submodule or want a lighter build.
 
 ### Uninstalling
 
@@ -121,17 +153,22 @@ make clean
 ./uninstall-jackdaw.sh
 ```
 
-It prompts for the same location you installed to (or honour `PREFIX=`), removes
-the binary, helpers, icons and launcher, and refreshes caches. It does **not**
-remove distro packages by default — pass `--purge` to print (and optionally run)
-the package-removal command, with a warning that those shared libraries may be
-used by other applications.
+It prompts for the same location you installed to (or honours `PREFIX=`),
+removes the binary, helpers, icons and launcher, and refreshes caches.
+
+It never touches distro packages.
+
+Your settings, plugin scan cache and recordings live in `~/.jackdaw` and are
+**left in place** — the uninstaller prints the path and what is in it, including
+a count of any recorded audio, so you can decide for yourself.
 
 ### Creating a release tarball
 
 `release-tarball.sh` produces `jackdaw-<VERSION>.tar.gz` that unpacks into a
-top-level `JackDAW/` directory containing the source, bundled headers, icons,
-packaging scripts and the prebuilt binary.
+top-level `JackDAW/` directory containing the source, bundled headers, the VST3
+SDK, icons, packaging scripts and the prebuilt binary. Because the SDK is
+included the tarball is around 15 MB, and it builds VST3 support with no
+network access or submodule fetch.
 
 ```sh
 ./release-tarball.sh           # version read from src/config.h
@@ -152,7 +189,7 @@ The default version comes from `#define VERSION` in `src/config.h`; edit the
 |---------|-------|
 | LV2     | Scanned in-process via lilv (reads `.ttl`). |
 | VST2    | Via the bundled public-domain `vestige` header (no Steinberg SDK). |
-| VST3    | Requires building with `make VST3=1` and the VST3 SDK. |
+| VST3    | Via the Steinberg VST3 SDK (MIT) vendored as the `ext/vst3sdk` submodule; on by default, disable with `make VST3=0`. |
 | CLAP    | Bundled CLAP headers. |
 | LADSPA  | Bundled LADSPA header. |
 

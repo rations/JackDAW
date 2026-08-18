@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "knob.h"
+#include "settings.h"
 
 #define KNOB_DIAM       28          /* px: circle diameter */
 #define KNOB_TEXT_H     12          /* px: readout strip below the circle */
@@ -167,8 +168,16 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     double r   = KNOB_DIAM / 2.0 - 2.5;
     double ang = knob_angle(kd);
 
-    /* Background arc track */
-    cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
+    /* Every colour below follows the chrome theme. These are drawn onto the
+     * track-header column, which timeline.c fills light in light mode, so the
+     * fixed light-on-dark values hid the pointer dot and the centre letter
+     * against a white strip. */
+    gboolean dark = settings_get_uint32("dark_mode", 1) != 0;
+
+    /* Background arc track — the unfilled remainder, deliberately subtle, so it
+     * inverts rather than keeping one fixed grey. */
+    if (dark) cairo_set_source_rgb(cr, 0.25, 0.25, 0.25);
+    else      cairo_set_source_rgb(cr, 0.80, 0.80, 0.80);
     cairo_set_line_width(cr, 3.0);
     cairo_arc(cr, cx, cy, r - 1.5, KNOB_START_ANG, KNOB_END_ANG);
     cairo_stroke(cr);
@@ -182,7 +191,8 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
     /* Pointer dot */
     double px = cx + (r - 3.5) * cos(ang);
     double py = cy + (r - 3.5) * sin(ang);
-    cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+    if (dark) cairo_set_source_rgb(cr, 0.95, 0.95, 0.95);
+    else      cairo_set_source_rgb(cr, 0.15, 0.15, 0.15);
     cairo_arc(cr, px, py, 2.0, 0.0, 2.0 * M_PI);
     cairo_fill(cr);
 
@@ -194,7 +204,8 @@ static gboolean knob_draw_cb(GtkWidget *widget, cairo_t *cr, gpointer data)
                                CAIRO_FONT_WEIGHT_BOLD);
         cairo_set_font_size(cr, 9.0);
         cairo_text_extents(cr, kd->center, &te);
-        cairo_set_source_rgb(cr, 0.7, 0.7, 0.7);
+        if (dark) cairo_set_source_rgb(cr, 0.70, 0.70, 0.70);
+        else      cairo_set_source_rgb(cr, 0.35, 0.35, 0.35);
         cairo_move_to(cr, cx - te.width / 2.0 - te.x_bearing,
                           cy - te.height / 2.0 - te.y_bearing);
         cairo_show_text(cr, kd->center);

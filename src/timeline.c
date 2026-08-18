@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "timeline.h"
+#include "settings.h"
 #include "trackstrip.h"
 #include "jackdaw-engine.h"
 #include "midiwindow.h"
@@ -14,7 +15,12 @@
 /* Frozen-pane colours, as cairo_set_source_rgb argument lists. The lane tone
  * matches wave_view_draw's own background so the empty area below the last
  * track is continuous with the lanes above it. */
-#define TL_HEADER_BG  0.227, 0.227, 0.243
+/* Track-header column fill. The track strips are transparent GTK widgets drawn
+ * on top of this, so it has to follow the chrome theme: a fixed dark fill left
+ * light mode's near-black label text on a dark grey column, i.e. unreadable.
+ * mixer.c branches on the same setting for its dB scale. */
+#define TL_HEADER_BG        0.227, 0.227, 0.243
+#define TL_HEADER_BG_LIGHT  0.965, 0.961, 0.957
 #define TL_LANE_BG    0.12,  0.12,  0.12
 #define TL_DIVIDER    0.45,  0.45,  0.47
 
@@ -2744,7 +2750,10 @@ static gboolean tracks_box_draw_bg(GtkWidget *w, cairo_t *cr, gpointer data)
     GtkAllocation a;
     gtk_widget_get_allocation(w, &a);
 
-    cairo_set_source_rgb(cr, TL_HEADER_BG);
+    if (settings_get_uint32("dark_mode", 1) != 0)
+        cairo_set_source_rgb(cr, TL_HEADER_BG);
+    else
+        cairo_set_source_rgb(cr, TL_HEADER_BG_LIGHT);
     cairo_rectangle(cr, 0, 0, TIMELINE_HEADER_WIDTH, a.height);
     cairo_fill(cr);
 

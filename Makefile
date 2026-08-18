@@ -12,7 +12,7 @@ TARGET  := $(SRCDIR)/jackdaw
 CC      := gcc
 CXX     := g++
 
-VST3SDK ?= /home/human/third_party/vst3sdk
+VST3SDK ?= $(EXTDIR)/vst3sdk
 # VST3 backend is built by default (you have the SDK). Disable with: make VST3=0
 VST3    ?= 1
 
@@ -120,6 +120,10 @@ SRCS_CXX := \
 # Optional VST3 backend (heavier; needs the SDK). Enable with: make VST3=1
 # NOTE: the exact SDK source list is version-sensitive — adjust VST3_SDK_SRC if
 # your vst3sdk checkout differs.
+# SDK objects go under build/ rather than next to their sources: writing them
+# into ext/vst3sdk left 26 stray .o files inside the submodule, which made it
+# (and its nested submodules) show as permanently dirty in git and the editor.
+VST3_OBJDIR := build/vst3sdk
 VST3_SDK_OBJ :=
 ifeq ($(VST3),1)
 SRCS_CXX += $(SRCDIR)/pluginhost_vst3.cpp
@@ -150,7 +154,7 @@ VST3_SDK_SRC := \
     $(VST3SDK)/public.sdk/source/vst/hosting/connectionproxy.cpp \
     $(VST3SDK)/public.sdk/source/vst/hosting/eventlist.cpp \
     $(VST3SDK)/public.sdk/source/vst/utility/stringconvert.cpp
-VST3_SDK_OBJ := $(VST3_SDK_SRC:.cpp=.o)
+VST3_SDK_OBJ := $(patsubst $(VST3SDK)/%.cpp,$(VST3_OBJDIR)/%.o,$(VST3_SDK_SRC))
 endif
 
 OBJS := $(SRCS_C:.c=.o) $(SRCS_CXX:.cpp=.o) $(VST3_SDK_OBJ)
@@ -218,11 +222,20 @@ $(SRCDIR)/%.o: $(SRCDIR)/%.c
 $(SRCDIR)/%.o: $(SRCDIR)/%.cpp
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
-# Generic rule for out-of-tree (VST3 SDK) C++ sources.
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# Out-of-tree (VST3 SDK) C++ sources -> build/vst3sdk/. Scoped to that prefix
+# rather than a catch-all %.o so it can never claim one of our own objects.
+# -w because these are Steinberg's sources, not ours: their warnings (printf
+# %lld mismatches, non-virtual bases, memset on non-trivial types) are not ours
+# to fix and only bury our own. src/%.o above keeps full -Wall -Wextra.
+$(VST3_OBJDIR)/%.o: $(VST3SDK)/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -w -c $< -o $@
 
 -include $(DEPS)
 
 clean:
 	rm -f $(SRCDIR)/*.o $(SRCDIR)/*.d $(TARGET) $(HELPERS)
+	rm -rf build
+	@# Sweep any .o left inside the submodule by an older revision of this
+	@# Makefile, which compiled SDK objects in place and left it looking dirty.
+	@[ -d "$(VST3SDK)" ] && find "$(VST3SDK)" -name '*.o' -delete 2>/dev/null || true

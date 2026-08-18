@@ -35,3 +35,9 @@ stamp-h1
 \#*\#
 .DS_Store
 Thumbs.db
+
+# Stray logs written by bridged plug-ins during the startup scan
+vstbridge-host*.log
+
+# Out-of-tree build dir (VST3 SDK objects)
+build/

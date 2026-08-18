@@ -153,8 +153,15 @@ int             ph_rt_active(void);
  * last call. */
 gint64          pluginhost_diag_take_max_us(PluginInstance *inst);
 /* Count of IHostApplication::createInstance calls made on the RT thread by VST3
- * plugins (message/attribute-list allocations in the audio callback). */
+ * plugins (message/attribute-list allocations in the audio callback). Defined in
+ * pluginhost_vst3.cpp, which is only compiled with VST3=1 — hence the stub, so
+ * the unconditional call in jackdaw-engine.c's diag thread still links when the
+ * VST3 backend is left out. */
+#ifdef HAVE_VST3
 guint64         ph_vst3_rt_alloc_count(void);
+#else
+static inline guint64 ph_vst3_rt_alloc_count(void) { return 0; }
+#endif
 
 /* TRUE if this plugin is an instrument (synth) rather than an audio effect. */
 gboolean        pluginhost_is_instrument(PluginInstance *inst);
