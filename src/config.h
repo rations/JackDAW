@@ -8,8 +8,8 @@
 #define CONFIG_H
 
 #define PACKAGE         "jackdaw"
-#define VERSION         "0.1.0"
-#define PACKAGE_VERSION "0.1.0"
+#define VERSION         "0.2.0"
+#define PACKAGE_VERSION "0.2.0"
 
 #define HAVE_SCHED_H     1
 #define HAVE_SCHED_YIELD 1

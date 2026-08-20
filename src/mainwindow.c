@@ -1164,6 +1164,30 @@ static void mw_mixer_window_mode_cb(GtkCheckMenuItem *item, gpointer data)
     mw_mixer_apply(win);
 }
 
+/* Right-click on the Mixer toolbar button offers the docked/windowed choice,
+ * mirroring the "Open Mixer in Window" item in the View menu. */
+static gboolean mw_mixer_button_press_cb(GtkWidget *w, GdkEventButton *ev,
+                                         gpointer data)
+{
+    (void)w;
+    JackDawMainWindow *win = JACKDAW_MAIN_WINDOW(data);
+    if (ev->type != GDK_BUTTON_PRESS || ev->button != 3) return FALSE;
+
+    GtkWidget *menu = gtk_menu_new();
+
+    GtkWidget *mi_mixwin =
+        gtk_check_menu_item_new_with_label("Open Mixer in Window");
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(mi_mixwin),
+                                   win->mixer_in_window);
+    g_signal_connect(mi_mixwin, "toggled",
+                     G_CALLBACK(mw_mixer_window_mode_cb), win);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), mi_mixwin);
+
+    gtk_widget_show_all(menu);
+    gtk_menu_popup_at_pointer(GTK_MENU(menu), (GdkEvent *)ev);
+    return TRUE; /* don't toggle on right-click */
+}
+
 static void mw_locate_start_cb(GtkWidget *widget, gpointer data)
 {
     (void)widget;
@@ -2304,6 +2328,8 @@ GtkWidget *jackdaw_main_window_new(JackDawProject *project)
     GtkWidget *tg_mixer = gtk_toggle_button_new_with_label("Mixer");
     win->mixer_button = tg_mixer;
     g_signal_connect(tg_mixer, "toggled", G_CALLBACK(mw_mixer_toggled), win);
+    g_signal_connect(tg_mixer, "button-press-event",
+                     G_CALLBACK(mw_mixer_button_press_cb), win);
     gtk_box_pack_end(GTK_BOX(ftb), tg_mixer, FALSE, FALSE, 0);
 
     /* ---- Timeline + mixer dock (vertical paned) ---- */
