@@ -340,8 +340,6 @@ typedef struct {
     GtkWidget      *shown;       /* currently displayed GUI (owned by instance) */
     GtkWidget      *mix_scale;   /* wet/dry for the selected effect */
     GtkWidget      *mix_row;     /* the dry/wet header (hidden when none selected) */
-    GtkWidget      *file_row;    /* Load Model / Load IR (only for plug-ins that
-                                  * expose a file-loading interface) */
     guint           sel_index;   /* index of the selected effect */
     guint           fit_id;      /* deferred "fit window to plugin" timer */
     int             fit_ticks;   /* retries left to catch late-negotiating UIs */
@@ -352,7 +350,6 @@ typedef struct {
 } FxWindow;
 
 static void fxwin_rebuild_list(FxWindow *fw);
-static void fxwin_update_file_buttons(FxWindow *fw);
 
 /* Release (free) every effect's native editor before the window dies. Like jalv
  * (jalv_close -> suil_instance_free), the suil instance and its idle/push timers
@@ -429,12 +426,10 @@ static void fxwin_show_gui(FxWindow *fw, guint index)
 {
     gpointer inst = jackdaw_track_fx_get(fw->track, index);
     if (!inst) {
-        if (fw->mix_row)  gtk_widget_hide(fw->mix_row);
-        if (fw->file_row) gtk_widget_hide(fw->file_row);
+        if (fw->mix_row) gtk_widget_hide(fw->mix_row);
         return;
     }
     fw->sel_index = index;
-    fxwin_update_file_buttons(fw);
 
     /* Reflect this effect's wet/dry without retriggering the change handler. */
     if (fw->mix_scale) {
@@ -708,45 +703,6 @@ static void fxwin_preset_load_clicked(GtkButton *b, gpointer data)
     gtk_widget_destroy(ch);
 }
 
-/* ---- File-loading plug-ins (e.g. NAMku: "Load Model" / "Load IR") ----
- * A path cannot be a VST3 parameter, so such plug-ins expose a dedicated
- * interface. The buttons only appear for plug-ins that implement it. */
-static void fxwin_file_clicked(GtkButton *b, gpointer data)
-{
-    FxWindow *fw = data;
-    int which = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(b), "ph-file-which"));
-    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
-    if (!inst || !pluginhost_has_file_loader(inst)) return;
-
-    GtkWidget *ch = gtk_file_chooser_dialog_new(
-        which == PH_FILE_MODEL ? "Load Model" : "Load Impulse Response",
-        GTK_WINDOW(fw->window), GTK_FILE_CHOOSER_ACTION_OPEN,
-        "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
-
-    /* Start at the currently loaded file, if any. */
-    char cur[PATH_MAX];
-    if (pluginhost_file_get(inst, which, cur, sizeof cur) && cur[0])
-        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(ch), cur);
-
-    if (gtk_dialog_run(GTK_DIALOG(ch)) == GTK_RESPONSE_ACCEPT) {
-        gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(ch));
-        if (path) pluginhost_file_set(inst, which, path);
-        g_free(path);
-    }
-    gtk_widget_destroy(ch);
-}
-
-/* Show/hide the file buttons for whichever effect is now selected. */
-static void fxwin_update_file_buttons(FxWindow *fw)
-{
-    if (!fw->file_row) return;
-    PluginInstance *inst = jackdaw_track_fx_get(fw->track, fw->sel_index);
-    if (inst && pluginhost_has_file_loader(inst))
-        gtk_widget_show_all(fw->file_row);
-    else
-        gtk_widget_hide(fw->file_row);
-}
-
 static void fxrow_remove_clicked(GtkButton *b, gpointer data)
 {
     (void)b;
@@ -948,22 +904,6 @@ void jackdaw_fx_window_open(JackDawTrack *track, JackDawProject *project)
     gtk_box_pack_start(GTK_BOX(fw->mix_row), pload, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(right), fw->mix_row, FALSE, FALSE, 0);
-
-    fw->file_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_container_set_border_width(GTK_CONTAINER(fw->file_row), 4);
-    {
-        GtkWidget *bm = gtk_button_new_with_label("Load Model\342\200\246");
-        GtkWidget *bi = gtk_button_new_with_label("Load IR\342\200\246");
-        g_object_set_data(G_OBJECT(bm), "ph-file-which",
-                          GINT_TO_POINTER(PH_FILE_MODEL));
-        g_object_set_data(G_OBJECT(bi), "ph-file-which",
-                          GINT_TO_POINTER(PH_FILE_IR));
-        g_signal_connect(bm, "clicked", G_CALLBACK(fxwin_file_clicked), fw);
-        g_signal_connect(bi, "clicked", G_CALLBACK(fxwin_file_clicked), fw);
-        gtk_box_pack_start(GTK_BOX(fw->file_row), bm, FALSE, FALSE, 0);
-        gtk_box_pack_start(GTK_BOX(fw->file_row), bi, FALSE, FALSE, 0);
-    }
-    gtk_box_pack_start(GTK_BOX(right), fw->file_row, FALSE, FALSE, 0);
 
     /* A stack so each effect's editor is added once and shown by switching the
      * visible child — never reparented (which would blank a native X11 UI). */
