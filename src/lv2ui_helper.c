@@ -7,6 +7,11 @@
  * argv: <binary> <plugin_uri> <ui_uri> <sample_rate>
  */
 #define _GNU_SOURCE
+/* sratom pulls in lv2/atom/forge.h, which has a URID field named `Bool` —
+ * Xlib (via gdkx.h) #defines Bool to int, so it MUST come first. */
+#ifdef HAVE_SRATOM
+#  include <sratom/sratom.h>
+#endif
 #include <gtk/gtk.h>
 #if GTK_MAJOR_VERSION >= 3
 #  include <gtk/gtkx.h>          /* GtkPlug/GtkSocket (GTK2 has them in gtk.h) */
@@ -66,16 +71,57 @@ static const LilvPlugin *g_plugin;
 static SuilInstance     *g_ui;
 static GtkWidget        *g_plug;
 static FILE             *g_proto;   /* private protocol channel (not stdout) */
+static LV2_URID          g_ev_transfer;
+
+#ifdef HAVE_SRATOM
+/* This process's own atom <-> Turtle serialiser. Its URIDs are not the host's,
+ * which is exactly why atoms cross the pipe as text (see lv2ui_ipc.h). */
+static Sratom *g_sratom;
+
+static Sratom *sratom_get(void)
+{
+    if (!g_sratom) {
+        g_sratom = sratom_new(&urid_map);
+        if (g_sratom) sratom_set_pretty_numbers(g_sratom, false);
+    }
+    return g_sratom;
+}
+static SerdNode atom_subject(void)
+{ return serd_node_from_string(SERD_URI, (const uint8_t *)LV2UI_IPC_ATOM_SUBJECT); }
+static SerdNode atom_pred(void)
+{ return serd_node_from_string(SERD_URI, (const uint8_t *)LV2UI_IPC_ATOM_PRED); }
+#endif
 
 static void ui_write_cb(SuilController c, uint32_t port, uint32_t size,
                         uint32_t protocol, const void *buffer)
 {
     (void)c;
-    if (protocol != 0 || size != sizeof(float)) return;
-    char line[LV2UI_IPC_MAXLINE];
-    lv2ui_ipc_fmt_port(line, sizeof line, port, *(const float *)buffer);
-    fputs(line, g_proto);
-    fflush(g_proto);
+    if (protocol == 0 && size == sizeof(float)) {
+        char line[LV2UI_IPC_MAXLINE];
+        lv2ui_ipc_fmt_port(line, sizeof line, port, *(const float *)buffer);
+        fputs(line, g_proto);
+        fflush(g_proto);
+        return;
+    }
+#ifdef HAVE_SRATOM
+    /* An atom: the editor loading a file, sending patch:Set, handing over
+     * state. Dropping these is what leaves such a plugin silent. */
+    if (protocol == g_ev_transfer && size >= sizeof(LV2_Atom)) {
+        Sratom *sr = sratom_get();
+        if (!sr) return;
+        const LV2_Atom *atom = (const LV2_Atom *)buffer;
+        SerdNode subj = atom_subject(), pred = atom_pred();
+        char *ttl = sratom_to_turtle(sr, &urid_unmap, LV2UI_IPC_ATOM_BASE,
+                                     &subj, &pred, atom->type, atom->size,
+                                     (const char *)buffer + sizeof(LV2_Atom));
+        if (!ttl) return;
+        char *line = lv2ui_ipc_fmt_atom(port, ttl);
+        free(ttl);
+        fputs(line, g_proto);
+        fflush(g_proto);
+        g_free(line);
+    }
+#endif
 }
 
 static uint32_t ui_index_cb(SuilController c, const char *symbol)
@@ -102,8 +148,27 @@ static gboolean stdin_cb(GIOChannel *src, GIOCondition cond, gpointer d)
     g_strchomp(line);
     if (!strcmp(line, "QUIT")) { g_free(line); gtk_main_quit(); return G_SOURCE_REMOVE; }
     guint32 idx; float val;
-    if (g_ui && lv2ui_ipc_parse_port(line, &idx, &val))
+    if (g_ui && lv2ui_ipc_parse_port(line, &idx, &val)) {
         suil_instance_port_event(g_ui, idx, sizeof(float), 0, &val);
+    }
+#ifdef HAVE_SRATOM
+    else if (g_ui) {
+        char *ttl = lv2ui_ipc_parse_atom(line, &idx);
+        if (ttl) {
+            Sratom *sr = sratom_get();
+            SerdNode subj = atom_subject(), pred = atom_pred();
+            LV2_Atom *atom = sr ? sratom_from_turtle(sr, LV2UI_IPC_ATOM_BASE,
+                                                     &subj, &pred, ttl) : NULL;
+            if (atom) {
+                suil_instance_port_event(g_ui, idx,
+                                         (uint32_t)(sizeof(LV2_Atom) + atom->size),
+                                         g_ev_transfer, atom);
+                free(atom);
+            }
+            g_free(ttl);
+        }
+    }
+#endif
     g_free(line);
     return G_SOURCE_CONTINUE;
 }
@@ -119,6 +184,7 @@ int main(int argc, char **argv)
 
     gtk_init(&argc, &argv);
     suil_init(&argc, &argv, SUIL_ARG_NONE);
+    g_ev_transfer = urid_map_cb(NULL, LV2_ATOM__eventTransfer);
     if (argc < 4) { g_printerr("usage: %s plugin_uri ui_uri sample_rate\n", argv[0]); return 2; }
     const char *plugin_uri = argv[1];
     const char *want_ui    = argv[2];

@@ -913,6 +913,41 @@ void pluginhost_ctl_ports(PluginInstance *inst, gboolean outputs,
 #endif
 }
 
+char *pluginhost_atom_pop_turtle(PluginInstance *inst, guint *port)
+{
+#if defined(HAVE_LV2) && defined(HAVE_SRATOM)
+    if (inst && inst->format == PH_LV2) {
+        guint32 p = 0;
+        char *ttl = ph_lv2_atom_pop_turtle(inst, &p);
+        if (ttl) { *port = p; return ttl; }
+    }
+#else
+    (void)inst; (void)port;
+#endif
+    return NULL;
+}
+
+gboolean pluginhost_atom_push_turtle(PluginInstance *inst, guint port,
+                                     const char *turtle)
+{
+#if defined(HAVE_LV2) && defined(HAVE_SRATOM)
+    if (inst && inst->format == PH_LV2)
+        return ph_lv2_atom_push_turtle(inst, port, turtle);
+#else
+    (void)inst; (void)port; (void)turtle;
+#endif
+    return FALSE;
+}
+
+void pluginhost_atom_ui_open(PluginInstance *inst, gboolean open)
+{
+#ifdef HAVE_LV2
+    if (inst && inst->format == PH_LV2) ph_lv2_atom_ui_open(inst, open);
+#else
+    (void)inst; (void)open;
+#endif
+}
+
 double pluginhost_sample_rate(PluginInstance *inst)
 {
     return inst ? inst->sample_rate : 48000.0;

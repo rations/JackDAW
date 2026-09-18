@@ -108,6 +108,20 @@ float ph_lv2_ctl_get  (PluginInstance *, guint port);
 void  ph_lv2_ctl_ports(PluginInstance *, gboolean outputs,
                        const guint **ports, guint *n);
 
+/* Editor <-> DSP atom traffic. Control ports carry floats; everything else a
+ * plugin's editor says (load this model, patch:Set, here is my state) is an
+ * atom on its control port, and everything it says back comes off its notify
+ * port. Raw for the in-process editor; Turtle for the out-of-process bridge,
+ * because a URID means nothing in the process that did not map it. */
+gboolean ph_lv2_atom_to_dsp  (PluginInstance *, guint32 port,
+                              const void *atom, guint32 size);
+gboolean ph_lv2_atom_from_dsp(PluginInstance *, guint32 *port,
+                              void *buf, guint32 bufsz, guint32 *size);
+void     ph_lv2_atom_ui_open (PluginInstance *, gboolean open);
+guint32  ph_lv2_atom_transfer_urid(PluginInstance *);
+char    *ph_lv2_atom_pop_turtle (PluginInstance *, guint32 *port);  /* g_free */
+gboolean ph_lv2_atom_push_turtle(PluginInstance *, guint32 port, const char *ttl);
+
 /* Instantiate (return NULL on failure). */
 PluginInstance *ph_lv2_instantiate   (const PluginInfo *, double sr, int max_block);
 PluginInstance *ph_vst2_instantiate  (const PluginInfo *, double sr, int max_block);

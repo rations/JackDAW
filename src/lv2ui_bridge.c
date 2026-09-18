@@ -74,10 +74,25 @@ static void push_ports(Bridge *b, gboolean outputs)
     }
 }
 
+/* Forward whatever the plugin has forged on its notify port to the helper.
+ * Control ports carry the meters; this is everything else the DSP tells its
+ * editor — capture lists, state, parameter echoes. */
+static void push_atoms(Bridge *b)
+{
+    guint port = 0;
+    char *ttl;
+    while ((ttl = pluginhost_atom_pop_turtle(b->inst, &port))) {
+        char *line = lv2ui_ipc_fmt_atom((guint32)port, ttl);
+        bridge_send(b, line);
+        g_free(line);
+        g_free(ttl);
+    }
+}
+
 static gboolean push_outputs(gpointer data)
 {
     Bridge *b = data;
-    if (b->embedded) push_ports(b, TRUE);
+    if (b->embedded) { push_ports(b, TRUE); push_atoms(b); }
     return G_SOURCE_CONTINUE;
 }
 
@@ -100,6 +115,7 @@ static gboolean on_helper_out(GIOChannel *src, GIOCondition cond, gpointer data)
             if (w > 0 && h > 0) gtk_widget_set_size_request(b->socket, w, h);
             gtk_socket_add_id(GTK_SOCKET(b->socket), (Window)xid);
             b->embedded = TRUE;
+            pluginhost_atom_ui_open(b->inst, TRUE);  /* DSP may fill the ring */
             push_ports(b, FALSE);   /* seed control inputs once */
         }
     } else if (!strncmp(line, "SIZE ", 5)) {
@@ -109,8 +125,15 @@ static gboolean on_helper_out(GIOChannel *src, GIOCondition cond, gpointer data)
             gtk_widget_set_size_request(b->socket, w, h);   /* plugin asked to resize */
     } else {
         guint32 idx; float val;
-        if (lv2ui_ipc_parse_port(line, &idx, &val))
+        if (lv2ui_ipc_parse_port(line, &idx, &val)) {
             pluginhost_ctl_set(b->inst, idx, val);   /* UI -> DSP */
+        } else {
+            char *ttl = lv2ui_ipc_parse_atom(line, &idx);
+            if (ttl) {
+                pluginhost_atom_push_turtle(b->inst, idx, ttl);
+                g_free(ttl);
+            }
+        }
     }
     g_free(line);
     return G_SOURCE_CONTINUE;
@@ -126,6 +149,7 @@ static void bridge_free(gpointer data, GObject *where)
 {
     (void)where;
     Bridge *b = data;
+    pluginhost_atom_ui_open(b->inst, FALSE);   /* nobody drains the ring now */
     if (b->push_timer)  g_source_remove(b->push_timer);
     if (b->out_watch)   g_source_remove(b->out_watch);
     if (b->in_fd >= 0)  { bridge_send(b, "QUIT\n"); close(b->in_fd); b->in_fd = -1; }

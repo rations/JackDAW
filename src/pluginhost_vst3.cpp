@@ -172,6 +172,16 @@ struct Vst3Backend {
      * grow the queue list while the RT thread is reading it. Writes now go into
      * this SDK ring buffer and are drained into in_params on the RT thread. */
     ParameterChangeTransfer        param_xfer{2048};
+    /* RT -> UI parameter feedback (level meters, gain reduction, any read-only
+     * value the DSP publishes). The plug-in writes these into
+     * ProcessData::outputParameterChanges on the audio thread; VST3 has no other
+     * processor->editor value path, and the HOST is what closes it by handing
+     * them to the edit controller. out_params is the object process() writes,
+     * RT-thread-only; out_xfer carries them to the GTK thread, which is the only
+     * thread allowed to touch IEditController. */
+    ParameterChanges               out_params;  /* RT-thread-only */
+    ParameterChangeTransfer        out_xfer{512};
+    guint                          pump_id = 0;  /* GTK drain timer */
     EventList                      in_events{256};   /* MIDI for instruments */
     int                            max_block = 0;
     std::vector<ParamID>           param_ids;
@@ -269,8 +279,11 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
      * thread, so nothing else ever mutates the object process() reads. */
     b->param_xfer.transferChangesTo(b->in_params);
     b->data.inputParameterChanges = &b->in_params;
+    b->out_params.clearQueue();
+    b->data.outputParameterChanges = &b->out_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
+    b->out_xfer.transferChangesFrom(b->out_params);
 
     if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
         memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * n);
@@ -334,8 +347,11 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
      * thread, so nothing else ever mutates the object process() reads. */
     b->param_xfer.transferChangesTo(b->in_params);
     b->data.inputParameterChanges = &b->in_params;
+    b->out_params.clearQueue();
+    b->data.outputParameterChanges = &b->out_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
+    b->out_xfer.transferChangesFrom(b->out_params);
     b->data.inputEvents = nullptr;        /* reset for the effect (audio) path */
 
     if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
@@ -344,6 +360,34 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
         memcpy(R, b->data.outputs[0].channelBuffers32[oc > 1 ? 1 : 0],
                sizeof(float) * n);
     }
+}
+
+/* Drain the RT thread's parameter feedback into the edit controller (GTK
+ * thread). This is the other half of ProcessData::outputParameterChanges: the
+ * processor publishes its meters there every block and the editor only ever
+ * sees them because the host forwards them here. Coalesced to the last value
+ * per parameter — a meter updates once per block (~375 Hz at 128 frames) and
+ * only the newest value is worth a repaint. */
+#define VST3_PUMP_MAX_IDS 32
+
+static gboolean vst3_pump_feedback(gpointer data)
+{
+    Vst3Backend *b = (Vst3Backend *)data;
+    if (!b->controller) return G_SOURCE_CONTINUE;
+
+    ParamID    ids[VST3_PUMP_MAX_IDS];
+    ParamValue vals[VST3_PUMP_MAX_IDS];
+    int        n = 0;
+
+    ParamID id; ParamValue v; int32 off;
+    while (b->out_xfer.getNextChange(id, v, off)) {
+        int i = 0;
+        for (; i < n; i++) if (ids[i] == id) { vals[i] = v; break; }
+        if (i == n && n < VST3_PUMP_MAX_IDS) { ids[n] = id; vals[n] = v; n++; }
+    }
+    for (int i = 0; i < n; i++)
+        b->controller->setParamNormalized(ids[i], vals[i]);
+    return G_SOURCE_CONTINUE;
 }
 
 static void vst3_destroy_gui(PluginInstance *pi);   /* fwd */
@@ -363,6 +407,7 @@ static void vst3_destroy(PluginInstance *pi)
 {
     Vst3Backend *b = (Vst3Backend *)pi->backend;
     if (!b) return;
+    if (b->pump_id) { g_source_remove(b->pump_id); b->pump_id = 0; }
     if (b->editor) vst3_destroy_gui(pi);   /* defensive: normally already gone */
     if (b->controller) b->controller->setComponentHandler(nullptr);
     if (b->processor) b->processor->setProcessing(false);
@@ -850,6 +895,19 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
             if (b->controller->getParameterInfo(i, pinf) == kResultOk)
                 b->param_ids.push_back(pinf.id);
         }
+
+        /* Pre-size both parameter queues to the plug-in's parameter count.
+         * ParameterChanges::addParameterData allocates a new queue when it runs
+         * past the pre-sized ones, and both objects are filled on the RT thread
+         * (in_params by the UI drain, out_params by the plug-in itself). */
+        int32 room = (pc > 0 ? pc : 16);
+        b->in_params.setMaxParameters(room);
+        b->out_params.setMaxParameters(room);
+
+        /* Meters/feedback: drain the RT thread's output parameter changes into
+         * the controller at 30 Hz. Runs for the instance's lifetime, not just
+         * while an editor is open, so the controller's values stay current. */
+        b->pump_id = g_timeout_add(33, vst3_pump_feedback, b);
     }
 
     PluginInstance *pi = ph_instance_alloc(PH_VST3, info->name, sr, max_block);

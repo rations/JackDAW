@@ -26,6 +26,7 @@ HAS_ALSA := $(shell pkg-config --exists alsa       2>/dev/null && echo 1)
 HAS_SR   := $(shell pkg-config --exists samplerate 2>/dev/null && echo 1)
 HAS_LILV := $(shell pkg-config --exists lilv-0     2>/dev/null && echo 1)
 HAS_SUIL := $(shell pkg-config --exists suil-0     2>/dev/null && echo 1)
+HAS_SRATOM := $(shell pkg-config --exists sratom-0 2>/dev/null && echo 1)
 
 PKGS_OPT :=
 OPT_DEFS :=
@@ -44,6 +45,15 @@ endif
 ifneq ($(HAS_SUIL),)
 PKGS_OPT += suil-0
 OPT_DEFS += -DHAVE_SUIL=1
+endif
+# sratom serialises an atom to Turtle and back. Needed to move a plugin editor's
+# atom messages (model/IR loads, patch:Set, state) across the helper-process
+# pipe: URIDs are private to the process that mapped them, so the atom cannot
+# cross as bytes. Without it those plugins still load, but only their float
+# controls reach the DSP.
+ifneq ($(HAS_SRATOM),)
+PKGS_OPT += sratom-0
+OPT_DEFS += -DHAVE_SRATOM=1
 endif
 
 # VST2, CLAP and LADSPA backends use vendored headers in ext/ — always available.
@@ -181,9 +191,11 @@ ifneq ($(HAS_SUIL),)
 # natively (container == ui type == X11UI), so no wrapper/GTK is ever loaded.
 HELPER_X11    := $(SRCDIR)/jackdaw-lv2ui-x11
 HELPERS       += $(HELPER_X11)
+H_SRATOM_CFLAGS := $(if $(HAS_SRATOM),$(shell pkg-config --cflags sratom-0) -DHAVE_SRATOM=1)
+H_SRATOM_LIBS   := $(if $(HAS_SRATOM),$(shell pkg-config --libs sratom-0))
 H_X11_CFLAGS  := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) \
-    $(shell pkg-config --cflags glib-2.0 x11 lilv-0 suil-0) -std=gnu99
-H_X11_LIBS    := $(shell pkg-config --libs glib-2.0 x11 lilv-0 suil-0) -lm
+    $(shell pkg-config --cflags glib-2.0 x11 lilv-0 suil-0) $(H_SRATOM_CFLAGS) -std=gnu99
+H_X11_LIBS    := $(shell pkg-config --libs glib-2.0 x11 lilv-0 suil-0) $(H_SRATOM_LIBS) -lm
 
 $(HELPER_X11): $(SRCDIR)/lv2ui_x11_helper.c $(SRCDIR)/lv2ui_ipc.h
 	$(CC) $(H_X11_CFLAGS) $< $(H_X11_LIBS) -o $@
@@ -194,8 +206,8 @@ HELPER_GTK2   := $(SRCDIR)/jackdaw-lv2ui-gtk2
 HELPERS       += $(HELPER_GTK2)
 # (lv2ui_helper.c defaults HELPER_CONTAINER_URI to GtkUI, which is the gtk2 type.)
 H_GTK2_CFLAGS := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) \
-    $(shell pkg-config --cflags gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) -std=gnu99
-H_GTK2_LIBS   := $(shell pkg-config --libs gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) -lm
+    $(shell pkg-config --cflags gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) $(H_SRATOM_CFLAGS) -std=gnu99
+H_GTK2_LIBS   := $(shell pkg-config --libs gtk+-2.0 gtk+-x11-2.0 lilv-0 suil-0) $(H_SRATOM_LIBS) -lm
 
 $(HELPER_GTK2): $(SRCDIR)/lv2ui_helper.c $(SRCDIR)/lv2ui_ipc.h
 	$(CC) $(H_GTK2_CFLAGS) $< $(H_GTK2_LIBS) -o $@

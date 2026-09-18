@@ -18,6 +18,7 @@
 #include <lv2/instance-access/instance-access.h>
 #include <lv2/data-access/data-access.h>
 #include <lv2/state/state.h>
+#include <lv2/resize-port/resize-port.h>
 #include <jack/ringbuffer.h>
 #include <semaphore.h>
 #include <stdint.h>
@@ -25,6 +26,10 @@
 #include <stdio.h>
 #include <glib/gprintf.h>
 #include <lv2/ui/ui.h>
+#ifdef HAVE_SRATOM
+#  include <sratom/sratom.h>
+#  include "lv2ui_ipc.h"   /* the atom-over-pipe contract shared with the helper */
+#endif
 #ifdef HAVE_SUIL
 #  include <suil/suil.h>
 #  include <gtk/gtkx.h>   /* GTK_IS_SOCKET (suil's wrapper is a GtkSocket) */
@@ -33,6 +38,9 @@
 #include "pluginhost_internal.h"
 
 #define LV2_GTK3_UI_URI "http://lv2plug.in/ns/extensions/ui#Gtk3UI"
+
+/* Capacity of each editor<->DSP atom ring (see Lv2Backend.atoms_to_dsp). */
+#define LV2_ATOM_RING_BYTES (256u * 1024u)
 
 /* Native plugin editors are hosted IN-PROCESS via suil, modeled on jalv
  * (jalv/src/gtk/jalv_gtk.c + jalv/src/jalv.c): the suil widget is embedded in a
@@ -44,6 +52,7 @@
 
 static LilvWorld *world;
 static LilvNode  *n_audio, *n_control, *n_input, *n_output, *n_atom_port, *n_cv;
+static LilvNode  *n_min_size;   /* resize-port:minimumSize */
 
 static void lv2_world_init(void)
 {
@@ -55,6 +64,7 @@ static void lv2_world_init(void)
     n_output    = lilv_new_uri(world, LILV_URI_OUTPUT_PORT);
     n_atom_port = lilv_new_uri(world, LV2_ATOM__AtomPort);
     n_cv        = lilv_new_uri(world, LV2_CORE__CVPort);
+    n_min_size  = lilv_new_uri(world, LV2_RESIZE_PORT__minimumSize);
 }
 
 /* Build the LV2_PATH lilv should search: the user's env (or the standard
@@ -319,6 +329,21 @@ typedef struct {
     int               midi_in_atom;
     LV2_Atom_Forge    forge;
 
+    /* Editor <-> DSP atom traffic (atom:eventTransfer / ui:portNotification).
+     * Control ports carry floats and nothing else, so everything that is not a
+     * number — a model/IR file to load, patch:Set, the plugin's state, a
+     * capture list — travels as an atom through the control and notify ports.
+     * A host that bridges only floats leaves those plugins visibly alive and
+     * completely mute. Both rings are lock-free: the RT thread drains
+     * atoms_to_dsp into the input sequence before run() and copies whatever the
+     * plugin wrote on its atom OUTPUT ports into atoms_to_ui after it. */
+    jack_ringbuffer_t *atoms_to_dsp;   /* UI thread -> RT  */
+    jack_ringbuffer_t *atoms_to_ui;    /* RT -> UI thread  */
+    void             *atom_scratch;    /* RT read buffer, sized to the ring    */
+    guint32           atom_scratch_sz;
+    LV2_URID          urid_ev_transfer;
+    volatile gint     ui_open;         /* 0 = nobody drains atoms_to_ui        */
+
     Lv2Param *params;
     guint     n_params;
 
@@ -332,8 +357,9 @@ typedef struct {
     const LV2_Feature *features[2][10]; /* per-instance feature list */
 
 #ifdef HAVE_SUIL
-    SuilInstance *ui;              /* in-process editor (suil), or NULL */
-    guint         ui_push_id;      /* 30 Hz timer pushing ctl_out -> UI */
+    SuilInstance   *ui;            /* in-process editor (suil), or NULL */
+    PluginInstance *ui_owner;      /* the instance that editor belongs to */
+    guint         ui_push_id;      /* 30 Hz timer pushing DSP -> UI */
     LV2_Extension_Data_Feature ui_ext_data; /* backing for data-access feature */
 #endif
 } Lv2Backend;
@@ -388,11 +414,103 @@ static inline void lv2_reset_atoms(Lv2Backend *b, int k)
     }
 }
 
+/* One ring record: an atom addressed to a port. The payload that follows is
+ * the complete LV2_Atom (header included), so a reader can hand it straight to
+ * the forge or to suil_instance_port_event. */
+typedef struct { guint32 port; guint32 size; } Lv2AtomRec;
+
+/* Move everything the editor queued since the last cycle out of the ring and
+ * into the RT scratch buffer, so it can be forged into EVERY instance (a
+ * dual-mono plugin runs two copies and both must see the same messages).
+ * Returns the number of scratch bytes staged. RT-safe: no malloc, no lock. */
+static guint32 lv2_stage_ui_atoms(Lv2Backend *b)
+{
+    if (!b->atoms_to_dsp) return 0;
+    guint32 used = 0;
+    for (;;) {
+        Lv2AtomRec rec;
+        if (jack_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec) break;
+        jack_ringbuffer_peek(b->atoms_to_dsp, (char *)&rec, sizeof rec);
+        if (jack_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec + rec.size) break;
+        if (used + sizeof rec + rec.size > b->atom_scratch_sz) break;  /* next cycle */
+        jack_ringbuffer_read_advance(b->atoms_to_dsp, sizeof rec);
+        memcpy((char *)b->atom_scratch + used, &rec, sizeof rec);
+        jack_ringbuffer_read(b->atoms_to_dsp,
+                             (char *)b->atom_scratch + used + sizeof rec, rec.size);
+        used += sizeof rec + rec.size;
+    }
+    return used;
+}
+
+/* Build instance k's atom INPUT sequence for this block: first whatever the
+ * editor sent (file loads, patch:Set, state), then this block's MIDI. Replaces
+ * the empty sequence lv2_reset_atoms wrote for that port. Mirrors jalv's
+ * process.c, which forges its UI ring and its MIDI into the one sequence.
+ * The forge refuses to write past the buffer, so an oversized message is
+ * dropped rather than corrupting the heap. */
+static void lv2_forge_input(Lv2Backend *b, int k, guint32 staged,
+                            const PhMidiEvent *ev, int n_ev)
+{
+    if (b->midi_in_atom < 0 || (staged == 0 && n_ev == 0)) return;
+    struct Lv2AtomPort *ap = &b->atoms[b->midi_in_atom];
+    lv2_atom_forge_set_buffer(&b->forge, (uint8_t *)ap->buf[k],
+                              sizeof(LV2_Atom_Sequence) + ap->capacity);
+    LV2_Atom_Forge_Frame frame;
+    lv2_atom_forge_sequence_head(&b->forge, &frame, 0);
+
+    for (guint32 off = 0; off + sizeof(Lv2AtomRec) <= staged; ) {
+        Lv2AtomRec rec;
+        memcpy(&rec, (char *)b->atom_scratch + off, sizeof rec);
+        off += sizeof rec;
+        if (off + rec.size > staged) break;
+        /* Only the port we forge into; anything else was queued for a port this
+         * host does not drive and is dropped (see ph_lv2_atom_to_dsp). */
+        if (rec.port == ap->index) {
+            lv2_atom_forge_frame_time(&b->forge, 0);
+            lv2_atom_forge_write(&b->forge, (char *)b->atom_scratch + off, rec.size);
+        }
+        off += rec.size;
+    }
+
+    for (int i = 0; i < n_ev; i++) {
+        lv2_atom_forge_frame_time(&b->forge, ev[i].time);
+        lv2_atom_forge_atom(&b->forge, ev[i].size, b->urid_midi);
+        lv2_atom_forge_write(&b->forge, ev[i].data, ev[i].size);
+    }
+    lv2_atom_forge_pop(&b->forge, &frame);
+}
+
+/* Copy whatever the plugin wrote on its atom OUTPUT ports (its notify port:
+ * capture lists, state, parameter echoes) to the editor's ring. Only while an
+ * editor is open — with nobody draining, the ring would fill and the plugin's
+ * replies would go stale. RT-safe: fixed-size writes into a lock-free ring,
+ * and a full ring drops the message rather than blocking. Instance 0 only:
+ * a dual-mono pair has one editor and both copies say the same thing. */
+static void lv2_collect_atom_out(Lv2Backend *b)
+{
+    if (!b->atoms_to_ui || !g_atomic_int_get(&b->ui_open)) return;
+    for (guint a = 0; a < b->n_atoms; a++) {
+        if (b->atoms[a].is_input) continue;
+        LV2_Atom_Sequence *seq = (LV2_Atom_Sequence *)b->atoms[a].buf[0];
+        if (!seq || seq->atom.type != b->urid_seq) continue;
+        LV2_ATOM_SEQUENCE_FOREACH(seq, evt) {
+            const LV2_Atom *atom = &evt->body;
+            Lv2AtomRec rec = { b->atoms[a].index, (guint32)lv2_atom_total_size(atom) };
+            if (jack_ringbuffer_write_space(b->atoms_to_ui) < sizeof rec + rec.size)
+                return;   /* editor is behind; drop the rest of this block */
+            jack_ringbuffer_write(b->atoms_to_ui, (const char *)&rec, sizeof rec);
+            jack_ringbuffer_write(b->atoms_to_ui, (const char *)atom, rec.size);
+        }
+    }
+}
+
 static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
 {
     Lv2Backend *b = pi->backend;
     if (n > b->max_block) n = b->max_block;
     if (b->n_audio_in == 0 || b->n_audio_out == 0) return;
+
+    const guint32 staged = lv2_stage_ui_atoms(b);
 
     if (b->dual_mono) {
         lilv_instance_connect_port(b->inst[0], b->ain[0],  L);
@@ -401,10 +519,13 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         lilv_instance_connect_port(b->inst[1], b->aout[0], b->outB);
         lv2_reset_atoms(b, 0);
         lv2_reset_atoms(b, 1);
+        lv2_forge_input(b, 0, staged, NULL, 0);
+        lv2_forge_input(b, 1, staged, NULL, 0);
         lilv_instance_run(b->inst[0], n);
         lilv_instance_run(b->inst[1], n);
         worker_apply_responses(&b->workers[0]);
         worker_apply_responses(&b->workers[1]);
+        lv2_collect_atom_out(b);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
         memcpy(R, b->outB, (size_t)n * sizeof(float));
     } else {
@@ -421,31 +542,14 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
             lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
 
         lv2_reset_atoms(b, 0);
+        lv2_forge_input(b, 0, staged, NULL, 0);
         lilv_instance_run(b->inst[0], n);
         worker_apply_responses(&b->workers[0]);
+        lv2_collect_atom_out(b);
         memcpy(L, b->outA, (size_t)n * sizeof(float));
         if (b->n_audio_out > 1) memcpy(R, b->outB, (size_t)n * sizeof(float));
         else                    memcpy(R, b->outA, (size_t)n * sizeof(float));
     }
-}
-
-/* Forge this block's MIDI into the instrument's MIDI input atom port, replacing
- * the empty-sequence reset that lv2_reset_atoms wrote for that port. Mirrors
- * jalv's process.c forge of MIDI into the input event buffer. */
-static void lv2_forge_midi(Lv2Backend *b, const PhMidiEvent *ev, int n_ev)
-{
-    if (b->midi_in_atom < 0) return;
-    struct Lv2AtomPort *ap = &b->atoms[b->midi_in_atom];
-    lv2_atom_forge_set_buffer(&b->forge, (uint8_t *)ap->buf[0],
-                              sizeof(LV2_Atom_Sequence) + ap->capacity);
-    LV2_Atom_Forge_Frame frame;
-    lv2_atom_forge_sequence_head(&b->forge, &frame, 0);
-    for (int i = 0; i < n_ev; i++) {
-        lv2_atom_forge_frame_time(&b->forge, ev[i].time);
-        lv2_atom_forge_atom(&b->forge, ev[i].size, b->urid_midi);
-        lv2_atom_forge_write(&b->forge, ev[i].data, ev[i].size);
-    }
-    lv2_atom_forge_pop(&b->forge, &frame);
 }
 
 /* Instrument render: forge MIDI, feed silent audio inputs, run, copy outputs.
@@ -457,7 +561,7 @@ static void lv2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
     if (n > b->max_block) n = b->max_block;
 
     lv2_reset_atoms(b, 0);
-    lv2_forge_midi(b, ev, n_ev);
+    lv2_forge_input(b, 0, lv2_stage_ui_atoms(b), ev, n_ev);
 
     for (int i = 0; i < b->n_audio_in; i++)
         lilv_instance_connect_port(b->inst[0], b->ain[i], b->dummy_in); /* silence */
@@ -468,6 +572,7 @@ static void lv2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
 
     lilv_instance_run(b->inst[0], n);
     worker_apply_responses(&b->workers[0]);
+    lv2_collect_atom_out(b);
 
     if (b->n_audio_out > 0) memcpy(L, b->outA, (size_t)n * sizeof(float));
     else                    memset(L, 0, (size_t)n * sizeof(float));
@@ -510,6 +615,9 @@ static void lv2_destroy(PluginInstance *pi)
     g_free(b->misc);
     for (guint a = 0; a < b->n_atoms; a++) { g_free(b->atoms[a].buf[0]); g_free(b->atoms[a].buf[1]); }
     g_free(b->atoms);
+    if (b->atoms_to_dsp) jack_ringbuffer_free(b->atoms_to_dsp);
+    if (b->atoms_to_ui)  jack_ringbuffer_free(b->atoms_to_ui);
+    g_free(b->atom_scratch);
     g_free(b->uri); g_free(b->ui_uri); g_free(b->ui_type);
     g_free(b);
 }
@@ -571,6 +679,127 @@ void ph_lv2_ctl_ports(PluginInstance *pi, gboolean outputs,
     else         { *ports = b->ctl_in;  *n = b->n_ctl_in;  }
 }
 
+/* ---- Editor <-> DSP atom traffic ------------------------------------------
+ * Shared by the in-process suil editor and the out-of-process UI bridge. The
+ * raw pair moves atoms inside this process; the Turtle pair is for the bridge,
+ * because a URID is only meaningful in the process that mapped it, so the atom
+ * has to cross as text and be re-mapped on the far side (sratom, the same
+ * serialisation LV2 state files use).
+ */
+
+guint32 ph_lv2_atom_transfer_urid(PluginInstance *pi)
+{
+    Lv2Backend *b = pi->backend;
+    return b ? b->urid_ev_transfer : 0;
+}
+
+void ph_lv2_atom_ui_open(PluginInstance *pi, gboolean open)
+{
+    Lv2Backend *b = pi ? pi->backend : NULL;
+    if (!b) return;
+    if (open && b->atoms_to_ui) {
+        /* Drop anything queued while no editor was listening — it is stale by
+         * the time one opens. Draining from the READ side is this thread's own
+         * half of the ring; jack_ringbuffer_reset touches both pointers and
+         * would race the RT thread if it were mid-write. */
+        jack_ringbuffer_read_advance(b->atoms_to_ui,
+                                     jack_ringbuffer_read_space(b->atoms_to_ui));
+    }
+    g_atomic_int_set(&b->ui_open, open ? 1 : 0);
+}
+
+gboolean ph_lv2_atom_to_dsp(PluginInstance *pi, guint32 port,
+                            const void *atom, guint32 size)
+{
+    Lv2Backend *b = pi ? pi->backend : NULL;
+    if (!b || !b->atoms_to_dsp || !atom || size < sizeof(LV2_Atom)) return FALSE;
+    /* Only the atom input port the RT thread forges into is driven; see
+     * lv2_forge_input. Anything else would be queued and never delivered. */
+    if (b->midi_in_atom < 0 || b->atoms[b->midi_in_atom].index != port) return FALSE;
+
+    Lv2AtomRec rec = { port, size };
+    if (jack_ringbuffer_write_space(b->atoms_to_dsp) < sizeof rec + size)
+        return FALSE;
+    jack_ringbuffer_write(b->atoms_to_dsp, (const char *)&rec, sizeof rec);
+    jack_ringbuffer_write(b->atoms_to_dsp, (const char *)atom, size);
+    return TRUE;
+}
+
+gboolean ph_lv2_atom_from_dsp(PluginInstance *pi, guint32 *port,
+                              void *buf, guint32 bufsz, guint32 *size)
+{
+    Lv2Backend *b = pi ? pi->backend : NULL;
+    if (!b || !b->atoms_to_ui) return FALSE;
+
+    Lv2AtomRec rec;
+    if (jack_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec) return FALSE;
+    jack_ringbuffer_peek(b->atoms_to_ui, (char *)&rec, sizeof rec);
+    if (jack_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec + rec.size)
+        return FALSE;                      /* still being written; try again */
+    jack_ringbuffer_read_advance(b->atoms_to_ui, sizeof rec);
+    if (rec.size > bufsz) {                /* cannot deliver it: drop it */
+        jack_ringbuffer_read_advance(b->atoms_to_ui, rec.size);
+        return FALSE;
+    }
+    jack_ringbuffer_read(b->atoms_to_ui, (char *)buf, rec.size);
+    *port = rec.port;
+    *size = rec.size;
+    return TRUE;
+}
+
+#ifdef HAVE_SRATOM
+/* One Sratom for the whole host, used only on the GTK thread. The base URI and
+ * the subject/predicate the atom hangs off are the protocol's (lv2ui_ipc.h):
+ * the helper parses what we write and we parse what it writes. */
+static Sratom *lv2_sratom(void)
+{
+    static Sratom *sr;
+    if (!sr) {
+        sr = sratom_new(&urid_map);
+        if (sr) sratom_set_pretty_numbers(sr, false);
+    }
+    return sr;
+}
+static SerdNode lv2_atom_subject(void)
+{ return serd_node_from_string(SERD_URI, (const uint8_t *)LV2UI_IPC_ATOM_SUBJECT); }
+static SerdNode lv2_atom_pred(void)
+{ return serd_node_from_string(SERD_URI, (const uint8_t *)LV2UI_IPC_ATOM_PRED); }
+
+char *ph_lv2_atom_pop_turtle(PluginInstance *pi, guint32 *port)
+{
+    /* Big enough for the largest message a port asked room for (rsz:minimumSize
+     * capacities are checked against this when the ring is written). */
+    static char buf[LV2_ATOM_RING_BYTES];
+    guint32 size = 0;
+    if (!ph_lv2_atom_from_dsp(pi, port, buf, sizeof buf, &size)) return NULL;
+
+    Sratom *sr = lv2_sratom();
+    if (!sr) return NULL;
+    const LV2_Atom *atom = (const LV2_Atom *)buf;
+    SerdNode subj = lv2_atom_subject(), pred = lv2_atom_pred();
+    char *ttl = sratom_to_turtle(sr, &urid_unmap, LV2UI_IPC_ATOM_BASE,
+                                 &subj, &pred,
+                                 atom->type, atom->size, LV2_ATOM_BODY_CONST(atom));
+    if (!ttl) return NULL;
+    char *out = g_strdup(ttl);
+    free(ttl);
+    return out;
+}
+
+gboolean ph_lv2_atom_push_turtle(PluginInstance *pi, guint32 port, const char *ttl)
+{
+    Sratom *sr = lv2_sratom();
+    if (!sr || !ttl) return FALSE;
+    SerdNode subj = lv2_atom_subject(), pred = lv2_atom_pred();
+    LV2_Atom *atom = sratom_from_turtle(sr, LV2UI_IPC_ATOM_BASE, &subj, &pred, ttl);
+    if (!atom) return FALSE;
+    gboolean ok = ph_lv2_atom_to_dsp(pi, port, atom,
+                                     (guint32)lv2_atom_total_size(atom));
+    free(atom);
+    return ok;
+}
+#endif /* HAVE_SRATOM */
+
 static guint lv2_param_count(PluginInstance *pi)
 { return ((Lv2Backend *)pi->backend)->n_params; }
 
@@ -613,7 +842,9 @@ void ph_lv2_ui_init(int *argc, char ***argv)
 #ifdef HAVE_SUIL
 static SuilHost *suil_host;
 
-/* UI wrote a control port -> store it; the RT thread reads b->ctl (float). */
+/* UI wrote a port. A control port is a float the RT thread reads out of b->ctl;
+ * anything else is an atom (a file to load, patch:Set, state) bound for the
+ * plugin's control port, which only reaches it through the ring. */
 static void lv2_ui_write(SuilController c, uint32_t port, uint32_t size,
                          uint32_t protocol, const void *buffer)
 {
@@ -621,6 +852,8 @@ static void lv2_ui_write(SuilController c, uint32_t port, uint32_t size,
     Lv2Backend *b = pi->backend;
     if (protocol == 0 && size == sizeof(float) && port < b->n_ports)
         b->ctl[port] = *(const float *)buffer;
+    else if (protocol == b->urid_ev_transfer)
+        ph_lv2_atom_to_dsp(pi, port, buffer, size);
 }
 
 static uint32_t lv2_ui_port_index(SuilController c, const char *symbol)
@@ -635,13 +868,27 @@ static uint32_t lv2_ui_port_index(SuilController c, const char *symbol)
     return LV2UI_INVALID_PORT_INDEX;
 }
 
-/* Push control-OUTPUT values (meters/tuner) to the UI — the jalv_update analog
- * (control ports only; no atom/event ports yet). Does NOT drive idle (suil does
- * that internally for X11 UIs). */
+/* Push what the DSP has to say to the UI — the jalv_update analog. Two kinds:
+ * control-OUTPUT values (meters, tuner readouts) and whatever the plugin forged
+ * on its notify port this cycle. Does NOT drive idle (suil does that internally
+ * for X11 UIs). */
 static gboolean lv2_ui_push_cb(gpointer data)
 {
     Lv2Backend *b = data;
     if (!b->ui) return G_SOURCE_REMOVE;
+
+    /* Notify-port atoms first: a state or capture-list reply should land before
+     * the meter values that follow it. Main thread only, so a static buffer. */
+    {
+        static char atom_buf[LV2_ATOM_RING_BYTES];
+        guint32 port, size;
+        PluginInstance *pi = b->ui_owner;
+        while (pi && ph_lv2_atom_from_dsp(pi, &port, atom_buf,
+                                          sizeof atom_buf, &size))
+            suil_instance_port_event(b->ui, port, size, b->urid_ev_transfer,
+                                     atom_buf);
+    }
+
     for (guint i = 0; i < b->n_ctl_out; i++) {
         guint idx = b->ctl_out[i];
         float v = b->ctl[idx];
@@ -660,6 +907,8 @@ static void lv2_destroy_gui(PluginInstance *pi)
     Lv2Backend *b = pi->backend;
     if (!b) return;
     if (b->ui_push_id) { g_source_remove(b->ui_push_id); b->ui_push_id = 0; }
+    ph_lv2_atom_ui_open(pi, FALSE);
+    b->ui_owner = NULL;
     if (b->ui) {
         /* suil's x11_in_gtk3 wrapper only removes its internal idle timer in its
          * "plug-removed" handler, but suil_instance_free destroys the socket
@@ -760,6 +1009,8 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
         guint idx = b->ctl_in[i];
         suil_instance_port_event(b->ui, idx, sizeof(float), 0, &b->ctl[idx]);
     }
+    b->ui_owner = pi;
+    ph_lv2_atom_ui_open(pi, TRUE);   /* the RT thread may start filling the ring */
     b->ui_push_id = g_timeout_add(33, lv2_ui_push_cb, b);
     return box;
 }
@@ -968,6 +1219,21 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
             struct Lv2AtomPort ap;
             memset(&ap, 0, sizeof ap);
             ap.index = i; ap.is_input = is_in; ap.capacity = atom_cap;
+            /* rsz:minimumSize is the port saying how much it needs to say what
+             * it has to say — a notify port that carries a state blob or a file
+             * list asks for far more than the MIDI-sized default. Give it what
+             * it asked for; short-changing it silently truncates those
+             * messages. */
+            LilvNodes *ms = lilv_port_get_value(p, port, n_min_size);
+            if (ms) {
+                const LilvNode *v = lilv_nodes_get_first(ms);
+                if (v && lilv_node_is_int(v)) {
+                    int want = lilv_node_as_int(v);
+                    if (want > 0 && (uint32_t)want > ap.capacity)
+                        ap.capacity = (uint32_t)want;
+                }
+                lilv_nodes_free(ms);
+            }
             g_array_append_val(atomg, ap);
         } else if (is_ctl) {
             float d = defs[i];
@@ -998,7 +1264,18 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
     b->urid_seq   = urid_map_cb(NULL, LV2_ATOM__Sequence);
     b->urid_chunk = urid_map_cb(NULL, LV2_ATOM__Chunk);
     b->urid_midi  = urid_map_cb(NULL, LV2_MIDI__MidiEvent);
+    b->urid_ev_transfer = urid_map_cb(NULL, LV2_ATOM__eventTransfer);
     lv2_atom_forge_init(&b->forge, &urid_map);
+
+    /* Editor <-> DSP atom rings. Sized for the largest thing that travels on
+     * them (a state blob or a capture list, not a MIDI note), so a big message
+     * is delivered rather than dropped. */
+    b->atoms_to_dsp    = jack_ringbuffer_create(LV2_ATOM_RING_BYTES);
+    b->atoms_to_ui     = jack_ringbuffer_create(LV2_ATOM_RING_BYTES);
+    b->atom_scratch_sz = LV2_ATOM_RING_BYTES;
+    b->atom_scratch    = g_malloc0(b->atom_scratch_sz);
+    if (b->atoms_to_dsp) jack_ringbuffer_mlock(b->atoms_to_dsp);
+    if (b->atoms_to_ui)  jack_ringbuffer_mlock(b->atoms_to_ui);
     /* The instrument's MIDI sink = the first atom INPUT port. */
     b->midi_in_atom = -1;
     for (guint a = 0; a < b->n_atoms; a++)

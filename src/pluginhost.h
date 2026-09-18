@@ -205,6 +205,14 @@ float           pluginhost_ctl_get(PluginInstance *inst, guint port);
 /* Enumerate control input (outputs=FALSE) or output (TRUE) port indices. */
 void            pluginhost_ctl_ports(PluginInstance *inst, gboolean outputs,
                                      const guint **ports, guint *n);
+/* Atom traffic for the bridge, serialized as Turtle: a URID is private to the
+ * process that mapped it, so an atom cannot cross a pipe as bytes. pop returns
+ * NULL when the plugin has said nothing (caller g_free()s a non-NULL result). */
+char           *pluginhost_atom_pop_turtle (PluginInstance *inst, guint *port);
+gboolean        pluginhost_atom_push_turtle(PluginInstance *inst, guint port,
+                                            const char *turtle);
+/* Tell the DSP whether an editor is listening for its notify port. */
+void            pluginhost_atom_ui_open(PluginInstance *inst, gboolean open);
 double          pluginhost_sample_rate(PluginInstance *inst);
 
 /* Tear down the cached editor (frees a native UI / destroys the generic panel)
