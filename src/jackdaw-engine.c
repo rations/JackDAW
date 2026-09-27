@@ -165,6 +165,17 @@ typedef struct {
 
 static JackDawEngine engine;
 
+/* Read a live port count from an RT thread. The count bounds reads of the
+ * port arrays, and the main thread publishes it with eng_publish_count()
+ * (a release store). The reader needs the matching acquire: volatile only
+ * stops the compiler caching the value, and on a weakly-ordered CPU
+ * (aarch64) a plain load followed by a load it merely guards (a control
+ * dependency) may be satisfied out of order. x86's TSO hid this. */
+static inline guint eng_count(volatile guint *slot)
+{
+    return (guint)g_atomic_int_get((gint *)slot);
+}
+
 /* -----------------------------------------------------------------------
  * Phase 2.5: Playback feeder thread
  *
@@ -879,7 +890,7 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
     }
 
     if (armed && t->midi_in_idx >= 0 &&
-        (guint)t->midi_in_idx < engine.midi_in_count && engine.midi_in[t->midi_in_idx]) {
+        (guint)t->midi_in_idx < eng_count(&engine.midi_in_count) && engine.midi_in[t->midi_in_idx]) {
         void *mbuf = jack_port_get_buffer(engine.midi_in[t->midi_in_idx], nframes);
         uint32_t mc = jack_midi_get_event_count(mbuf);
         for (uint32_t m = 0; m < mc && nev < cap; m++) {
@@ -1047,7 +1058,10 @@ static void engine_process_track(int i)
             if (pk < REC_PEAK_MAX_BUCKETS) {
                 t->rec_peak_buf[pk * 2]     = wf_mn;
                 t->rec_peak_buf[pk * 2 + 1] = wf_mx;
-                t->rec_peak_count = pk + 1;
+                /* Release store: the timeline reads the pair only once it
+                 * sees the count, and a weakly-ordered CPU could otherwise
+                 * make the count visible before the pair. */
+                g_atomic_int_set(&t->rec_peak_count, pk + 1);
             }
         }
     }
@@ -1200,12 +1214,12 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * so the live graph must touch none of them. Output silence, freeze the
      * transport, and return before any plugin or mix work. */
     if (g_atomic_int_get(&engine.render_suspend)) {
-        for (i = 0; i < engine.audio_out_count; i++) {
+        for (i = 0; i < eng_count(&engine.audio_out_count); i++) {
             if (!engine.audio_out[i]) continue;
             port_buf = jack_port_get_buffer(engine.audio_out[i], nframes);
             memset(port_buf, 0, nframes * sizeof(float));
         }
-        for (i = 0; i < engine.midi_out_count; i++) {
+        for (i = 0; i < eng_count(&engine.midi_out_count); i++) {
             if (!engine.midi_out[i]) continue;
             jack_midi_clear_buffer(
                 jack_port_get_buffer(engine.midi_out[i], nframes));
@@ -1360,7 +1374,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         gint tflags = g_atomic_int_get(&t->state_flags);
         gboolean instr = jackdaw_track_is_instrument(t);
         if (!instr && (tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
-            (guint)t->audio_in_idx < engine.audio_in_count &&
+            (guint)t->audio_in_idx < eng_count(&engine.audio_in_count) &&
             engine.audio_in[(guint)t->audio_in_idx]) {
             g_slot_live_L[i] = jack_port_get_buffer(
                 engine.audio_in[(guint)t->audio_in_idx], nframes);
@@ -1370,7 +1384,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         }
         if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
             t->midi_in_idx >= 0 &&
-            (guint)t->midi_in_idx < engine.midi_in_count &&
+            (guint)t->midi_in_idx < eng_count(&engine.midi_in_count) &&
             engine.midi_in[t->midi_in_idx] && t->midi_rec_buf)
             g_slot_midi_buf[i] = jack_port_get_buffer(
                 engine.midi_in[t->midi_in_idx], nframes);
@@ -1443,7 +1457,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
     gfloat mpk_L = 0.0f, mpk_R = 0.0f;
     guint oi;
-    for (oi = 0; oi < engine.audio_out_count; oi++) {
+    for (oi = 0; oi < eng_count(&engine.audio_out_count); oi++) {
         if (!engine.audio_out[oi]) continue;
         port_buf = jack_port_get_buffer(engine.audio_out[oi], nframes);
         if (oi == 0) {
@@ -1533,7 +1547,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                                       : engine.play_pos - (off_t)nframes;
                 float *out_buf[2] = { NULL, NULL };
                 if (to_main) {
-                    for (oi = 0; oi < engine.audio_out_count && oi < 2; oi++)
+                    for (oi = 0; oi < eng_count(&engine.audio_out_count) && oi < 2; oi++)
                         if (engine.audio_out[oi])
                             out_buf[oi] = jack_port_get_buffer(
                                 engine.audio_out[oi], nframes);
@@ -1564,7 +1578,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
 
     /* Clear all MIDI output buffers before any writes */
-    for (oi = 0; oi < engine.midi_out_count; oi++) {
+    for (oi = 0; oi < eng_count(&engine.midi_out_count); oi++) {
         if (!engine.midi_out[oi]) continue;
         void *mbuf = jack_port_get_buffer(engine.midi_out[oi], nframes);
         jack_midi_clear_buffer(mbuf);
@@ -1590,7 +1604,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
         gint mi = t->midi_in_idx;
-        if (mi < 0 || (guint)mi >= engine.midi_out_count || !engine.midi_out[mi])
+        if (mi < 0 || (guint)mi >= eng_count(&engine.midi_out_count) || !engine.midi_out[mi])
             continue;
         if (out_done & (1u << mi)) continue;
 
@@ -1609,7 +1623,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             continue;
         }
 
-        if ((guint)mi >= engine.midi_in_count || !engine.midi_in[mi]) continue;
+        if ((guint)mi >= eng_count(&engine.midi_in_count) || !engine.midi_in[mi]) continue;
         void *ibuf = jack_port_get_buffer(engine.midi_in[mi], nframes);
         uint32_t mc = jack_midi_get_event_count(ibuf);
         uint32_t m;

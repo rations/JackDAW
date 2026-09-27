@@ -607,7 +607,7 @@ static gboolean wave_view_draw(GtkWidget *widget, cairo_t *cr)
             }
           } else {
             /* Live waveform — read peak buffer written by the RT callback */
-            gint    pk_count = rec_t->rec_peak_count; /* read once: RT may still write */
+            gint    pk_count = g_atomic_int_get(&rec_t->rec_peak_count); /* acquire: pairs below it are written */
             gfloat *pk_buf   = rec_t->rec_peak_buf;
             guint   blk      = rec_t->rec_peak_block;
 

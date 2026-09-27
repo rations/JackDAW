@@ -49,7 +49,7 @@ static uint32_t clap_in_size(const struct clap_input_events *l)
 
 static const clap_event_header_t *clap_in_get(const struct clap_input_events *l, uint32_t i)
 { ClapBackend *b = (ClapBackend *)l->ctx;
-  return (i < (uint32_t)b->n_pending) ? &b->pending[i].header : NULL; }
+  return (i < (uint32_t)g_atomic_int_get(&b->n_pending)) ? &b->pending[i].header : NULL; }
 
 static bool clap_out_push(const struct clap_output_events *l,
                           const clap_event_header_t *e)
