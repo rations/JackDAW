@@ -2,9 +2,11 @@
 #
 # release-tarball.sh — build a JackDAW release tarball.
 #
-# Produces  jackdaw-<VERSION>.tar.gz  which unpacks into a top-level directory
-# named  JackDAW/  containing the source, bundled headers, icons, packaging
-# scripts and (by default) the prebuilt binary.
+# Produces  jackdaw-<VERSION>-linux-<ARCH>.tar.gz  (or  jackdaw-<VERSION>.tar.gz
+# for a source-only tarball) which unpacks into a top-level directory named
+# JackDAW/  containing the source, bundled headers, icons, packaging scripts
+# and (by default) the prebuilt binary. <ARCH> is read from the binary itself
+# (x86_64, aarch64), so the name says what it runs on, not where it was packed.
 #
 # Usage:
 #   ./release-tarball.sh [VERSION] [--no-binary]
@@ -44,7 +46,21 @@ if [ -z "$VERSION" ]; then
 fi
 VERSION=${VERSION#v}   # tolerate a leading 'v'
 
-NAME="jackdaw-$VERSION"
+# A binary tarball only runs on one architecture, so it says which in its
+# name. Taken from the ELF header rather than uname -m, so a binary built
+# elsewhere is still named for what it is.
+ARCH=""
+if [ "$INCLUDE_BINARY" -eq 1 ] && [ -f src/jackdaw ]; then
+    if command -v readelf >/dev/null 2>&1; then
+        case $(readelf -h src/jackdaw 2>/dev/null) in
+            *X86-64*)  ARCH=x86_64 ;;
+            *AArch64*) ARCH=aarch64 ;;
+        esac
+    fi
+    [ -n "$ARCH" ] || ARCH=$(uname -m)
+fi
+
+NAME="jackdaw-$VERSION${ARCH:+-linux-$ARCH}"
 TARBALL="$ROOT/$NAME.tar.gz"
 
 STAGE=$(mktemp -d)
