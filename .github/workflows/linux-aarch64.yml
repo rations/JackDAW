@@ -1,0 +1,145 @@
+# aarch64 Linux build, gates and release tarball.
+#
+# WHY THIS EXISTS. x86_64 releases are built on the author's own machine. There
+# is no ARM hardware on hand (no Pi, no arm64 laptop), so the aarch64 build can
+# only be compiled and checked on a runner of its own architecture.
+#
+# WHY A DEBIAN CONTAINER ON AN UBUNTU RUNNER. `runs-on:` names the virtual
+# machine, and GitHub hosts no Debian runner. Everything that reaches the
+# tarball -- compiler, glibc, GTK3, JACK, lilv/suil/sratom, sndfile -- comes
+# from debian:12 (bookworm). Ubuntu contributes only the kernel, Docker and the
+# git that does the checkout. Debian 12 is glibc 2.36, so the binary runs on
+# bookworm-era systems (Raspberry Pi OS included); a bare ubuntu-24.04-arm
+# runner is glibc 2.39 and would raise that floor.
+#
+# WHAT THIS DOES NOT COVER: no live audio, no JACK server, no xrun count, no
+# CPU-load figure. It proves the aarch64 build compiles clean, links, stays
+# under the glibc ceiling and packages -- not that it sounds right on a board.
+name: Linux aarch64
+
+# Every push on every branch, except commits that cannot change the build. The
+# list says what to IGNORE rather than what to match, so a forgotten entry costs
+# a spare run instead of silently skipping a check. icons/ is NOT ignored: the
+# tarball packages it.
+on:
+  push:
+    branches: ['**']
+    paths-ignore: &docs_only
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
+  pull_request:
+    paths-ignore: *docs_only
+  workflow_dispatch:
+
+concurrency:
+  group: linux-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: aarch64 (ubuntu-24.04-arm, debian:12)
+    # GitHub-hosted arm64 runner, free for public repositories. Check the label
+    # against https://github.com/actions/runner-images before changing it.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Checkout and submodules run on the HOST, where git already is; only the
+      # build needs the Debian ABI. Never `--recursive`: the Makefile compiles
+      # only base/, pluginterfaces/ and public.sdk/ from the SDK, and its other
+      # submodules (vstgui4, doc, tutorials, cmake) are large and unused.
+      - name: Submodules
+        run: |
+          git submodule update --init ext/vst3sdk
+          git -C ext/vst3sdk submodule update --init base pluginterfaces public.sdk
+
+      - name: Build, gate and package inside Debian 12
+        run: |
+          docker run --rm -i \
+            -v "$PWD:/src" -w /src \
+            "debian:12" \
+            bash -euo pipefail -s <<'CONTAINER'
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+
+          # One dev package per pkg-config probe in the Makefile: PKGS_REQ
+          # (gtk+-3.0, gtk+-x11-3.0, jack, sndfile), the optional alsa,
+          # samplerate, lilv-0, suil-0 and sratom-0, and the LV2 UI helpers'
+          # x11 and gtk+-2.0 (the gtk2 helper hosts GtkUI editors out of
+          # process, as in the x86_64 release). file and binutils are what the
+          # gates below run on; release-tarball.sh reads the arch with readelf.
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config ca-certificates file binutils \
+            libgtk-3-dev libjack-jackd2-dev libsndfile1-dev \
+            libasound2-dev libsamplerate0-dev \
+            liblilv-dev libsuil-dev libsratom-dev lv2-dev \
+            libx11-dev libgtk2.0-dev
+
+          # No `| head -1` on these: under pipefail, head closing the pipe early
+          # kills ldd with SIGPIPE (status 141) and errexit ends the job.
+          echo "== toolchain and ABI floor =="
+          cc --version
+          ldd --version
+          uname -m
+
+          echo "== build =="
+          make VST3=1 -j"$(nproc)" 2>&1 | tee build.log
+
+          BINS="src/jackdaw src/jackdaw-lv2ui-x11 src/jackdaw-lv2ui-gtk2"
+
+          # The x86_64 build is warning-free under -Wall -Wextra, so any warning
+          # here is new and architecture-specific -- e.g. -Wtype-limits firing
+          # because char is unsigned on aarch64. SDK objects build with -w and
+          # never match ^src/.
+          echo "== gate: no compiler warnings in src/ =="
+          if grep -E '^src/.*warning:' build.log; then
+            echo "FAIL: compiler warnings above" >&2; exit 1
+          fi
+
+          echo "== gate: every binary is aarch64 and resolves its libraries =="
+          for b in $BINS; do
+            [ -f "$b" ] || { echo "FAIL: $b was not built" >&2; exit 1; }
+            info=$(file -b "$b")
+            echo "$b: $info"
+            case "$info" in
+              *'ARM aarch64'*) ;;
+              *) echo "FAIL: $b is not aarch64" >&2; exit 1 ;;
+            esac
+            if ldd "$b" | grep 'not found'; then
+              echo "FAIL: $b has unresolved libraries" >&2; exit 1
+            fi
+          done
+
+          # The container is what sets the floor; this catches a change of
+          # image, or a symbol pulled from a newer glibc some other way.
+          echo "== gate: glibc symbol ceiling 2.36 =="
+          for b in $BINS; do
+            max=$(objdump -T "$b" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+            echo "$b: GLIBC_$max"
+            if [ "$(printf '%s\n2.36\n' "$max" | sort -V | tail -n1)" != "2.36" ]; then
+              echo "FAIL: $b needs GLIBC_$max > 2.36" >&2; exit 1
+            fi
+          done
+
+          echo "== package =="
+          ./release-tarball.sh
+          ls -l jackdaw-*-linux-aarch64.tar.gz
+          CONTAINER
+
+      # The container ran as root, so everything it wrote is root-owned and the
+      # upload action, which does not run as root, cannot read it.
+      - name: Hand the workspace back to the runner
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" .
+
+      # An artifact and not a release: the aarch64 build has never run on real
+      # hardware, so it is attached to a release by hand once someone has heard
+      # it on a board.
+      - name: Upload the release tarball
+        uses: actions/upload-artifact@v6
+        with:
+          name: jackdaw-linux-aarch64
+          path: jackdaw-*-linux-aarch64.tar.gz
+          if-no-files-found: error
