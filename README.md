@@ -172,13 +172,16 @@ included the tarball is around 15 MB, and it builds VST3 support with no
 network access or submodule fetch.
 
 ```sh
-./release-tarball.sh           # version read from src/config.h
-./release-tarball.sh 0.2.0     # override the version on the command line
+./release-tarball.sh               # binary tarball for this machine's build
 ./release-tarball.sh --no-binary   # source-only tarball
 ```
 
-The default version comes from `#define VERSION` in `src/config.h`; edit the
-`VERSION=` variable at the top of the script, or pass it as the first argument.
+The version lives in one place: the `VERSION` file at the repo root. The
+Makefile compiles it into the binary (the window title shows it) and the
+script names the tarball from it, so the x86_64 and aarch64 releases always
+carry the same number. To release a new version, edit `VERSION`, commit it,
+then run `make` (a changed `VERSION` rebuilds everything) and the script. The
+script refuses a binary built from a different version.
 
 ### aarch64 (Raspberry Pi 4/5, Orange Pi 5, arm64 laptops)
 

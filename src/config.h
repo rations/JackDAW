@@ -8,8 +8,13 @@
 #define CONFIG_H
 
 #define PACKAGE         "jackdaw"
-#define VERSION         "0.2.0"
-#define PACKAGE_VERSION "0.2.0"
+
+/* VERSION and PACKAGE_VERSION come from the VERSION file at the repo root,
+ * passed in by the Makefile, so the x86_64 and aarch64 builds and the release
+ * tarball name all read one number. Bump it there, not here. */
+#ifndef VERSION
+#  error "VERSION not defined: build with the Makefile (it reads ./VERSION)"
+#endif
 
 #define HAVE_SCHED_H     1
 #define HAVE_SCHED_YIELD 1

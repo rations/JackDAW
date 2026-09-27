@@ -9,29 +9,23 @@
 # (x86_64, aarch64), so the name says what it runs on, not where it was packed.
 #
 # Usage:
-#   ./release-tarball.sh [VERSION] [--no-binary]
+#   ./release-tarball.sh [--no-binary]
 #
-#   VERSION       Override the version (e.g. 0.2.0). If omitted, it is read
-#                 from src/config.h (#define VERSION "...").
 #   --no-binary   Source-only tarball (install will always build from source).
 #
-# Edit the VERSION default below, or pass it on the command line each release.
+# The version is the VERSION file at the repo root, the same file the Makefile
+# compiles into the binary, so every architecture's tarball carries one number.
+# To release: edit VERSION, rebuild (make rebuilds everything when it changes),
+# then run this. A binary built from a different VERSION is refused.
 #
 set -eu
-
-# --------------------------------------------------------------------------- #
-# Default version — edit here, or override with the first argument.
-# Empty means "read from src/config.h".
-# --------------------------------------------------------------------------- #
-VERSION=""
 
 INCLUDE_BINARY=1
 for arg in "$@"; do
     case "$arg" in
         --no-binary) INCLUDE_BINARY=0 ;;
         -h|--help) sed -n '2,/^set -eu/{/^set -eu/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
-        --*) printf 'error: unknown option: %s\n' "$arg" >&2; exit 1 ;;
-        *) VERSION="$arg" ;;
+        *) printf 'error: unknown argument: %s (the version is set in ./VERSION)\n' "$arg" >&2; exit 1 ;;
     esac
 done
 
@@ -39,12 +33,18 @@ done
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 cd "$ROOT"
 
-# Resolve version from config.h if not provided.
-if [ -z "$VERSION" ]; then
-    VERSION=$(sed -n 's/^#define VERSION[[:space:]]*"\(.*\)"/\1/p' src/config.h)
-    [ -n "$VERSION" ] || { echo "error: could not read VERSION from src/config.h" >&2; exit 1; }
+VERSION=$(tr -d ' \t\r\n' < VERSION 2>/dev/null) || VERSION=""
+[ -n "$VERSION" ] || { echo "error: VERSION file missing or empty" >&2; exit 1; }
+
+# Refuse a binary built before VERSION was bumped: its tarball would be named
+# for one version and report another. The version is compiled into the window
+# title format string ("%s — JackDAW " VERSION in mainwindow.c), so it is
+# visible in the binary without running it.
+if [ "$INCLUDE_BINARY" -eq 1 ] && [ -f src/jackdaw ] &&
+   ! grep -aqF "JackDAW $VERSION" src/jackdaw; then
+    echo "error: src/jackdaw was not built from VERSION $VERSION; run make first" >&2
+    exit 1
 fi
-VERSION=${VERSION#v}   # tolerate a leading 'v'
 
 # A binary tarball only runs on one architecture, so it says which in its
 # name. Taken from the ELF header rather than uname -m, so a binary built
@@ -73,7 +73,7 @@ echo "==> Staging JackDAW $VERSION" >&2
 # --------------------------------------------------------------------------- #
 # Top-level files
 # --------------------------------------------------------------------------- #
-for f in Makefile LICENSE README.md jackdawicon.png jackdaw.desktop.in \
+for f in Makefile VERSION LICENSE README.md jackdawicon.png jackdaw.desktop.in \
          install-jackdaw.sh uninstall-jackdaw.sh release-tarball.sh; do
     [ -e "$f" ] && cp -p "$f" "$DEST/" || echo "  (skip missing $f)" >&2
 done

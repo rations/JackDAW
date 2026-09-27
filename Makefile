@@ -17,6 +17,18 @@ VST3SDK ?= $(EXTDIR)/vst3sdk
 VST3    ?= 1
 
 # ---------------------------------------------------------------------------
+# Version: the one number for every build and release tarball lives in the
+# VERSION file at the repo root. Every object depends on it (see the pattern
+# rules below), so bumping it rebuilds everything and no stale binary can
+# carry the old number.
+# ---------------------------------------------------------------------------
+
+JACKDAW_VERSION := $(strip $(shell cat VERSION 2>/dev/null))
+ifeq ($(JACKDAW_VERSION),)
+$(error VERSION file missing or empty)
+endif
+
+# ---------------------------------------------------------------------------
 # Package detection via pkg-config
 # ---------------------------------------------------------------------------
 
@@ -74,7 +86,8 @@ PKG_LIBS   := $(shell pkg-config --libs   $(PKGS_REQ) $(PKGS_OPT))
 # ---------------------------------------------------------------------------
 
 WARN   := -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
-COMMON := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) $(PKG_CFLAGS) $(OPT_DEFS)
+COMMON := -g -O2 $(WARN) -I$(SRCDIR) -I$(EXTDIR) $(PKG_CFLAGS) $(OPT_DEFS) \
+          -DVERSION='"$(JACKDAW_VERSION)"' -DPACKAGE_VERSION='"$(JACKDAW_VERSION)"'
 
 # make ASAN=1  -> build with AddressSanitizer to pinpoint memory corruption.
 ifeq ($(ASAN),1)
@@ -229,10 +242,10 @@ $(TARGET): $(OBJS)
 	$(CXX) $^ $(LDFLAGS) -o $@
 	@echo "Built: $@"
 
-$(SRCDIR)/%.o: $(SRCDIR)/%.c
+$(SRCDIR)/%.o: $(SRCDIR)/%.c VERSION
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(SRCDIR)/%.o: $(SRCDIR)/%.cpp
+$(SRCDIR)/%.o: $(SRCDIR)/%.cpp VERSION
 	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
 # Out-of-tree (VST3 SDK) C++ sources -> build/vst3sdk/. Scoped to that prefix
