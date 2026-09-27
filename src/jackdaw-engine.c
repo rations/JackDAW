@@ -920,9 +920,9 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
     return nev;
 }
 
-/* Enable flush-to-zero + denormals-are-zero on the calling thread's SSE unit.
- * Cheap (two MXCSR register writes); safe to call every cycle. Re-armed before
- * every plugin in pluginhost_process() too, in case a plugin clears MXCSR. */
+/* Enable flush-to-zero + denormals-are-zero on the calling thread (x86 MXCSR,
+ * aarch64 FPCR.FZ). Cheap; safe to call every cycle. Re-armed before every
+ * plugin in pluginhost_process() too, in case a plugin clears the bits. */
 static inline void engine_rt_set_denormal_mode(void)
 {
     rt_set_denormal_mode();

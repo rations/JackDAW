@@ -711,8 +711,9 @@ void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev,
     if (!inst || !inst->ops) return;
     if (!g_atomic_int_get(&inst->active)) return;   /* bypassed: leave L/R as-is */
 
-    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
-     * which would let denormals stall this plugin's process(). */
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared the FP
+     * control register (MXCSR/FPCR), which would let denormals stall this
+     * plugin's process(). */
     rt_set_denormal_mode();
     gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     if (inst->ops->process_midi)
@@ -765,8 +766,9 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
         memcpy(inst->dry_R, R, (size_t)nframes * sizeof(float));
     }
 
-    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
-     * which would let denormals stall this plugin's process(). */
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared the FP
+     * control register (MXCSR/FPCR), which would let denormals stall this
+     * plugin's process(). */
     rt_set_denormal_mode();
     gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     inst->ops->process(inst, L, R, nframes);
