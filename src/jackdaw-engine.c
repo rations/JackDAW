@@ -103,10 +103,12 @@ typedef struct {
 
     /* Loop region (frames). Looping is active only while loop_enabled is set and
      * loop_end > loop_start; the playhead wraps loop_end -> loop_start once it has
-     * entered the region. Set/cleared from the main thread; read in the RT path. */
+     * entered the region. Set/cleared from the main thread; read in the RT path.
+     * start/end are a pair: other threads read them through eng_loop_read(). */
     volatile gint  loop_enabled;
     volatile off_t loop_start;
     volatile off_t loop_end;
+    volatile gint  loop_seq;       /* odd while set_loop_range is mid-update */
 
     /* Punch in/out recording (independent of looping). record_mode is set from
      * the UI menu; punch_armed is set when playback starts in punch mode and the
@@ -174,6 +176,32 @@ static JackDawEngine engine;
 static inline guint eng_count(volatile guint *slot)
 {
     return (guint)g_atomic_int_get((gint *)slot);
+}
+
+/* Loop range read off the main thread. start and end are two stores, so a
+ * reader could pair a new start with an old end and wrap to the wrong place
+ * (a seqlock around the pair closes that). The reader never waits for the
+ * writer: an RT thread spinning on a preempted main thread could spin for a
+ * whole scheduler slice. After a few tries it gives up and returns TRUE, and
+ * the caller keeps the pair it read last time, so a new range lands at most a
+ * cycle late but is never seen torn. */
+typedef struct { off_t start, end; } EngLoopRange;
+
+static gboolean eng_loop_read(EngLoopRange *out)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        gint s0 = g_atomic_int_get(&engine.loop_seq);
+        if (s0 & 1) continue;
+        off_t a = __atomic_load_n(&engine.loop_start, __ATOMIC_RELAXED);
+        off_t b = __atomic_load_n(&engine.loop_end,   __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* pair loads before re-check */
+        if (g_atomic_int_get(&engine.loop_seq) == s0) {
+            out->start = a;
+            out->end   = b;
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 /* -----------------------------------------------------------------------
@@ -280,6 +308,7 @@ static void *feeder_thread_func(void *arg)
     (void)arg;
     guint i;
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 }; /* 2 ms sleep */
+    EngLoopRange feed_loop = { 0, 0 };
 
     while (!feeder_stop_flag) {
         nanosleep(&ts, NULL);
@@ -290,6 +319,7 @@ static void *feeder_thread_func(void *arg)
             continue;
 
         int jack_sr = (int)jack_get_sample_rate(engine.client);
+        eng_loop_read(&feed_loop);   /* one pair for the whole pass */
 
         for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
             JackDawTrack *t = engine.slots[i];
@@ -343,8 +373,8 @@ static void *feeder_thread_func(void *arg)
                  * past loop_end (playhead placed after the region) is left
                  * alone, so playback there does not loop. --- */
                 if (g_atomic_int_get(&engine.loop_enabled)) {
-                    off_t l_start = engine.loop_start;
-                    off_t l_end   = engine.loop_end;
+                    off_t l_start = feed_loop.start;
+                    off_t l_end   = feed_loop.end;
                     if (l_end > l_start) {
                         if (pf == l_end) {
                             pf = l_start;
@@ -1305,9 +1335,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * remainder past loop_end is carried over so the clock's loop period equals
      * the region length, matching the feeder. Checked at block granularity, so
      * the loop point quantizes to the JACK period (acceptable for now). */
+    static EngLoopRange rt_loop;   /* JACK thread only; kept if a read fails */
+    eng_loop_read(&rt_loop);
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.loop_enabled)) {
-        off_t l_start = engine.loop_start;
-        off_t l_end   = engine.loop_end;
+        off_t l_start = rt_loop.start;
+        off_t l_end   = rt_loop.end;
         off_t bstart  = engine.play_pos - (off_t)nframes;
         if (l_end > l_start && bstart >= l_start && bstart < l_end &&
             engine.play_pos >= l_end)
@@ -1319,8 +1351,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * loop wrap; punch_armed gates it so normal recording is never affected. The
      * local `flags` is updated in step so the capture passes below act this block. */
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.punch_armed)) {
-        off_t ls = engine.loop_start;
-        off_t le = engine.loop_end;
+        off_t ls = rt_loop.start;
+        off_t le = rt_loop.end;
         off_t bstart = engine.play_pos - (off_t)nframes;
         if (le > ls) {
             if (!(flags & ENGINE_RECORDING)) {
@@ -3130,15 +3162,26 @@ void jackdaw_engine_set_loop_range(off_t start, off_t end)
     if (start < 0) start = 0;
     if (end   < 0) end   = 0;
     if (end < start) { off_t tmp = start; start = end; end = tmp; }
-    engine.loop_start = start;
-    engine.loop_end   = end;
+    /* Seqlock write (see eng_loop_read): odd, the pair, even. The release
+     * fence keeps the pair stores from overtaking the odd count; the final
+     * increment is a full barrier, so the pair is visible before the even. */
+    g_atomic_int_inc(&engine.loop_seq);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&engine.loop_start, start, __ATOMIC_RELAXED);
+    __atomic_store_n(&engine.loop_end,   end,   __ATOMIC_RELAXED);
+    g_atomic_int_inc(&engine.loop_seq);
     engine_loop_reseek();
 }
 
 void jackdaw_engine_get_loop_range(off_t *start, off_t *end)
 {
-    if (start) *start = engine.loop_start;
-    if (end)   *end   = engine.loop_end;
+    /* Called off the main thread too (the offline render worker). Never from
+     * RT, so it may wait out a writer mid-update. */
+    EngLoopRange r;
+    while (eng_loop_read(&r))
+        g_thread_yield();
+    if (start) *start = r.start;
+    if (end)   *end   = r.end;
 }
 
 void jackdaw_engine_set_loop_enabled(gboolean on)
