@@ -851,7 +851,7 @@ static int eng_midi_cmp(const void *a, const void *b)
  * then live JACK MIDI input (while armed). Tracks sounding notes per slot. */
 static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start,
                                       jack_nframes_t nframes, gboolean playing,
-                                      gboolean armed, PhMidiEvent *mev, int cap)
+                                      void *mbuf, PhMidiEvent *mev, int cap)
 {
     int nev = 0;
 
@@ -889,9 +889,10 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
         }
     }
 
-    if (armed && t->midi_in_idx >= 0 &&
-        (guint)t->midi_in_idx < eng_count(&engine.midi_in_count) && engine.midi_in[t->midi_in_idx]) {
-        void *mbuf = jack_port_get_buffer(engine.midi_in[t->midi_in_idx], nframes);
+    /* mbuf: this track's MIDI input for the cycle when it is armed, else NULL.
+     * Pre-fetched by the JACK thread; this runs on a worker, where
+     * jack_port_get_buffer() must not be called. */
+    if (mbuf) {
         uint32_t mc = jack_midi_get_event_count(mbuf);
         for (uint32_t m = 0; m < mc && nev < cap; m++) {
             jack_midi_event_t ev;
@@ -1076,7 +1077,8 @@ static void engine_process_track(int i)
         PhMidiEvent *mev = eng_block_ev[i];
         int nev = eng_gather_instrument_midi(i, t, blk_start, nframes,
                                              (flags & ENGINE_PLAYING) != 0,
-                                             (tflags & TRACK_ARMED) != 0,
+                                             (tflags & TRACK_ARMED) ?
+                                                 g_slot_midi_buf[i] : NULL,
                                              mev, ENG_MIDI_MAX_EV);
         eng_block_nev[i] = nev;
         if (chain && chain->n > 0) {
@@ -1363,8 +1365,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * then fan the tracks out across the worker pool and sum the results.
      *
      * Pre-fetch: live audio input (for monitoring + dry capture) and the MIDI
-     * input buffer (for MIDI recording). Mirrors the gating that used to live in
-     * the per-track loop. */
+     * input buffer (live instrument input + MIDI recording). Mirrors the gating
+     * that used to live in the per-track loop. */
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         g_slot_live_L[i]   = NULL;
         g_slot_live_R[i]   = NULL;
@@ -1384,10 +1386,13 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             if (t->audio_src_port_r && pr)
                 g_slot_live_R[i] = jack_port_get_buffer(pr, nframes);
         }
-        if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
+        /* Every armed instrument track, not just while recording: the worker
+         * also feeds live input to the instrument (eng_gather_instrument_midi).
+         * The MIDI recorder keeps its own RECORDING gate. */
+        if (instr && (tflags & TRACK_ARMED) &&
             t->midi_in_idx >= 0 &&
             (guint)t->midi_in_idx < eng_count(&engine.midi_in_count) &&
-            engine.midi_in[t->midi_in_idx] && t->midi_rec_buf)
+            engine.midi_in[t->midi_in_idx])
             g_slot_midi_buf[i] = jack_port_get_buffer(
                 engine.midi_in[t->midi_in_idx], nframes);
     }
