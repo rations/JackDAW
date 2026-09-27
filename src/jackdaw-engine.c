@@ -1378,9 +1378,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             engine.audio_in[(guint)t->audio_in_idx]) {
             g_slot_live_L[i] = jack_port_get_buffer(
                 engine.audio_in[(guint)t->audio_in_idx], nframes);
-            if (t->audio_src_port_r && engine.audio_in_r[(guint)t->audio_in_idx])
-                g_slot_live_R[i] = jack_port_get_buffer(
-                    engine.audio_in_r[(guint)t->audio_in_idx], nframes);
+            /* Loaded once: the main thread clears it before unregistering. */
+            jack_port_t *pr = g_atomic_pointer_get(
+                &engine.audio_in_r[(guint)t->audio_in_idx]);
+            if (t->audio_src_port_r && pr)
+                g_slot_live_R[i] = jack_port_get_buffer(pr, nframes);
         }
         if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
             t->midi_in_idx >= 0 &&
@@ -2314,7 +2316,8 @@ gboolean jackdaw_engine_is_playing(void)
  * order that keeps the RT callback safe at every instant:
  *
  *   grow   — register the new ports FIRST, then raise the count.
- *   shrink — lower the count FIRST, then unregister the ports it dropped.
+ *   shrink — lower the count FIRST, wait out any cycle that loaded the old
+ *            count (eng_wait_rt_past), then unregister the ports it dropped.
  *
  * The old code did the opposite on both counts: it g_renew()'d the arrays the
  * callback was indexing (so a concurrent cycle could read through a freed
@@ -2326,6 +2329,28 @@ gboolean jackdaw_engine_is_playing(void)
 static inline void eng_publish_count(volatile guint *slot, guint n)
 {
     g_atomic_int_set((gint *)slot, (gint)n);
+}
+
+/* Block until every RT cycle that could have seen the state from before this
+ * call has finished, so a port hidden from the callback (count lowered, or
+ * pointer cleared) can be unregistered. Lowering the count is not enough on
+ * its own: a cycle already in flight loaded the old count and may still be
+ * about to jack_port_get_buffer() the port. g_rt_cycle is bumped at the START
+ * of each callback, so two increments prove the in-flight cycle is over (the
+ * same rule as track_retire_is_safe).
+ *
+ * Bounded: if no cycle starts for ENG_RT_WAIT_US the callback is not being run
+ * (client zombified or server stalled), so nothing is in flight and returning
+ * is safe. Main thread only; costs at most about two periods. */
+#define ENG_RT_WAIT_US (2 * G_USEC_PER_SEC)
+static void eng_wait_rt_past(void)
+{
+    if (!engine.active || !engine.client) return;
+    guint c0 = jackdaw_engine_get_cycle_count();
+    gint64 deadline = g_get_monotonic_time() + ENG_RT_WAIT_US;
+    while ((guint)(jackdaw_engine_get_cycle_count() - c0) < 2u &&
+           g_get_monotonic_time() < deadline)
+        g_usleep(500);
 }
 
 gboolean jackdaw_engine_set_audio_in_count(guint n)
@@ -2353,6 +2378,7 @@ gboolean jackdaw_engine_set_audio_in_count(guint n)
         eng_publish_count(&engine.audio_in_count, n);
     } else {
         eng_publish_count(&engine.audio_in_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_in[i]) {
                 jack_port_unregister(engine.client, engine.audio_in[i]);
@@ -2393,6 +2419,7 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
         eng_publish_count(&engine.audio_out_count, n);
     } else {
         eng_publish_count(&engine.audio_out_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_out[i]) {
                 jack_port_unregister(engine.client, engine.audio_out[i]);
@@ -2429,6 +2456,7 @@ gboolean jackdaw_engine_set_midi_in_count(guint n)
         eng_publish_count(&engine.midi_in_count, n);
     } else {
         eng_publish_count(&engine.midi_in_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.midi_in[i]) {
                 jack_port_unregister(engine.client, engine.midi_in[i]);
@@ -2465,6 +2493,7 @@ gboolean jackdaw_engine_set_midi_out_count(guint n)
         eng_publish_count(&engine.midi_out_count, n);
     } else {
         eng_publish_count(&engine.midi_out_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.midi_out[i]) {
                 jack_port_unregister(engine.client, engine.midi_out[i]);
@@ -2656,9 +2685,11 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
         if (track->audio_in_idx >= 0 &&
             (guint)track->audio_in_idx < engine.audio_in_count &&
             engine.audio_in_r[(guint)track->audio_in_idx]) {
-            jack_port_unregister(engine.client,
-                                 engine.audio_in_r[(guint)track->audio_in_idx]);
-            engine.audio_in_r[(guint)track->audio_in_idx] = NULL;
+            jack_port_t *pr = engine.audio_in_r[(guint)track->audio_in_idx];
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)track->audio_in_idx],
+                                 NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     g_clear_pointer(&track->audio_src_port,   g_free);
@@ -3494,9 +3525,10 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
         if (!engine.audio_in_r[(guint)ai]) {
             char name[64];
             g_snprintf(name, sizeof(name), "in_%uR", (guint)ai + 1);
-            engine.audio_in_r[(guint)ai] = jack_port_register(engine.client,
+            jack_port_t *pr = jack_port_register(engine.client,
                 name, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-            if (!engine.audio_in_r[(guint)ai]) return TRUE;
+            if (!pr) return TRUE;
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], pr);
         }
     } else {
         /* Clear the right source first so the RT callback stops reading it,
@@ -3508,8 +3540,10 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
             g_clear_pointer(&t->audio_src_port_r, g_free);
         }
         if (engine.audio_in_r[(guint)ai]) {
-            jack_port_unregister(engine.client, engine.audio_in_r[(guint)ai]);
-            engine.audio_in_r[(guint)ai] = NULL;
+            jack_port_t *pr = engine.audio_in_r[(guint)ai];
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     return FALSE;
