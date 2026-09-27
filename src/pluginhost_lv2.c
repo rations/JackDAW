@@ -82,8 +82,12 @@ static void lv2_apply_search_path(const GList *extra)
         if (p->len) g_string_append_c(p, ':');
         g_string_append(p, env);
     }
-    if (p->len == 0)
-        g_string_append(p, "/usr/lib/lv2:/usr/lib/x86_64-linux-gnu/lv2");
+    if (p->len == 0) {
+        g_string_append(p, "/usr/lib/lv2");
+#ifdef PH_MULTIARCH_LIBDIR
+        g_string_append(p, ":" PH_MULTIARCH_LIBDIR "/lv2");
+#endif
+    }
     LilvNode *node = lilv_new_string(world, p->str);
     lilv_world_set_option(world, LILV_OPTION_LV2_PATH, node);
     lilv_node_free(node);

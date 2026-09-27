@@ -5,6 +5,16 @@
 
 G_BEGIN_DECLS
 
+/* Debian-style multiarch library directory for the architecture this binary
+ * was built for. Distro plug-ins live under it (/usr/lib/<triplet>/lv2 etc.),
+ * and it used to be hard-coded to x86_64, so an aarch64 build never found
+ * them. Left undefined on anything else; callers skip the path. */
+#if defined(__x86_64__)
+#  define PH_MULTIARCH_LIBDIR "/usr/lib/x86_64-linux-gnu"
+#elif defined(__aarch64__)
+#  define PH_MULTIARCH_LIBDIR "/usr/lib/aarch64-linux-gnu"
+#endif
+
 /* Backend vtable. Every backend fills one of these on a PluginInstance. */
 typedef struct {
     void        (*process)    (PluginInstance *, float *L, float *R, int n);

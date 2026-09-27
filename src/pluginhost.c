@@ -591,17 +591,23 @@ static void ph_seed_default_paths(void)
     }
     pluginhost_add_search_path(PH_LV2, "/usr/lib/lv2");
     pluginhost_add_search_path(PH_LV2, "/usr/local/lib/lv2");
-    pluginhost_add_search_path(PH_LV2, "/usr/lib/x86_64-linux-gnu/lv2");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_LV2, PH_MULTIARCH_LIBDIR "/lv2");
+#endif
     pluginhost_add_search_path(PH_VST2, "/usr/lib/vst");
     pluginhost_add_search_path(PH_VST2, "/usr/local/lib/vst");
     pluginhost_add_search_path(PH_VST3, "/usr/lib/vst3");
     pluginhost_add_search_path(PH_VST3, "/usr/local/lib/vst3");
-    pluginhost_add_search_path(PH_VST3, "/usr/lib/x86_64-linux-gnu/vst3");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_VST3, PH_MULTIARCH_LIBDIR "/vst3");
+#endif
     pluginhost_add_search_path(PH_CLAP, "/usr/lib/clap");
     pluginhost_add_search_path(PH_CLAP, "/usr/local/lib/clap");
     pluginhost_add_search_path(PH_LADSPA, "/usr/lib/ladspa");
     pluginhost_add_search_path(PH_LADSPA, "/usr/local/lib/ladspa");
-    pluginhost_add_search_path(PH_LADSPA, "/usr/lib/x86_64-linux-gnu/ladspa");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_LADSPA, PH_MULTIARCH_LIBDIR "/ladspa");
+#endif
 }
 
 void pluginhost_load_paths_from_settings(void)
