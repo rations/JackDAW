@@ -19,7 +19,7 @@
 #include <lv2/data-access/data-access.h>
 #include <lv2/state/state.h>
 #include <lv2/resize-port/resize-port.h>
-#include <jack/ringbuffer.h>
+#include "rt_ringbuffer.h"
 #include <semaphore.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -82,8 +82,12 @@ static void lv2_apply_search_path(const GList *extra)
         if (p->len) g_string_append_c(p, ':');
         g_string_append(p, env);
     }
-    if (p->len == 0)
-        g_string_append(p, "/usr/lib/lv2:/usr/lib/x86_64-linux-gnu/lv2");
+    if (p->len == 0) {
+        g_string_append(p, "/usr/lib/lv2");
+#ifdef PH_MULTIARCH_LIBDIR
+        g_string_append(p, ":" PH_MULTIARCH_LIBDIR "/lv2");
+#endif
+    }
     LilvNode *node = lilv_new_string(world, p->str);
     lilv_world_set_option(world, LILV_OPTION_LV2_PATH, node);
     lilv_node_free(node);
@@ -166,8 +170,8 @@ static LV2_Feature  feat_log    = { LV2_LOG__log, &lv2_log };
 typedef struct {
     const LV2_Worker_Interface *iface;
     LV2_Handle                  plugin;     /* lilv instance handle */
-    jack_ringbuffer_t          *requests;   /* RT  -> worker */
-    jack_ringbuffer_t          *responses;  /* worker -> RT  */
+    rt_ringbuffer_t          *requests;   /* RT  -> worker */
+    rt_ringbuffer_t          *responses;  /* worker -> RT  */
     sem_t                       sem;
     GThread                    *thread;
     volatile gint               quit;
@@ -180,11 +184,27 @@ static LV2_Worker_Status worker_respond_cb(LV2_Worker_Respond_Handle h,
                                            uint32_t size, const void *data)
 {
     Worker *w = h;
-    if (jack_ringbuffer_write_space(w->responses) < sizeof(size) + size)
+    if (rt_ringbuffer_write_space(w->responses) < sizeof(size) + size)
         return LV2_WORKER_ERR_NO_SPACE;
-    jack_ringbuffer_write(w->responses, (const char *)&size, sizeof(size));
-    jack_ringbuffer_write(w->responses, (const char *)data, size);
+    rt_ringbuffer_write(w->responses, (const char *)&size, sizeof(size));
+    rt_ringbuffer_write(w->responses, (const char *)data, size);
     return LV2_WORKER_SUCCESS;
+}
+
+/* Take the next record's size header off a worker ring, but only once its
+ * whole payload is in: the producer writes header and payload as two separate
+ * writes, so the header alone does not mean the record is complete. Consuming
+ * it early would hand work()/work_response() a short payload and desync every
+ * record after it. An incomplete record is left for the next wake-up (worker)
+ * or the next cycle (RT). RT-safe. */
+static gboolean worker_ring_take(rt_ringbuffer_t *rb, uint32_t *size)
+{
+    size_t avail = rt_ringbuffer_read_space(rb);
+    if (avail < sizeof *size) return FALSE;
+    rt_ringbuffer_peek(rb, (char *)size, sizeof *size);
+    if (avail - sizeof *size < *size) return FALSE;
+    rt_ringbuffer_read_advance(rb, sizeof *size);
+    return TRUE;
 }
 
 static gpointer worker_thread_fn(gpointer arg)
@@ -195,13 +215,12 @@ static gpointer worker_thread_fn(gpointer arg)
         sem_wait(&w->sem);
         if (g_atomic_int_get(&w->quit)) break;
         uint32_t size;
-        while (jack_ringbuffer_read_space(w->requests) >= sizeof(size)) {
-            jack_ringbuffer_read(w->requests, (char *)&size, sizeof(size));
+        while (worker_ring_take(w->requests, &size)) {
             if (size > sizeof(buf)) {           /* oversized: drain & drop */
-                jack_ringbuffer_read_advance(w->requests, size);
+                rt_ringbuffer_read_advance(w->requests, size);
                 continue;
             }
-            jack_ringbuffer_read(w->requests, buf, size);
+            rt_ringbuffer_read(w->requests, buf, size);
             if (w->iface && w->iface->work)
                 w->iface->work(w->plugin, worker_respond_cb, w, size, buf);
         }
@@ -215,10 +234,10 @@ static LV2_Worker_Status worker_schedule_cb(LV2_Worker_Schedule_Handle h,
 {
     Worker *w = h;
     if (!w->requests) return LV2_WORKER_ERR_UNKNOWN;   /* not yet wired */
-    if (jack_ringbuffer_write_space(w->requests) < sizeof(size) + size)
+    if (rt_ringbuffer_write_space(w->requests) < sizeof(size) + size)
         return LV2_WORKER_ERR_NO_SPACE;
-    jack_ringbuffer_write(w->requests, (const char *)&size, sizeof(size));
-    jack_ringbuffer_write(w->requests, (const char *)data, size);
+    rt_ringbuffer_write(w->requests, (const char *)&size, sizeof(size));
+    rt_ringbuffer_write(w->requests, (const char *)data, size);
     sem_post(&w->sem);
     return LV2_WORKER_SUCCESS;
 }
@@ -229,10 +248,9 @@ static void worker_apply_responses(Worker *w)
     if (!w->active || !w->iface) return;
     char buf[WORKER_BUF_BYTES];
     uint32_t size;
-    while (jack_ringbuffer_read_space(w->responses) >= sizeof(size)) {
-        jack_ringbuffer_read(w->responses, (char *)&size, sizeof(size));
-        if (size > sizeof(buf)) { jack_ringbuffer_read_advance(w->responses, size); continue; }
-        jack_ringbuffer_read(w->responses, buf, size);
+    while (worker_ring_take(w->responses, &size)) {
+        if (size > sizeof(buf)) { rt_ringbuffer_read_advance(w->responses, size); continue; }
+        rt_ringbuffer_read(w->responses, buf, size);
         if (w->iface->work_response)
             w->iface->work_response(w->plugin, size, buf);
     }
@@ -246,8 +264,8 @@ static void worker_init(Worker *w, LilvInstance *inst)
     if (!iface) { w->active = FALSE; return; }
     w->iface     = iface;
     w->plugin    = lilv_instance_get_handle(inst);
-    w->requests  = jack_ringbuffer_create(WORKER_BUF_BYTES * 4);
-    w->responses = jack_ringbuffer_create(WORKER_BUF_BYTES * 4);
+    w->requests  = rt_ringbuffer_create(WORKER_BUF_BYTES * 4);
+    w->responses = rt_ringbuffer_create(WORKER_BUF_BYTES * 4);
     sem_init(&w->sem, 0, 0);
     w->quit      = 0;
     w->thread    = g_thread_new("lv2-worker", worker_thread_fn, w);
@@ -261,8 +279,8 @@ static void worker_destroy(Worker *w)
     sem_post(&w->sem);
     if (w->thread) g_thread_join(w->thread);
     sem_destroy(&w->sem);
-    if (w->requests)  jack_ringbuffer_free(w->requests);
-    if (w->responses) jack_ringbuffer_free(w->responses);
+    if (w->requests)  rt_ringbuffer_free(w->requests);
+    if (w->responses) rt_ringbuffer_free(w->responses);
     w->active = FALSE;
 }
 
@@ -337,8 +355,8 @@ typedef struct {
      * completely mute. Both rings are lock-free: the RT thread drains
      * atoms_to_dsp into the input sequence before run() and copies whatever the
      * plugin wrote on its atom OUTPUT ports into atoms_to_ui after it. */
-    jack_ringbuffer_t *atoms_to_dsp;   /* UI thread -> RT  */
-    jack_ringbuffer_t *atoms_to_ui;    /* RT -> UI thread  */
+    rt_ringbuffer_t *atoms_to_dsp;   /* UI thread -> RT  */
+    rt_ringbuffer_t *atoms_to_ui;    /* RT -> UI thread  */
     void             *atom_scratch;    /* RT read buffer, sized to the ring    */
     guint32           atom_scratch_sz;
     LV2_URID          urid_ev_transfer;
@@ -429,14 +447,14 @@ static guint32 lv2_stage_ui_atoms(Lv2Backend *b)
     guint32 used = 0;
     for (;;) {
         Lv2AtomRec rec;
-        if (jack_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec) break;
-        jack_ringbuffer_peek(b->atoms_to_dsp, (char *)&rec, sizeof rec);
-        if (jack_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec + rec.size) break;
+        if (rt_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec) break;
+        rt_ringbuffer_peek(b->atoms_to_dsp, (char *)&rec, sizeof rec);
+        if (rt_ringbuffer_read_space(b->atoms_to_dsp) < sizeof rec + rec.size) break;
         if (used + sizeof rec + rec.size > b->atom_scratch_sz) break;  /* next cycle */
-        jack_ringbuffer_read_advance(b->atoms_to_dsp, sizeof rec);
+        rt_ringbuffer_read_advance(b->atoms_to_dsp, sizeof rec);
         memcpy((char *)b->atom_scratch + used, &rec, sizeof rec);
-        jack_ringbuffer_read(b->atoms_to_dsp,
-                             (char *)b->atom_scratch + used + sizeof rec, rec.size);
+        rt_ringbuffer_read(b->atoms_to_dsp,
+                           (char *)b->atom_scratch + used + sizeof rec, rec.size);
         used += sizeof rec + rec.size;
     }
     return used;
@@ -496,10 +514,10 @@ static void lv2_collect_atom_out(Lv2Backend *b)
         LV2_ATOM_SEQUENCE_FOREACH(seq, evt) {
             const LV2_Atom *atom = &evt->body;
             Lv2AtomRec rec = { b->atoms[a].index, (guint32)lv2_atom_total_size(atom) };
-            if (jack_ringbuffer_write_space(b->atoms_to_ui) < sizeof rec + rec.size)
+            if (rt_ringbuffer_write_space(b->atoms_to_ui) < sizeof rec + rec.size)
                 return;   /* editor is behind; drop the rest of this block */
-            jack_ringbuffer_write(b->atoms_to_ui, (const char *)&rec, sizeof rec);
-            jack_ringbuffer_write(b->atoms_to_ui, (const char *)atom, rec.size);
+            rt_ringbuffer_write(b->atoms_to_ui, (const char *)&rec, sizeof rec);
+            rt_ringbuffer_write(b->atoms_to_ui, (const char *)atom, rec.size);
         }
     }
 }
@@ -615,8 +633,8 @@ static void lv2_destroy(PluginInstance *pi)
     g_free(b->misc);
     for (guint a = 0; a < b->n_atoms; a++) { g_free(b->atoms[a].buf[0]); g_free(b->atoms[a].buf[1]); }
     g_free(b->atoms);
-    if (b->atoms_to_dsp) jack_ringbuffer_free(b->atoms_to_dsp);
-    if (b->atoms_to_ui)  jack_ringbuffer_free(b->atoms_to_ui);
+    if (b->atoms_to_dsp) rt_ringbuffer_free(b->atoms_to_dsp);
+    if (b->atoms_to_ui)  rt_ringbuffer_free(b->atoms_to_ui);
     g_free(b->atom_scratch);
     g_free(b->uri); g_free(b->ui_uri); g_free(b->ui_type);
     g_free(b);
@@ -700,10 +718,10 @@ void ph_lv2_atom_ui_open(PluginInstance *pi, gboolean open)
     if (open && b->atoms_to_ui) {
         /* Drop anything queued while no editor was listening — it is stale by
          * the time one opens. Draining from the READ side is this thread's own
-         * half of the ring; jack_ringbuffer_reset touches both pointers and
+         * half of the ring; rt_ringbuffer_reset touches both pointers and
          * would race the RT thread if it were mid-write. */
-        jack_ringbuffer_read_advance(b->atoms_to_ui,
-                                     jack_ringbuffer_read_space(b->atoms_to_ui));
+        rt_ringbuffer_read_advance(b->atoms_to_ui,
+                                   rt_ringbuffer_read_space(b->atoms_to_ui));
     }
     g_atomic_int_set(&b->ui_open, open ? 1 : 0);
 }
@@ -718,10 +736,10 @@ gboolean ph_lv2_atom_to_dsp(PluginInstance *pi, guint32 port,
     if (b->midi_in_atom < 0 || b->atoms[b->midi_in_atom].index != port) return FALSE;
 
     Lv2AtomRec rec = { port, size };
-    if (jack_ringbuffer_write_space(b->atoms_to_dsp) < sizeof rec + size)
+    if (rt_ringbuffer_write_space(b->atoms_to_dsp) < sizeof rec + size)
         return FALSE;
-    jack_ringbuffer_write(b->atoms_to_dsp, (const char *)&rec, sizeof rec);
-    jack_ringbuffer_write(b->atoms_to_dsp, (const char *)atom, size);
+    rt_ringbuffer_write(b->atoms_to_dsp, (const char *)&rec, sizeof rec);
+    rt_ringbuffer_write(b->atoms_to_dsp, (const char *)atom, size);
     return TRUE;
 }
 
@@ -732,16 +750,16 @@ gboolean ph_lv2_atom_from_dsp(PluginInstance *pi, guint32 *port,
     if (!b || !b->atoms_to_ui) return FALSE;
 
     Lv2AtomRec rec;
-    if (jack_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec) return FALSE;
-    jack_ringbuffer_peek(b->atoms_to_ui, (char *)&rec, sizeof rec);
-    if (jack_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec + rec.size)
+    if (rt_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec) return FALSE;
+    rt_ringbuffer_peek(b->atoms_to_ui, (char *)&rec, sizeof rec);
+    if (rt_ringbuffer_read_space(b->atoms_to_ui) < sizeof rec + rec.size)
         return FALSE;                      /* still being written; try again */
-    jack_ringbuffer_read_advance(b->atoms_to_ui, sizeof rec);
+    rt_ringbuffer_read_advance(b->atoms_to_ui, sizeof rec);
     if (rec.size > bufsz) {                /* cannot deliver it: drop it */
-        jack_ringbuffer_read_advance(b->atoms_to_ui, rec.size);
+        rt_ringbuffer_read_advance(b->atoms_to_ui, rec.size);
         return FALSE;
     }
-    jack_ringbuffer_read(b->atoms_to_ui, (char *)buf, rec.size);
+    rt_ringbuffer_read(b->atoms_to_ui, (char *)buf, rec.size);
     *port = rec.port;
     *size = rec.size;
     return TRUE;
@@ -1270,12 +1288,12 @@ PluginInstance *ph_lv2_instantiate(const PluginInfo *info, double sr, int max_bl
     /* Editor <-> DSP atom rings. Sized for the largest thing that travels on
      * them (a state blob or a capture list, not a MIDI note), so a big message
      * is delivered rather than dropped. */
-    b->atoms_to_dsp    = jack_ringbuffer_create(LV2_ATOM_RING_BYTES);
-    b->atoms_to_ui     = jack_ringbuffer_create(LV2_ATOM_RING_BYTES);
+    b->atoms_to_dsp    = rt_ringbuffer_create(LV2_ATOM_RING_BYTES);
+    b->atoms_to_ui     = rt_ringbuffer_create(LV2_ATOM_RING_BYTES);
     b->atom_scratch_sz = LV2_ATOM_RING_BYTES;
     b->atom_scratch    = g_malloc0(b->atom_scratch_sz);
-    if (b->atoms_to_dsp) jack_ringbuffer_mlock(b->atoms_to_dsp);
-    if (b->atoms_to_ui)  jack_ringbuffer_mlock(b->atoms_to_ui);
+    if (b->atoms_to_dsp) rt_ringbuffer_mlock(b->atoms_to_dsp);
+    if (b->atoms_to_ui)  rt_ringbuffer_mlock(b->atoms_to_ui);
     /* The instrument's MIDI sink = the first atom INPUT port. */
     b->midi_in_atom = -1;
     for (guint a = 0; a < b->n_atoms; a++)

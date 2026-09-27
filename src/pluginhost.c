@@ -591,17 +591,23 @@ static void ph_seed_default_paths(void)
     }
     pluginhost_add_search_path(PH_LV2, "/usr/lib/lv2");
     pluginhost_add_search_path(PH_LV2, "/usr/local/lib/lv2");
-    pluginhost_add_search_path(PH_LV2, "/usr/lib/x86_64-linux-gnu/lv2");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_LV2, PH_MULTIARCH_LIBDIR "/lv2");
+#endif
     pluginhost_add_search_path(PH_VST2, "/usr/lib/vst");
     pluginhost_add_search_path(PH_VST2, "/usr/local/lib/vst");
     pluginhost_add_search_path(PH_VST3, "/usr/lib/vst3");
     pluginhost_add_search_path(PH_VST3, "/usr/local/lib/vst3");
-    pluginhost_add_search_path(PH_VST3, "/usr/lib/x86_64-linux-gnu/vst3");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_VST3, PH_MULTIARCH_LIBDIR "/vst3");
+#endif
     pluginhost_add_search_path(PH_CLAP, "/usr/lib/clap");
     pluginhost_add_search_path(PH_CLAP, "/usr/local/lib/clap");
     pluginhost_add_search_path(PH_LADSPA, "/usr/lib/ladspa");
     pluginhost_add_search_path(PH_LADSPA, "/usr/local/lib/ladspa");
-    pluginhost_add_search_path(PH_LADSPA, "/usr/lib/x86_64-linux-gnu/ladspa");
+#ifdef PH_MULTIARCH_LIBDIR
+    pluginhost_add_search_path(PH_LADSPA, PH_MULTIARCH_LIBDIR "/ladspa");
+#endif
 }
 
 void pluginhost_load_paths_from_settings(void)
@@ -711,8 +717,9 @@ void pluginhost_process_midi(PluginInstance *inst, const PhMidiEvent *ev,
     if (!inst || !inst->ops) return;
     if (!g_atomic_int_get(&inst->active)) return;   /* bypassed: leave L/R as-is */
 
-    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
-     * which would let denormals stall this plugin's process(). */
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared the FP
+     * control register (MXCSR/FPCR), which would let denormals stall this
+     * plugin's process(). */
     rt_set_denormal_mode();
     gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     if (inst->ops->process_midi)
@@ -765,8 +772,9 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
         memcpy(inst->dry_R, R, (size_t)nframes * sizeof(float));
     }
 
-    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared MXCSR,
-     * which would let denormals stall this plugin's process(). */
+    /* Re-arm FTZ/DAZ: the previous plugin (or this one) may have cleared the FP
+     * control register (MXCSR/FPCR), which would let denormals stall this
+     * plugin's process(). */
     rt_set_denormal_mode();
     gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
     inst->ops->process(inst, L, R, nframes);

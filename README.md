@@ -164,8 +164,9 @@ a count of any recorded audio, so you can decide for yourself.
 
 ### Creating a release tarball
 
-`release-tarball.sh` produces `jackdaw-<VERSION>.tar.gz` that unpacks into a
-top-level `JackDAW/` directory containing the source, bundled headers, the VST3
+`release-tarball.sh` produces `jackdaw-<VERSION>-linux-<ARCH>.tar.gz` (ARCH is
+`x86_64` or `aarch64`, read from the binary; a `--no-binary` tarball is plain
+`jackdaw-<VERSION>.tar.gz`) that unpacks into a top-level `JackDAW/` directory containing the source, bundled headers, the VST3
 SDK, icons, packaging scripts and the prebuilt binary. Because the SDK is
 included the tarball is around 15 MB, and it builds VST3 support with no
 network access or submodule fetch.
@@ -178,6 +179,16 @@ network access or submodule fetch.
 
 The default version comes from `#define VERSION` in `src/config.h`; edit the
 `VERSION=` variable at the top of the script, or pass it as the first argument.
+
+### aarch64 (Raspberry Pi 4/5, Orange Pi 5, arm64 laptops)
+
+The aarch64 tarball is built by GitHub Actions (`.github/workflows/linux-aarch64.yml`)
+on an arm64 runner inside a Debian 12 container, so it needs glibc 2.36 or newer.
+Download it from the run's artifacts (`jackdaw-linux-aarch64`) and install it the
+same way as x86_64; the installer checks that the binary's architecture matches.
+
+It has not yet been run on ARM hardware — it builds and packages, but no live
+audio, xrun or CPU-load figure has been taken on a board.
 
 ---
 
@@ -207,11 +218,13 @@ On startup JackDAW scans and reports any **newly discovered** plugins.
 **Default search paths** (always present):
 
 - User: `~/.lv2`, `~/.vst`, `~/.vst3`, `~/.clap`, `~/.ladspa`
-- LV2: `/usr/lib/lv2`, `/usr/local/lib/lv2`, `/usr/lib/x86_64-linux-gnu/lv2`
+- LV2: `/usr/lib/lv2`, `/usr/local/lib/lv2`, `/usr/lib/<arch>-linux-gnu/lv2`
 - VST2: `/usr/lib/vst`, `/usr/local/lib/vst`
-- VST3: `/usr/lib/vst3`, `/usr/local/lib/vst3`, `/usr/lib/x86_64-linux-gnu/vst3`
+- VST3: `/usr/lib/vst3`, `/usr/local/lib/vst3`, `/usr/lib/<arch>-linux-gnu/vst3`
 - CLAP: `/usr/lib/clap`, `/usr/local/lib/clap`
-- LADSPA: `/usr/lib/ladspa`, `/usr/local/lib/ladspa`, `/usr/lib/x86_64-linux-gnu/ladspa`
+- LADSPA: `/usr/lib/ladspa`, `/usr/local/lib/ladspa`, `/usr/lib/<arch>-linux-gnu/ladspa`
+
+(`<arch>` is `x86_64` or `aarch64`, matching the build.)
 
 **Adding more folders / rescanning:** open the **Plugins…** paths dialog. It
 has **Add Folder…**, **Remove**, and **Scan** (rescan) buttons; extra paths are

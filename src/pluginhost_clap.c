@@ -9,6 +9,7 @@
 
 #include "clap/clap.h"
 #include "pluginhost_internal.h"
+#include "rt_ringbuffer.h"
 
 #define CLAP_MAX_PENDING 256
 
@@ -34,9 +35,14 @@ typedef struct {
     clap_id  *param_ids;
     guint     n_params;
 
-    /* pending param edits flushed into in_events on the next process */
-    clap_event_param_value_t pending[CLAP_MAX_PENDING];
-    volatile gint            n_pending;
+    /* Param edits: the main thread queues them on param_q; process() drains
+     * the queue into events[], which only the RT thread touches, and hands
+     * that to the plugin as in_events. A shared array with a shared count let
+     * the RT thread's reset to 0 race an append, replaying edits already
+     * delivered or dropping new ones. */
+    rt_ringbuffer_t         *param_q;                /* main -> RT */
+    clap_event_param_value_t events[CLAP_MAX_PENDING];
+    guint                    n_events;               /* RT only */
 
     float    *outL, *outR;
     int       max_block;
@@ -45,11 +51,11 @@ typedef struct {
 /* ---- Input/output event adapters ---- */
 
 static uint32_t clap_in_size(const struct clap_input_events *l)
-{ ClapBackend *b = (ClapBackend *)l->ctx; return (uint32_t)g_atomic_int_get(&b->n_pending); }
+{ ClapBackend *b = (ClapBackend *)l->ctx; return b->n_events; }
 
 static const clap_event_header_t *clap_in_get(const struct clap_input_events *l, uint32_t i)
 { ClapBackend *b = (ClapBackend *)l->ctx;
-  return (i < (uint32_t)b->n_pending) ? &b->pending[i].header : NULL; }
+  return (i < b->n_events) ? &b->events[i].header : NULL; }
 
 static bool clap_out_push(const struct clap_output_events *l,
                           const clap_event_header_t *e)
@@ -137,6 +143,12 @@ static void clap_process_cb(PluginInstance *pi, float *L, float *R, int n)
     clap_audio_buffer_t in  = { in_ch,  NULL, 2, 0, 0 };
     clap_audio_buffer_t out = { out_ch, NULL, 2, 0, 0 };
 
+    b->n_events = 0;
+    while (b->param_q && b->n_events < CLAP_MAX_PENDING &&
+           rt_ringbuffer_read(b->param_q, (char *)&b->events[b->n_events],
+                              sizeof b->events[0]) == sizeof b->events[0])
+        b->n_events++;
+
     clap_input_events_t  ine = { b, clap_in_size, clap_in_get };
     clap_output_events_t oute = { b, clap_out_push };
 
@@ -154,7 +166,6 @@ static void clap_process_cb(PluginInstance *pi, float *L, float *R, int n)
 
     if (b->plugin && b->plugin->process)
         b->plugin->process(b->plugin, &pr);
-    g_atomic_int_set(&b->n_pending, 0);    /* events consumed */
 
     memcpy(L, b->outL, (size_t)n * sizeof(float));
     memcpy(R, b->outR, (size_t)n * sizeof(float));
@@ -180,6 +191,7 @@ static void clap_destroy(PluginInstance *pi)
     if (b->dl) dlclose(b->dl);
     g_free(b->param_ids);
     g_free(b->outL); g_free(b->outR);
+    rt_ringbuffer_free(b->param_q);
     g_free(b);
 }
 
@@ -228,22 +240,21 @@ static gboolean clap_param_display(PluginInstance *pi, guint i, char *buf, gsize
 static void clap_param_set(PluginInstance *pi, guint i, float v)
 {
     ClapBackend *b = (ClapBackend *)pi->backend;
-    if (i >= b->n_params) return;
-    gint slot = g_atomic_int_get(&b->n_pending);
-    if (slot >= CLAP_MAX_PENDING) return;
-    clap_event_param_value_t *ev = &b->pending[slot];
-    memset(ev, 0, sizeof(*ev));
-    ev->header.size     = sizeof(*ev);
-    ev->header.time     = 0;
-    ev->header.space_id = CLAP_CORE_EVENT_SPACE_ID;
-    ev->header.type     = CLAP_EVENT_PARAM_VALUE;
-    ev->param_id  = b->param_ids[i];
-    ev->note_id   = -1;
-    ev->port_index= -1;
-    ev->channel   = -1;
-    ev->key       = -1;
-    ev->value     = v;
-    g_atomic_int_set(&b->n_pending, slot + 1);
+    if (i >= b->n_params || !b->param_q) return;
+    clap_event_param_value_t ev;
+    if (rt_ringbuffer_write_space(b->param_q) < sizeof ev) return;
+    memset(&ev, 0, sizeof(ev));
+    ev.header.size     = sizeof(ev);
+    ev.header.time     = 0;
+    ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    ev.header.type     = CLAP_EVENT_PARAM_VALUE;
+    ev.param_id  = b->param_ids[i];
+    ev.note_id   = -1;
+    ev.port_index= -1;
+    ev.channel   = -1;
+    ev.key       = -1;
+    ev.value     = v;
+    rt_ringbuffer_write(b->param_q, (const char *)&ev, sizeof ev);
 }
 
 static void clap_param_range(PluginInstance *pi, guint i, float *mn, float *mx)
@@ -361,6 +372,9 @@ PluginInstance *ph_clap_instantiate(const PluginInfo *info, double sr, int max_b
     b->max_block = max_block;
     b->outL = g_new0(float, max_block);
     b->outR = g_new0(float, max_block);
+    b->param_q = rt_ringbuffer_create(CLAP_MAX_PENDING *
+                                      sizeof(clap_event_param_value_t));
+    if (b->param_q) rt_ringbuffer_mlock(b->param_q);
 
     b->state = (const clap_plugin_state_t *)
         plugin->get_extension(plugin, CLAP_EXT_STATE);

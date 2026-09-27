@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <jack/jack.h>
 #include <jack/midiport.h>
-#include <jack/ringbuffer.h>
+#include "rt_ringbuffer.h"
 #include <jack/thread.h>     /* jack_client_create_thread (RT-priority workers) */
 #include <semaphore.h>
 #ifdef HAVE_SAMPLERATE
@@ -103,10 +103,12 @@ typedef struct {
 
     /* Loop region (frames). Looping is active only while loop_enabled is set and
      * loop_end > loop_start; the playhead wraps loop_end -> loop_start once it has
-     * entered the region. Set/cleared from the main thread; read in the RT path. */
+     * entered the region. Set/cleared from the main thread; read in the RT path.
+     * start/end are a pair: other threads read them through eng_loop_read(). */
     volatile gint  loop_enabled;
     volatile off_t loop_start;
     volatile off_t loop_end;
+    volatile gint  loop_seq;       /* odd while set_loop_range is mid-update */
 
     /* Punch in/out recording (independent of looping). record_mode is set from
      * the UI menu; punch_armed is set when playback starts in punch mode and the
@@ -157,20 +159,57 @@ typedef struct {
     volatile gint      render_done;    /* set by RT when render_end reached */
     float             *render_tap_L;
     float             *render_tap_R;
-    jack_ringbuffer_t *render_rb_L;    /* RT -> render writer thread */
-    jack_ringbuffer_t *render_rb_R;
+    rt_ringbuffer_t *render_rb_L;    /* RT -> render writer thread */
+    rt_ringbuffer_t *render_rb_R;
 
     gboolean active;
 } JackDawEngine;
 
 static JackDawEngine engine;
 
+/* Read a live port count from an RT thread. The count bounds reads of the
+ * port arrays, and the main thread publishes it with eng_publish_count()
+ * (a release store). The reader needs the matching acquire: volatile only
+ * stops the compiler caching the value, and on a weakly-ordered CPU
+ * (aarch64) a plain load followed by a load it merely guards (a control
+ * dependency) may be satisfied out of order. x86's TSO hid this. */
+static inline guint eng_count(volatile guint *slot)
+{
+    return (guint)g_atomic_int_get((gint *)slot);
+}
+
+/* Loop range read off the main thread. start and end are two stores, so a
+ * reader could pair a new start with an old end and wrap to the wrong place
+ * (a seqlock around the pair closes that). The reader never waits for the
+ * writer: an RT thread spinning on a preempted main thread could spin for a
+ * whole scheduler slice. After a few tries it gives up and returns TRUE, and
+ * the caller keeps the pair it read last time, so a new range lands at most a
+ * cycle late but is never seen torn. */
+typedef struct { off_t start, end; } EngLoopRange;
+
+static gboolean eng_loop_read(EngLoopRange *out)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        gint s0 = g_atomic_int_get(&engine.loop_seq);
+        if (s0 & 1) continue;
+        off_t a = __atomic_load_n(&engine.loop_start, __ATOMIC_RELAXED);
+        off_t b = __atomic_load_n(&engine.loop_end,   __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* pair loads before re-check */
+        if (g_atomic_int_get(&engine.loop_seq) == s0) {
+            out->start = a;
+            out->end   = b;
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
 /* -----------------------------------------------------------------------
  * Phase 2.5: Playback feeder thread
  *
  * A dedicated pthread fills play_buf_L/R ringbuffers from AudioClip data
  * so the RT callback always has audio to drain.  No malloc/free/mutex
- * in the feeder — only jack_ringbuffer_* (lock-free) and libsndfile reads.
+ * in the feeder — only rt_ringbuffer_* (lock-free) and libsndfile reads.
  * ----------------------------------------------------------------------- */
 
 /* Output frames produced per slot per inner-loop pass (controls granularity).
@@ -251,10 +290,10 @@ static void feeder_slot_release(guint i)
 static void feeder_write(JackDawTrack *t, size_t n)
 {
     if (n == 0) return;
-    jack_ringbuffer_write(t->play_buf_L, (const char *)feeder_L,
-                          n * sizeof(float));
-    jack_ringbuffer_write(t->play_buf_R, (const char *)feeder_R,
-                          n * sizeof(float));
+    rt_ringbuffer_write(t->play_buf_L, (const char *)feeder_L,
+                        n * sizeof(float));
+    rt_ringbuffer_write(t->play_buf_R, (const char *)feeder_R,
+                        n * sizeof(float));
 }
 
 static void feeder_emit_silence(JackDawTrack *t, size_t n)
@@ -269,6 +308,7 @@ static void *feeder_thread_func(void *arg)
     (void)arg;
     guint i;
     struct timespec ts = { .tv_sec = 0, .tv_nsec = 2000000 }; /* 2 ms sleep */
+    EngLoopRange feed_loop = { 0, 0 };
 
     while (!feeder_stop_flag) {
         nanosleep(&ts, NULL);
@@ -279,6 +319,7 @@ static void *feeder_thread_func(void *arg)
             continue;
 
         int jack_sr = (int)jack_get_sample_rate(engine.client);
+        eng_loop_read(&feed_loop);   /* one pair for the whole pass */
 
         for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
             JackDawTrack *t = engine.slots[i];
@@ -312,9 +353,9 @@ static void *feeder_thread_func(void *arg)
 
             /* --- Inner fill loop: top up the ringbuffer each wakeup --- */
             while (TRUE) {
-                size_t space_L = jack_ringbuffer_write_space(t->play_buf_L)
+                size_t space_L = rt_ringbuffer_write_space(t->play_buf_L)
                                  / sizeof(float);
-                size_t space_R = jack_ringbuffer_write_space(t->play_buf_R)
+                size_t space_R = rt_ringbuffer_write_space(t->play_buf_R)
                                  / sizeof(float);
                 size_t out_want = (space_L < space_R) ? space_L : space_R;
                 if (out_want > FEEDER_CHUNK_FRAMES)
@@ -332,8 +373,8 @@ static void *feeder_thread_func(void *arg)
                  * past loop_end (playhead placed after the region) is left
                  * alone, so playback there does not loop. --- */
                 if (g_atomic_int_get(&engine.loop_enabled)) {
-                    off_t l_start = engine.loop_start;
-                    off_t l_end   = engine.loop_end;
+                    off_t l_start = feed_loop.start;
+                    off_t l_end   = feed_loop.end;
                     if (l_end > l_start) {
                         if (pf == l_end) {
                             pf = l_start;
@@ -650,8 +691,8 @@ static void recorder_slot_finalize(guint i)
     JackDawTrack *t = engine.slots[i];
     if (t && t->rec_buf_L && t->rec_buf_R) {
         while (TRUE) {
-            size_t avL = jack_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
-            size_t avR = jack_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
+            size_t avL = rt_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
+            size_t avR = rt_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
             size_t av  = avL < avR ? avL : avR;
             if (av > REC_SCRATCH_FRAMES) av = REC_SCRATCH_FRAMES;
             /* Cap at expected_frames so the WAV ends exactly at the stop point */
@@ -662,8 +703,8 @@ static void recorder_slot_finalize(guint i)
             }
             if (av == 0) break;
 
-            jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
-            jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
+            rt_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
+            rt_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
 
             if (rs->channels == 1) {
                 rs->written += sf_writef_float(rs->sf, rec_scratch_L, (sf_count_t)av);
@@ -719,8 +760,8 @@ static void *recorder_thread_func(void *arg)
             if (!t || !t->rec_buf_L || !t->rec_buf_R) continue;
 
             while (TRUE) {
-                size_t avL = jack_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
-                size_t avR = jack_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
+                size_t avL = rt_ringbuffer_read_space(t->rec_buf_L) / sizeof(float);
+                size_t avR = rt_ringbuffer_read_space(t->rec_buf_R) / sizeof(float);
                 size_t av  = avL < avR ? avL : avR;
                 if (av > REC_SCRATCH_FRAMES) av = REC_SCRATCH_FRAMES;
                 /* Cap at expected_frames if stop has been signalled */
@@ -731,8 +772,8 @@ static void *recorder_thread_func(void *arg)
                 }
                 if (av == 0) break;
 
-                jack_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
-                jack_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
+                rt_ringbuffer_read(t->rec_buf_L, (char *)rec_scratch_L, av * sizeof(float));
+                rt_ringbuffer_read(t->rec_buf_R, (char *)rec_scratch_R, av * sizeof(float));
 
                 if (rs->channels == 1) {
                     rs->written += sf_writef_float(rs->sf, rec_scratch_L, (sf_count_t)av);
@@ -812,11 +853,11 @@ static int           eng_block_nev[JACKDAW_MAX_TRACKS];
 /* ---- Preview-note injection (main thread -> RT) ----
  * The main thread queues short MIDI messages tagged with a track slot; the RT
  * thread drains the ring once per cycle into per-slot scratch, and the gather
- * function emits them at block offset 0. Lock-free SPSC via jack_ringbuffer. */
+ * function emits them at block offset 0. Lock-free SPSC via rt_ringbuffer. */
 #define ENG_PREVIEW_MAX 32                    /* per-slot events drained per cycle */
 typedef struct { gint32 slot; guint8 data[3]; } EngPrevMsg;
-static jack_ringbuffer_t *eng_preview_rb;     /* SPSC: main -> RT */
-static jack_ringbuffer_t *eng_control_rb;     /* SPSC: RT -> main (control surface) */
+static rt_ringbuffer_t *eng_preview_rb;     /* SPSC: main -> RT */
+static rt_ringbuffer_t *eng_control_rb;     /* SPSC: RT -> main (control surface) */
 static guint8 eng_preview_data[JACKDAW_MAX_TRACKS][ENG_PREVIEW_MAX][3];
 static int    eng_preview_n[JACKDAW_MAX_TRACKS];
 
@@ -840,7 +881,7 @@ static int eng_midi_cmp(const void *a, const void *b)
  * then live JACK MIDI input (while armed). Tracks sounding notes per slot. */
 static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start,
                                       jack_nframes_t nframes, gboolean playing,
-                                      gboolean armed, PhMidiEvent *mev, int cap)
+                                      void *mbuf, PhMidiEvent *mev, int cap)
 {
     int nev = 0;
 
@@ -878,9 +919,10 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
         }
     }
 
-    if (armed && t->midi_in_idx >= 0 &&
-        (guint)t->midi_in_idx < engine.midi_in_count && engine.midi_in[t->midi_in_idx]) {
-        void *mbuf = jack_port_get_buffer(engine.midi_in[t->midi_in_idx], nframes);
+    /* mbuf: this track's MIDI input for the cycle when it is armed, else NULL.
+     * Pre-fetched by the JACK thread; this runs on a worker, where
+     * jack_port_get_buffer() must not be called. */
+    if (mbuf) {
         uint32_t mc = jack_midi_get_event_count(mbuf);
         for (uint32_t m = 0; m < mc && nev < cap; m++) {
             jack_midi_event_t ev;
@@ -920,9 +962,9 @@ static int eng_gather_instrument_midi(int slot, JackDawTrack *t, off_t blk_start
     return nev;
 }
 
-/* Enable flush-to-zero + denormals-are-zero on the calling thread's SSE unit.
- * Cheap (two MXCSR register writes); safe to call every cycle. Re-armed before
- * every plugin in pluginhost_process() too, in case a plugin clears MXCSR. */
+/* Enable flush-to-zero + denormals-are-zero on the calling thread (x86 MXCSR,
+ * aarch64 FPCR.FZ). Cheap; safe to call every cycle. Re-armed before every
+ * plugin in pluginhost_process() too, in case a plugin clears the bits. */
 static inline void engine_rt_set_denormal_mode(void)
 {
     rt_set_denormal_mode();
@@ -1016,9 +1058,9 @@ static void engine_process_track(int i)
     } else {
         size_t got_L = 0, got_R = 0;
         if (t->play_buf_L && (flags & ENGINE_PLAYING))
-            got_L = jack_ringbuffer_read(t->play_buf_L, (char *)bL, want);
+            got_L = rt_ringbuffer_read(t->play_buf_L, (char *)bL, want);
         if (t->play_buf_R && (flags & ENGINE_PLAYING))
-            got_R = jack_ringbuffer_read(t->play_buf_R, (char *)bR, want);
+            got_R = rt_ringbuffer_read(t->play_buf_R, (char *)bR, want);
         if (got_L < want) memset((char *)bL + got_L, 0, want - got_L);
         if (got_R < want) memset((char *)bR + got_R, 0, want - got_R);
     }
@@ -1047,7 +1089,10 @@ static void engine_process_track(int i)
             if (pk < REC_PEAK_MAX_BUCKETS) {
                 t->rec_peak_buf[pk * 2]     = wf_mn;
                 t->rec_peak_buf[pk * 2 + 1] = wf_mx;
-                t->rec_peak_count = pk + 1;
+                /* Release store: the timeline reads the pair only once it
+                 * sees the count, and a weakly-ordered CPU could otherwise
+                 * make the count visible before the pair. */
+                g_atomic_int_set(&t->rec_peak_count, pk + 1);
             }
         }
     }
@@ -1062,7 +1107,8 @@ static void engine_process_track(int i)
         PhMidiEvent *mev = eng_block_ev[i];
         int nev = eng_gather_instrument_midi(i, t, blk_start, nframes,
                                              (flags & ENGINE_PLAYING) != 0,
-                                             (tflags & TRACK_ARMED) != 0,
+                                             (tflags & TRACK_ARMED) ?
+                                                 g_slot_midi_buf[i] : NULL,
                                              mev, ENG_MIDI_MAX_EV);
         eng_block_nev[i] = nev;
         if (chain && chain->n > 0) {
@@ -1116,9 +1162,9 @@ static void engine_process_track(int i)
     /* Capture dry input to rec ringbuffers while recording. */
     if (live_L && (flags & ENGINE_RECORDING)) {
         if (t->rec_buf_L)
-            jack_ringbuffer_write(t->rec_buf_L, (const char *)live_L, want);
+            rt_ringbuffer_write(t->rec_buf_L, (const char *)live_L, want);
         if (t->rec_buf_R)
-            jack_ringbuffer_write(t->rec_buf_R, (const char *)live_R, want);
+            rt_ringbuffer_write(t->rec_buf_R, (const char *)live_R, want);
     }
 
     /* Record MIDI with absolute timeline frames (instrument tracks). */
@@ -1136,8 +1182,8 @@ static void engine_process_track(int i)
             r.data[0] = ev.buffer[0];
             r.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
             r.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
-            if (jack_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
-                jack_ringbuffer_write(t->midi_rec_buf, (const char *)&r, sizeof r);
+            if (rt_ringbuffer_write_space(t->midi_rec_buf) >= sizeof r)
+                rt_ringbuffer_write(t->midi_rec_buf, (const char *)&r, sizeof r);
         }
     }
 }
@@ -1200,12 +1246,12 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * so the live graph must touch none of them. Output silence, freeze the
      * transport, and return before any plugin or mix work. */
     if (g_atomic_int_get(&engine.render_suspend)) {
-        for (i = 0; i < engine.audio_out_count; i++) {
+        for (i = 0; i < eng_count(&engine.audio_out_count); i++) {
             if (!engine.audio_out[i]) continue;
             port_buf = jack_port_get_buffer(engine.audio_out[i], nframes);
             memset(port_buf, 0, nframes * sizeof(float));
         }
-        for (i = 0; i < engine.midi_out_count; i++) {
+        for (i = 0; i < eng_count(&engine.midi_out_count); i++) {
             if (!engine.midi_out[i]) continue;
             jack_midi_clear_buffer(
                 jack_port_get_buffer(engine.midi_out[i], nframes));
@@ -1253,8 +1299,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) eng_preview_n[i] = 0;
     if (eng_preview_rb) {
         EngPrevMsg msg;
-        while (jack_ringbuffer_read_space(eng_preview_rb) >= sizeof msg) {
-            jack_ringbuffer_read(eng_preview_rb, (char *)&msg, sizeof msg);
+        while (rt_ringbuffer_read_space(eng_preview_rb) >= sizeof msg) {
+            rt_ringbuffer_read(eng_preview_rb, (char *)&msg, sizeof msg);
             if (msg.slot >= 0 && msg.slot < JACKDAW_MAX_TRACKS &&
                 eng_preview_n[msg.slot] < ENG_PREVIEW_MAX) {
                 guint8 *d = eng_preview_data[msg.slot][eng_preview_n[msg.slot]++];
@@ -1277,8 +1323,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             cm.data[0] = ev.buffer[0];
             cm.data[1] = ev.size > 1 ? ev.buffer[1] : 0;
             cm.data[2] = ev.size > 2 ? ev.buffer[2] : 0;
-            if (jack_ringbuffer_write_space(eng_control_rb) >= sizeof cm)
-                jack_ringbuffer_write(eng_control_rb, (const char *)&cm, sizeof cm);
+            if (rt_ringbuffer_write_space(eng_control_rb) >= sizeof cm)
+                rt_ringbuffer_write(eng_control_rb, (const char *)&cm, sizeof cm);
         }
     }
 
@@ -1289,9 +1335,11 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * remainder past loop_end is carried over so the clock's loop period equals
      * the region length, matching the feeder. Checked at block granularity, so
      * the loop point quantizes to the JACK period (acceptable for now). */
+    static EngLoopRange rt_loop;   /* JACK thread only; kept if a read fails */
+    eng_loop_read(&rt_loop);
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.loop_enabled)) {
-        off_t l_start = engine.loop_start;
-        off_t l_end   = engine.loop_end;
+        off_t l_start = rt_loop.start;
+        off_t l_end   = rt_loop.end;
         off_t bstart  = engine.play_pos - (off_t)nframes;
         if (l_end > l_start && bstart >= l_start && bstart < l_end &&
             engine.play_pos >= l_end)
@@ -1303,8 +1351,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * loop wrap; punch_armed gates it so normal recording is never affected. The
      * local `flags` is updated in step so the capture passes below act this block. */
     if ((flags & ENGINE_PLAYING) && g_atomic_int_get(&engine.punch_armed)) {
-        off_t ls = engine.loop_start;
-        off_t le = engine.loop_end;
+        off_t ls = rt_loop.start;
+        off_t le = rt_loop.end;
         off_t bstart = engine.play_pos - (off_t)nframes;
         if (le > ls) {
             if (!(flags & ENGINE_RECORDING)) {
@@ -1349,8 +1397,8 @@ static int engine_process(jack_nframes_t nframes, void *arg)
      * then fan the tracks out across the worker pool and sum the results.
      *
      * Pre-fetch: live audio input (for monitoring + dry capture) and the MIDI
-     * input buffer (for MIDI recording). Mirrors the gating that used to live in
-     * the per-track loop. */
+     * input buffer (live instrument input + MIDI recording). Mirrors the gating
+     * that used to live in the per-track loop. */
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         g_slot_live_L[i]   = NULL;
         g_slot_live_R[i]   = NULL;
@@ -1360,18 +1408,23 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         gint tflags = g_atomic_int_get(&t->state_flags);
         gboolean instr = jackdaw_track_is_instrument(t);
         if (!instr && (tflags & TRACK_ARMED) && t->audio_in_idx >= 0 &&
-            (guint)t->audio_in_idx < engine.audio_in_count &&
+            (guint)t->audio_in_idx < eng_count(&engine.audio_in_count) &&
             engine.audio_in[(guint)t->audio_in_idx]) {
             g_slot_live_L[i] = jack_port_get_buffer(
                 engine.audio_in[(guint)t->audio_in_idx], nframes);
-            if (t->audio_src_port_r && engine.audio_in_r[(guint)t->audio_in_idx])
-                g_slot_live_R[i] = jack_port_get_buffer(
-                    engine.audio_in_r[(guint)t->audio_in_idx], nframes);
+            /* Loaded once: the main thread clears it before unregistering. */
+            jack_port_t *pr = g_atomic_pointer_get(
+                &engine.audio_in_r[(guint)t->audio_in_idx]);
+            if (t->audio_src_port_r && pr)
+                g_slot_live_R[i] = jack_port_get_buffer(pr, nframes);
         }
-        if (instr && (tflags & TRACK_ARMED) && (flags & ENGINE_RECORDING) &&
+        /* Every armed instrument track, not just while recording: the worker
+         * also feeds live input to the instrument (eng_gather_instrument_midi).
+         * The MIDI recorder keeps its own RECORDING gate. */
+        if (instr && (tflags & TRACK_ARMED) &&
             t->midi_in_idx >= 0 &&
-            (guint)t->midi_in_idx < engine.midi_in_count &&
-            engine.midi_in[t->midi_in_idx] && t->midi_rec_buf)
+            (guint)t->midi_in_idx < eng_count(&engine.midi_in_count) &&
+            engine.midi_in[t->midi_in_idx])
             g_slot_midi_buf[i] = jack_port_get_buffer(
                 engine.midi_in[t->midi_in_idx], nframes);
     }
@@ -1443,7 +1496,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
     gfloat mpk_L = 0.0f, mpk_R = 0.0f;
     guint oi;
-    for (oi = 0; oi < engine.audio_out_count; oi++) {
+    for (oi = 0; oi < eng_count(&engine.audio_out_count); oi++) {
         if (!engine.audio_out[oi]) continue;
         port_buf = jack_port_get_buffer(engine.audio_out[oi], nframes);
         if (oi == 0) {
@@ -1485,12 +1538,12 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                 engine.render_tap_R[k] = engine.master_R[k] * mvol;
             }
             size_t bytes = (size_t)in_range * sizeof(float);
-            if (jack_ringbuffer_write_space(engine.render_rb_L) >= bytes &&
-                jack_ringbuffer_write_space(engine.render_rb_R) >= bytes) {
-                jack_ringbuffer_write(engine.render_rb_L,
-                                      (const char *)engine.render_tap_L, bytes);
-                jack_ringbuffer_write(engine.render_rb_R,
-                                      (const char *)engine.render_tap_R, bytes);
+            if (rt_ringbuffer_write_space(engine.render_rb_L) >= bytes &&
+                rt_ringbuffer_write_space(engine.render_rb_R) >= bytes) {
+                rt_ringbuffer_write(engine.render_rb_L,
+                                    (const char *)engine.render_tap_L, bytes);
+                rt_ringbuffer_write(engine.render_rb_R,
+                                    (const char *)engine.render_tap_R, bytes);
             }
         }
         if (engine.play_pos >= engine.render_end)
@@ -1533,7 +1586,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
                                       : engine.play_pos - (off_t)nframes;
                 float *out_buf[2] = { NULL, NULL };
                 if (to_main) {
-                    for (oi = 0; oi < engine.audio_out_count && oi < 2; oi++)
+                    for (oi = 0; oi < eng_count(&engine.audio_out_count) && oi < 2; oi++)
                         if (engine.audio_out[oi])
                             out_buf[oi] = jack_port_get_buffer(
                                 engine.audio_out[oi], nframes);
@@ -1564,7 +1617,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
     }
 
     /* Clear all MIDI output buffers before any writes */
-    for (oi = 0; oi < engine.midi_out_count; oi++) {
+    for (oi = 0; oi < eng_count(&engine.midi_out_count); oi++) {
         if (!engine.midi_out[oi]) continue;
         void *mbuf = jack_port_get_buffer(engine.midi_out[oi], nframes);
         jack_midi_clear_buffer(mbuf);
@@ -1590,7 +1643,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
         gint mi = t->midi_in_idx;
-        if (mi < 0 || (guint)mi >= engine.midi_out_count || !engine.midi_out[mi])
+        if (mi < 0 || (guint)mi >= eng_count(&engine.midi_out_count) || !engine.midi_out[mi])
             continue;
         if (out_done & (1u << mi)) continue;
 
@@ -1609,7 +1662,7 @@ static int engine_process(jack_nframes_t nframes, void *arg)
             continue;
         }
 
-        if ((guint)mi >= engine.midi_in_count || !engine.midi_in[mi]) continue;
+        if ((guint)mi >= eng_count(&engine.midi_in_count) || !engine.midi_in[mi]) continue;
         void *ibuf = jack_port_get_buffer(engine.midi_in[mi], nframes);
         uint32_t mc = jack_midi_get_event_count(ibuf);
         uint32_t m;
@@ -1672,18 +1725,18 @@ static int engine_buffer_size_cb(jack_nframes_t nframes, void *arg)
     for (i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
-        if (t->play_buf_L) jack_ringbuffer_free(t->play_buf_L);
-        if (t->play_buf_R) jack_ringbuffer_free(t->play_buf_R);
-        if (t->rec_buf_L)  jack_ringbuffer_free(t->rec_buf_L);
-        if (t->rec_buf_R)  jack_ringbuffer_free(t->rec_buf_R);
-        t->play_buf_L = jack_ringbuffer_create(rb_bytes);
-        t->play_buf_R = jack_ringbuffer_create(rb_bytes);
-        t->rec_buf_L  = jack_ringbuffer_create(rb_bytes);
-        t->rec_buf_R  = jack_ringbuffer_create(rb_bytes);
-        if (t->play_buf_L) jack_ringbuffer_mlock(t->play_buf_L);
-        if (t->play_buf_R) jack_ringbuffer_mlock(t->play_buf_R);
-        if (t->rec_buf_L)  jack_ringbuffer_mlock(t->rec_buf_L);
-        if (t->rec_buf_R)  jack_ringbuffer_mlock(t->rec_buf_R);
+        if (t->play_buf_L) rt_ringbuffer_free(t->play_buf_L);
+        if (t->play_buf_R) rt_ringbuffer_free(t->play_buf_R);
+        if (t->rec_buf_L)  rt_ringbuffer_free(t->rec_buf_L);
+        if (t->rec_buf_R)  rt_ringbuffer_free(t->rec_buf_R);
+        t->play_buf_L = rt_ringbuffer_create(rb_bytes);
+        t->play_buf_R = rt_ringbuffer_create(rb_bytes);
+        t->rec_buf_L  = rt_ringbuffer_create(rb_bytes);
+        t->rec_buf_R  = rt_ringbuffer_create(rb_bytes);
+        if (t->play_buf_L) rt_ringbuffer_mlock(t->play_buf_L);
+        if (t->play_buf_R) rt_ringbuffer_mlock(t->play_buf_R);
+        if (t->rec_buf_L)  rt_ringbuffer_mlock(t->rec_buf_L);
+        if (t->rec_buf_R)  rt_ringbuffer_mlock(t->rec_buf_R);
         /* Ringbuffers just emptied — tell feeder to re-seek to play position */
         feeder_slots[i].locate_frame = (off_t)engine.play_pos;
         g_atomic_int_set(&feeder_slots[i].locate_req, 1);
@@ -2023,13 +2076,13 @@ gboolean jackdaw_engine_init(JackDawProject *project)
     if (!engine.metro_out) goto fail;
 
     /* Preview-note queue (main thread -> RT). Sized for many in-flight clicks. */
-    eng_preview_rb = jack_ringbuffer_create(256 * sizeof(EngPrevMsg));
-    if (eng_preview_rb) jack_ringbuffer_mlock(eng_preview_rb);
+    eng_preview_rb = rt_ringbuffer_create(256 * sizeof(EngPrevMsg));
+    if (eng_preview_rb) rt_ringbuffer_mlock(eng_preview_rb);
 
     /* Control-surface input queue (RT -> main). Footswitch events are sparse;
      * 1024 slots is ample and the RT side drops on overflow, never blocks. */
-    eng_control_rb = jack_ringbuffer_create(1024 * sizeof(JackDawCtlEvent));
-    if (eng_control_rb) jack_ringbuffer_mlock(eng_control_rb);
+    eng_control_rb = rt_ringbuffer_create(1024 * sizeof(JackDawCtlEvent));
+    if (eng_control_rb) rt_ringbuffer_mlock(eng_control_rb);
 
     /* Activate — after this the process callback can be called at any time */
     if (jack_activate(engine.client) != 0) {
@@ -2191,16 +2244,16 @@ void jackdaw_engine_quit(void)
         g_free(engine.slot_L[s]); engine.slot_L[s] = NULL;
         g_free(engine.slot_R[s]); engine.slot_R[s] = NULL;
     }
-    if (engine.render_rb_L) { jack_ringbuffer_free(engine.render_rb_L); engine.render_rb_L = NULL; }
-    if (engine.render_rb_R) { jack_ringbuffer_free(engine.render_rb_R); engine.render_rb_R = NULL; }
+    if (engine.render_rb_L) { rt_ringbuffer_free(engine.render_rb_L); engine.render_rb_L = NULL; }
+    if (engine.render_rb_R) { rt_ringbuffer_free(engine.render_rb_R); engine.render_rb_R = NULL; }
     g_free(engine.click_buf); engine.click_buf = NULL; engine.click_len = 0;
     g_free(engine.audio_in);  engine.audio_in  = NULL;
     g_free(engine.audio_out); engine.audio_out = NULL;
     g_free(engine.midi_in);   engine.midi_in   = NULL;
     g_free(engine.midi_out);  engine.midi_out  = NULL;
 
-    if (eng_preview_rb) { jack_ringbuffer_free(eng_preview_rb); eng_preview_rb = NULL; }
-    if (eng_control_rb) { jack_ringbuffer_free(eng_control_rb); eng_control_rb = NULL; }
+    if (eng_preview_rb) { rt_ringbuffer_free(eng_preview_rb); eng_preview_rb = NULL; }
+    if (eng_control_rb) { rt_ringbuffer_free(eng_control_rb); eng_control_rb = NULL; }
     engine.control_in = NULL;   /* unregistered by jack_client_close above */
     g_clear_pointer(&engine.control_src_port, g_free);
 }
@@ -2210,9 +2263,9 @@ void jackdaw_engine_quit(void)
 gboolean jackdaw_engine_control_poll(JackDawCtlEvent *out)
 {
     if (!eng_control_rb || !out) return FALSE;
-    if (jack_ringbuffer_read_space(eng_control_rb) < sizeof(JackDawCtlEvent))
+    if (rt_ringbuffer_read_space(eng_control_rb) < sizeof(JackDawCtlEvent))
         return FALSE;
-    jack_ringbuffer_read(eng_control_rb, (char *)out, sizeof(JackDawCtlEvent));
+    rt_ringbuffer_read(eng_control_rb, (char *)out, sizeof(JackDawCtlEvent));
     return TRUE;
 }
 
@@ -2251,8 +2304,8 @@ void jackdaw_engine_preview_note(JackDawTrack *t, guint8 pitch,
     msg.data[1] = (guint8)(pitch & 0x7F);
     msg.data[2] = on ? (velocity ? velocity : 1) : 0;
 
-    if (jack_ringbuffer_write_space(eng_preview_rb) >= sizeof msg)
-        jack_ringbuffer_write(eng_preview_rb, (const char *)&msg, sizeof msg);
+    if (rt_ringbuffer_write_space(eng_preview_rb) >= sizeof msg)
+        rt_ringbuffer_write(eng_preview_rb, (const char *)&msg, sizeof msg);
 }
 
 gboolean jackdaw_engine_is_running(void)
@@ -2300,7 +2353,8 @@ gboolean jackdaw_engine_is_playing(void)
  * order that keeps the RT callback safe at every instant:
  *
  *   grow   — register the new ports FIRST, then raise the count.
- *   shrink — lower the count FIRST, then unregister the ports it dropped.
+ *   shrink — lower the count FIRST, wait out any cycle that loaded the old
+ *            count (eng_wait_rt_past), then unregister the ports it dropped.
  *
  * The old code did the opposite on both counts: it g_renew()'d the arrays the
  * callback was indexing (so a concurrent cycle could read through a freed
@@ -2312,6 +2366,28 @@ gboolean jackdaw_engine_is_playing(void)
 static inline void eng_publish_count(volatile guint *slot, guint n)
 {
     g_atomic_int_set((gint *)slot, (gint)n);
+}
+
+/* Block until every RT cycle that could have seen the state from before this
+ * call has finished, so a port hidden from the callback (count lowered, or
+ * pointer cleared) can be unregistered. Lowering the count is not enough on
+ * its own: a cycle already in flight loaded the old count and may still be
+ * about to jack_port_get_buffer() the port. g_rt_cycle is bumped at the START
+ * of each callback, so two increments prove the in-flight cycle is over (the
+ * same rule as track_retire_is_safe).
+ *
+ * Bounded: if no cycle starts for ENG_RT_WAIT_US the callback is not being run
+ * (client zombified or server stalled), so nothing is in flight and returning
+ * is safe. Main thread only; costs at most about two periods. */
+#define ENG_RT_WAIT_US (2 * G_USEC_PER_SEC)
+static void eng_wait_rt_past(void)
+{
+    if (!engine.active || !engine.client) return;
+    guint c0 = jackdaw_engine_get_cycle_count();
+    gint64 deadline = g_get_monotonic_time() + ENG_RT_WAIT_US;
+    while ((guint)(jackdaw_engine_get_cycle_count() - c0) < 2u &&
+           g_get_monotonic_time() < deadline)
+        g_usleep(500);
 }
 
 gboolean jackdaw_engine_set_audio_in_count(guint n)
@@ -2339,6 +2415,7 @@ gboolean jackdaw_engine_set_audio_in_count(guint n)
         eng_publish_count(&engine.audio_in_count, n);
     } else {
         eng_publish_count(&engine.audio_in_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_in[i]) {
                 jack_port_unregister(engine.client, engine.audio_in[i]);
@@ -2379,6 +2456,7 @@ gboolean jackdaw_engine_set_audio_out_count(guint n)
         eng_publish_count(&engine.audio_out_count, n);
     } else {
         eng_publish_count(&engine.audio_out_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.audio_out[i]) {
                 jack_port_unregister(engine.client, engine.audio_out[i]);
@@ -2415,6 +2493,7 @@ gboolean jackdaw_engine_set_midi_in_count(guint n)
         eng_publish_count(&engine.midi_in_count, n);
     } else {
         eng_publish_count(&engine.midi_in_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.midi_in[i]) {
                 jack_port_unregister(engine.client, engine.midi_in[i]);
@@ -2451,6 +2530,7 @@ gboolean jackdaw_engine_set_midi_out_count(guint n)
         eng_publish_count(&engine.midi_out_count, n);
     } else {
         eng_publish_count(&engine.midi_out_count, n);
+        eng_wait_rt_past();
         for (i = n; i < old; i++) {
             if (engine.midi_out[i]) {
                 jack_port_unregister(engine.client, engine.midi_out[i]);
@@ -2562,11 +2642,11 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
     sr = engine.client ? jack_get_sample_rate(engine.client) : 48000;
     rb_bytes = (size_t)(2 * sr) * sizeof(float);
 
-    track->play_buf_L = jack_ringbuffer_create(rb_bytes);
-    track->play_buf_R = jack_ringbuffer_create(rb_bytes);
-    track->rec_buf_L  = jack_ringbuffer_create(rb_bytes);
-    track->rec_buf_R  = jack_ringbuffer_create(rb_bytes);
-    track->midi_rec_buf = jack_ringbuffer_create(TRACK_MIDI_RINGBUF_BYTES);
+    track->play_buf_L = rt_ringbuffer_create(rb_bytes);
+    track->play_buf_R = rt_ringbuffer_create(rb_bytes);
+    track->rec_buf_L  = rt_ringbuffer_create(rb_bytes);
+    track->rec_buf_R  = rt_ringbuffer_create(rb_bytes);
+    track->midi_rec_buf = rt_ringbuffer_create(TRACK_MIDI_RINGBUF_BYTES);
 
     if (!track->play_buf_L || !track->play_buf_R ||
         !track->rec_buf_L  || !track->rec_buf_R  || !track->midi_rec_buf) {
@@ -2574,10 +2654,10 @@ gboolean jackdaw_engine_add_track(JackDawTrack *track)
         return TRUE;
     }
 
-    jack_ringbuffer_mlock(track->play_buf_L);
-    jack_ringbuffer_mlock(track->play_buf_R);
-    jack_ringbuffer_mlock(track->rec_buf_L);
-    jack_ringbuffer_mlock(track->rec_buf_R);
+    rt_ringbuffer_mlock(track->play_buf_L);
+    rt_ringbuffer_mlock(track->play_buf_R);
+    rt_ringbuffer_mlock(track->rec_buf_L);
+    rt_ringbuffer_mlock(track->rec_buf_R);
 
     track->slot   = i;
     engine.slots[i] = track; /* RT callback can see this now */
@@ -2642,9 +2722,11 @@ void jackdaw_engine_remove_track(JackDawTrack *track)
         if (track->audio_in_idx >= 0 &&
             (guint)track->audio_in_idx < engine.audio_in_count &&
             engine.audio_in_r[(guint)track->audio_in_idx]) {
-            jack_port_unregister(engine.client,
-                                 engine.audio_in_r[(guint)track->audio_in_idx]);
-            engine.audio_in_r[(guint)track->audio_in_idx] = NULL;
+            jack_port_t *pr = engine.audio_in_r[(guint)track->audio_in_idx];
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)track->audio_in_idx],
+                                 NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     g_clear_pointer(&track->audio_src_port,   g_free);
@@ -2822,7 +2904,7 @@ static void recorder_arm_all(void)
          * ringbuffer now (RECORDING isn't set yet, so the RT thread is not yet
          * writing to it). No WAV file. */
         if (jackdaw_track_is_instrument(t)) {
-            if (t->midi_rec_buf) jack_ringbuffer_reset(t->midi_rec_buf);
+            if (t->midi_rec_buf) rt_ringbuffer_reset(t->midi_rec_buf);
             continue;
         }
 
@@ -2882,7 +2964,7 @@ static gboolean midi_finalize_idle(gpointer data)
     for (guint i = 0; i < JACKDAW_MAX_TRACKS; i++) {
         JackDawTrack *t = engine.slots[i];
         if (!t || !jackdaw_track_is_instrument(t) || !t->midi_rec_buf) continue;
-        if (jack_ringbuffer_read_space(t->midi_rec_buf) < sizeof(MidiRecEvent))
+        if (rt_ringbuffer_read_space(t->midi_rec_buf) < sizeof(MidiRecEvent))
             continue;
 
         off_t  origin = t->rec_start_frame;
@@ -2895,8 +2977,8 @@ static gboolean midi_finalize_idle(gpointer data)
         gint64    last_frame = origin;
 
         MidiRecEvent r;
-        while (jack_ringbuffer_read_space(t->midi_rec_buf) >= sizeof r) {
-            jack_ringbuffer_read(t->midi_rec_buf, (char *)&r, sizeof r);
+        while (rt_ringbuffer_read_space(t->midi_rec_buf) >= sizeof r) {
+            rt_ringbuffer_read(t->midi_rec_buf, (char *)&r, sizeof r);
             if (r.frame > last_frame) last_frame = r.frame;
             int st = r.data[0] & 0xF0, ch = r.data[0] & 0x0F, p = r.data[1] & 0x7F;
             if (st == 0x90 && r.data[2] > 0) {
@@ -2956,12 +3038,12 @@ const JackDawRecNote *jackdaw_engine_rec_preview(JackDawTrack *t, guint *count)
     if (count) *count = 0;
     if (!t || !t->midi_rec_buf) return NULL;
 
-    size_t avail = jack_ringbuffer_read_space(t->midi_rec_buf);
+    size_t avail = rt_ringbuffer_read_space(t->midi_rec_buf);
     guint  ne    = (guint)(avail / sizeof(MidiRecEvent));
     if (ne == 0) return NULL;
     if (ne > ENG_REC_PREVIEW_MAX) ne = ENG_REC_PREVIEW_MAX;
-    size_t got = jack_ringbuffer_peek(t->midi_rec_buf, (char *)ev,
-                                      (size_t)ne * sizeof(MidiRecEvent));
+    size_t got = rt_ringbuffer_peek(t->midi_rec_buf, (char *)ev,
+                                    (size_t)ne * sizeof(MidiRecEvent));
     ne = (guint)(got / sizeof(MidiRecEvent));
 
     off_t now = (off_t)engine.play_pos;
@@ -3044,8 +3126,8 @@ void jackdaw_engine_locate(off_t sample)
         JackDawTrack *t = engine.slots[i];
         if (!t) continue;
         t->played_frames = sample;
-        if (t->play_buf_L) jack_ringbuffer_reset(t->play_buf_L);
-        if (t->play_buf_R) jack_ringbuffer_reset(t->play_buf_R);
+        if (t->play_buf_L) rt_ringbuffer_reset(t->play_buf_L);
+        if (t->play_buf_R) rt_ringbuffer_reset(t->play_buf_R);
         /* Tell feeder to re-seek each slot to the new position */
         feeder_slots[i].locate_frame = sample;
         g_atomic_int_set(&feeder_slots[i].locate_req, 1);
@@ -3067,8 +3149,8 @@ static void engine_loop_reseek(void)
         if (!t) continue;
         if (!playing) {
             t->played_frames = pos;
-            if (t->play_buf_L) jack_ringbuffer_reset(t->play_buf_L);
-            if (t->play_buf_R) jack_ringbuffer_reset(t->play_buf_R);
+            if (t->play_buf_L) rt_ringbuffer_reset(t->play_buf_L);
+            if (t->play_buf_R) rt_ringbuffer_reset(t->play_buf_R);
         }
         feeder_slots[i].locate_frame = pos;
         g_atomic_int_set(&feeder_slots[i].locate_req, 1);
@@ -3080,15 +3162,26 @@ void jackdaw_engine_set_loop_range(off_t start, off_t end)
     if (start < 0) start = 0;
     if (end   < 0) end   = 0;
     if (end < start) { off_t tmp = start; start = end; end = tmp; }
-    engine.loop_start = start;
-    engine.loop_end   = end;
+    /* Seqlock write (see eng_loop_read): odd, the pair, even. The release
+     * fence keeps the pair stores from overtaking the odd count; the final
+     * increment is a full barrier, so the pair is visible before the even. */
+    g_atomic_int_inc(&engine.loop_seq);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&engine.loop_start, start, __ATOMIC_RELAXED);
+    __atomic_store_n(&engine.loop_end,   end,   __ATOMIC_RELAXED);
+    g_atomic_int_inc(&engine.loop_seq);
     engine_loop_reseek();
 }
 
 void jackdaw_engine_get_loop_range(off_t *start, off_t *end)
 {
-    if (start) *start = engine.loop_start;
-    if (end)   *end   = engine.loop_end;
+    /* Called off the main thread too (the offline render worker). Never from
+     * RT, so it may wait out a writer mid-update. */
+    EngLoopRange r;
+    while (eng_loop_read(&r))
+        g_thread_yield();
+    if (start) *start = r.start;
+    if (end)   *end   = r.end;
 }
 
 void jackdaw_engine_set_loop_enabled(gboolean on)
@@ -3385,10 +3478,10 @@ void jackdaw_engine_render_tap_start(off_t end_frame)
 {
     size_t bytes = (size_t)engine.buf_size * 64 * sizeof(float);
     if (bytes < 65536) bytes = 65536;
-    if (!engine.render_rb_L) engine.render_rb_L = jack_ringbuffer_create(bytes);
-    if (!engine.render_rb_R) engine.render_rb_R = jack_ringbuffer_create(bytes);
-    if (engine.render_rb_L) jack_ringbuffer_reset(engine.render_rb_L);
-    if (engine.render_rb_R) jack_ringbuffer_reset(engine.render_rb_R);
+    if (!engine.render_rb_L) engine.render_rb_L = rt_ringbuffer_create(bytes);
+    if (!engine.render_rb_R) engine.render_rb_R = rt_ringbuffer_create(bytes);
+    if (engine.render_rb_L) rt_ringbuffer_reset(engine.render_rb_L);
+    if (engine.render_rb_R) rt_ringbuffer_reset(engine.render_rb_R);
     engine.render_end = end_frame;
     g_atomic_int_set(&engine.render_done, 0);
     g_atomic_int_set(&engine.render_active, 1);
@@ -3408,13 +3501,13 @@ gboolean jackdaw_engine_render_tap_done(void)
 size_t jackdaw_engine_render_tap_read(float *L, float *R, size_t max_frames)
 {
     if (!engine.render_rb_L || !engine.render_rb_R) return 0;
-    size_t avL = jack_ringbuffer_read_space(engine.render_rb_L) / sizeof(float);
-    size_t avR = jack_ringbuffer_read_space(engine.render_rb_R) / sizeof(float);
+    size_t avL = rt_ringbuffer_read_space(engine.render_rb_L) / sizeof(float);
+    size_t avR = rt_ringbuffer_read_space(engine.render_rb_R) / sizeof(float);
     size_t av  = avL < avR ? avL : avR;
     if (av > max_frames) av = max_frames;
     if (av == 0) return 0;
-    jack_ringbuffer_read(engine.render_rb_L, (char *)L, av * sizeof(float));
-    jack_ringbuffer_read(engine.render_rb_R, (char *)R, av * sizeof(float));
+    rt_ringbuffer_read(engine.render_rb_L, (char *)L, av * sizeof(float));
+    rt_ringbuffer_read(engine.render_rb_R, (char *)R, av * sizeof(float));
     return av;
 }
 
@@ -3480,9 +3573,10 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
         if (!engine.audio_in_r[(guint)ai]) {
             char name[64];
             g_snprintf(name, sizeof(name), "in_%uR", (guint)ai + 1);
-            engine.audio_in_r[(guint)ai] = jack_port_register(engine.client,
+            jack_port_t *pr = jack_port_register(engine.client,
                 name, JACK_DEFAULT_AUDIO_TYPE, JackPortIsInput, 0);
-            if (!engine.audio_in_r[(guint)ai]) return TRUE;
+            if (!pr) return TRUE;
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], pr);
         }
     } else {
         /* Clear the right source first so the RT callback stops reading it,
@@ -3494,8 +3588,10 @@ gboolean jackdaw_engine_set_track_stereo(JackDawTrack *t, gboolean stereo)
             g_clear_pointer(&t->audio_src_port_r, g_free);
         }
         if (engine.audio_in_r[(guint)ai]) {
-            jack_port_unregister(engine.client, engine.audio_in_r[(guint)ai]);
-            engine.audio_in_r[(guint)ai] = NULL;
+            jack_port_t *pr = engine.audio_in_r[(guint)ai];
+            g_atomic_pointer_set(&engine.audio_in_r[(guint)ai], NULL);
+            eng_wait_rt_past();
+            jack_port_unregister(engine.client, pr);
         }
     }
     return FALSE;
