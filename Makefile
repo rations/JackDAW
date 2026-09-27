@@ -108,6 +108,7 @@ SRCS_C := \
     $(SRCDIR)/undo.c \
     $(SRCDIR)/project.c \
     $(SRCDIR)/jackdaw-engine.c \
+    $(SRCDIR)/rt_ringbuffer.c \
     $(SRCDIR)/midicontrol.c \
     $(SRCDIR)/pluginhost.c \
     $(SRCDIR)/pluginhost_lv2.c \

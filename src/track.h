@@ -2,7 +2,7 @@
 #define TRACK_H_INCLUDED
 
 #include <glib-object.h>
-#include <jack/ringbuffer.h>
+#include "rt_ringbuffer.h"
 #include "audio_clip.h"
 #include "clipregion.h"
 #include "midiclip.h"
@@ -78,13 +78,13 @@ struct _JackDawTrack {
     volatile gfloat  peak_R;
 
     /* Playback ringbuffers: fed by main thread, drained by RT callback */
-    jack_ringbuffer_t *play_buf_L;
-    jack_ringbuffer_t *play_buf_R;
+    rt_ringbuffer_t *play_buf_L;
+    rt_ringbuffer_t *play_buf_R;
 
     /* Record ringbuffers: filled by RT callback, drained by main thread */
-    jack_ringbuffer_t *rec_buf_L;
-    jack_ringbuffer_t *rec_buf_R;
-    jack_ringbuffer_t *midi_rec_buf;
+    rt_ringbuffer_t *rec_buf_L;
+    rt_ringbuffer_t *rec_buf_R;
+    rt_ringbuffer_t *midi_rec_buf;
 
     /* Playback position in frames within clip */
     volatile off_t played_frames;
