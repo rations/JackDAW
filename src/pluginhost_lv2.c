@@ -191,6 +191,22 @@ static LV2_Worker_Status worker_respond_cb(LV2_Worker_Respond_Handle h,
     return LV2_WORKER_SUCCESS;
 }
 
+/* Take the next record's size header off a worker ring, but only once its
+ * whole payload is in: the producer writes header and payload as two separate
+ * writes, so the header alone does not mean the record is complete. Consuming
+ * it early would hand work()/work_response() a short payload and desync every
+ * record after it. An incomplete record is left for the next wake-up (worker)
+ * or the next cycle (RT). RT-safe. */
+static gboolean worker_ring_take(rt_ringbuffer_t *rb, uint32_t *size)
+{
+    size_t avail = rt_ringbuffer_read_space(rb);
+    if (avail < sizeof *size) return FALSE;
+    rt_ringbuffer_peek(rb, (char *)size, sizeof *size);
+    if (avail - sizeof *size < *size) return FALSE;
+    rt_ringbuffer_read_advance(rb, sizeof *size);
+    return TRUE;
+}
+
 static gpointer worker_thread_fn(gpointer arg)
 {
     Worker *w = arg;
@@ -199,8 +215,7 @@ static gpointer worker_thread_fn(gpointer arg)
         sem_wait(&w->sem);
         if (g_atomic_int_get(&w->quit)) break;
         uint32_t size;
-        while (rt_ringbuffer_read_space(w->requests) >= sizeof(size)) {
-            rt_ringbuffer_read(w->requests, (char *)&size, sizeof(size));
+        while (worker_ring_take(w->requests, &size)) {
             if (size > sizeof(buf)) {           /* oversized: drain & drop */
                 rt_ringbuffer_read_advance(w->requests, size);
                 continue;
@@ -233,8 +248,7 @@ static void worker_apply_responses(Worker *w)
     if (!w->active || !w->iface) return;
     char buf[WORKER_BUF_BYTES];
     uint32_t size;
-    while (rt_ringbuffer_read_space(w->responses) >= sizeof(size)) {
-        rt_ringbuffer_read(w->responses, (char *)&size, sizeof(size));
+    while (worker_ring_take(w->responses, &size)) {
         if (size > sizeof(buf)) { rt_ringbuffer_read_advance(w->responses, size); continue; }
         rt_ringbuffer_read(w->responses, buf, size);
         if (w->iface->work_response)
