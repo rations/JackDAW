@@ -957,19 +957,40 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
      * our pango usage over libcairo's single global font-face cache and triggers
      * a use-after-free *inside libcairo* (confirmed by ASan on gxtuner). Those go
      * out-of-process via the bridge (jackdaw-lv2ui-gtk3), where the plugin is the
-     * sole cairo consumer — the same isolation that makes them work in Reaper. */
+     * sole cairo consumer — the same isolation that makes them work in Reaper.
+     *
+     * Exception: an X11UI that REQUIRES instance-access or data-access needs a
+     * pointer into our DSP instance, which no out-of-process helper can give it
+     * (JUCE's LV2 UI wrapper returns NULL from instantiate without it — e.g.
+     * TONE3000). Those can only ever run in-process, so host them here via
+     * suil's x11_in_gtk3 wrapper. */
     LilvUIs *uis = lilv_plugin_get_uis(b->plugin);
     if (!uis) return NULL;
     LilvNode *gtk3 = lilv_new_uri(world, LV2_GTK3_UI_URI);
+    LilvNode *x11  = lilv_new_uri(world, LV2_UI__X11UI);
+    LilvNode *req  = lilv_new_uri(world, LV2_CORE__requiredFeature);
+    LilvNode *ia   = lilv_new_uri(world, LV2_INSTANCE_ACCESS_URI);
+    LilvNode *da   = lilv_new_uri(world, LV2_DATA_ACCESS_URI);
     const LilvUI   *use_ui   = NULL;
     const LilvNode *use_type = NULL;
     LILV_FOREACH(uis, it, uis) {
         const LilvUI *ui = lilv_uis_get(uis, it);
-        if (lilv_ui_is_a(ui, gtk3)) {   /* native Gtk3UI only */
+        if (lilv_ui_is_a(ui, gtk3)) {   /* native Gtk3UI: always preferred */
             use_ui = ui; use_type = gtk3; break;
         }
+        if (!use_ui && lilv_ui_is_a(ui, x11)) {
+            const LilvNode *u = lilv_ui_get_uri(ui);
+            lilv_world_load_resource(world, u);   /* ui.ttl via rdfs:seeAlso */
+            if (lilv_world_ask(world, u, req, ia) || lilv_world_ask(world, u, req, da)) {
+                use_ui = ui; use_type = x11;   /* keep looking for a Gtk3UI */
+            }
+        }
     }
-    if (!use_ui) { lilv_node_free(gtk3); lilv_uis_free(uis); return NULL; }
+    lilv_node_free(req); lilv_node_free(ia); lilv_node_free(da);
+    if (!use_ui) {
+        lilv_node_free(gtk3); lilv_node_free(x11); lilv_uis_free(uis);
+        return NULL;
+    }
 
     /* Parent the editor in a GtkEventBox (its own native X window) — this is
      * what jalv does and what makes embedding reliable. */
@@ -1015,7 +1036,7 @@ static GtkWidget *lv2_make_gui(PluginInstance *pi)
         bundle ? bundle : "", binary ? binary : "", ui_features);
 
     lilv_free(bundle); lilv_free(binary);
-    lilv_node_free(gtk3); lilv_uis_free(uis);
+    lilv_node_free(gtk3); lilv_node_free(x11); lilv_uis_free(uis);
 
     if (!b->ui) { gtk_widget_destroy(box); return NULL; }
     GtkWidget *w = (GtkWidget *)suil_instance_get_widget(b->ui);
