@@ -522,7 +522,10 @@ static void lv2_collect_atom_out(Lv2Backend *b)
     }
 }
 
-static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
+/* Effect render, in place. ev/n_ev is MIDI for the plug-in's MIDI input (the
+ * control input's footswitch, see pluginhost_process_fx_midi), or none. */
+static void lv2_run_fx(PluginInstance *pi, const PhMidiEvent *ev, int n_ev,
+                       float *L, float *R, int n)
 {
     Lv2Backend *b = pi->backend;
     if (n > b->max_block) n = b->max_block;
@@ -537,8 +540,8 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         lilv_instance_connect_port(b->inst[1], b->aout[0], b->outB);
         lv2_reset_atoms(b, 0);
         lv2_reset_atoms(b, 1);
-        lv2_forge_input(b, 0, staged, NULL, 0);
-        lv2_forge_input(b, 1, staged, NULL, 0);
+        lv2_forge_input(b, 0, staged, ev, n_ev);
+        lv2_forge_input(b, 1, staged, ev, n_ev);
         lilv_instance_run(b->inst[0], n);
         lilv_instance_run(b->inst[1], n);
         worker_apply_responses(&b->workers[0]);
@@ -560,7 +563,7 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
             lilv_instance_connect_port(b->inst[0], b->aout[i], b->dummy_out);
 
         lv2_reset_atoms(b, 0);
-        lv2_forge_input(b, 0, staged, NULL, 0);
+        lv2_forge_input(b, 0, staged, ev, n_ev);
         lilv_instance_run(b->inst[0], n);
         worker_apply_responses(&b->workers[0]);
         lv2_collect_atom_out(b);
@@ -568,6 +571,17 @@ static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
         if (b->n_audio_out > 1) memcpy(R, b->outB, (size_t)n * sizeof(float));
         else                    memcpy(R, b->outA, (size_t)n * sizeof(float));
     }
+}
+
+static void lv2_process(PluginInstance *pi, float *L, float *R, int n)
+{
+    lv2_run_fx(pi, NULL, 0, L, R, n);
+}
+
+static void lv2_process_fx_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                                int n_ev, float *L, float *R, int n)
+{
+    lv2_run_fx(pi, ev, n_ev, L, R, n);
 }
 
 /* Instrument render: forge MIDI, feed silent audio inputs, run, copy outputs.
@@ -1171,6 +1185,7 @@ static gboolean lv2_state_load(PluginInstance *pi, const void *data, gsize len)
 static const PhOps lv2_ops = {
     .process     = lv2_process,
     .process_midi = lv2_process_midi,
+    .process_fx_midi = lv2_process_fx_midi,
     .destroy     = lv2_destroy,
     .make_gui    = lv2_make_gui,
     .destroy_gui = lv2_destroy_gui,

@@ -2,6 +2,7 @@
 
 #ifdef HAVE_VST3
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,8 @@
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
+#include "pluginterfaces/vst/ivstunits.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 #include "pluginterfaces/vst/vstspeaker.h"
 #include "pluginterfaces/gui/iplugview.h"
@@ -182,7 +185,20 @@ struct Vst3Backend {
     ParameterChanges               out_params;  /* RT-thread-only */
     ParameterChangeTransfer        out_xfer{512};
     guint                          pump_id = 0;  /* GTK drain timer */
-    EventList                      in_events{256};   /* MIDI for instruments */
+    EventList                      in_events{256};   /* MIDI: notes */
+    /* Where the rest of a MIDI message lands. VST3 delivers only notes as
+     * events: a Control Change (and channel pressure and pitch bend) reaches a
+     * plug-in as a change of the parameter IMidiMapping names for it, and a
+     * Program Change as a change of the kIsProgramChange parameter of the unit
+     * IUnitInfo::getUnitByBus names for the channel — the SDK's own wrapper
+     * does the same (public.sdk/source/vst/basewrapper/basewrapper.cpp). Both
+     * are IEditController calls, which the RT thread may never make, so
+     * vst3_resolve_midi answers them once on the main thread and the RT thread
+     * only reads these tables. kNoParamId = nothing listens. Without them an
+     * amp's footswitch learn heard nothing but notes. */
+    ParamID                        midi_cc[16][kCountCtrlNumber];
+    ParamID                        midi_prog[16];
+    int32                          midi_prog_steps[16] = {};  /* stepCount */
     int                            max_block = 0;
     std::vector<ParamID>           param_ids;
     HostComponentHandler           handler;            /* set on the controller */
@@ -258,7 +274,80 @@ extern "C" void ph_vst3_scan(GList **catalog, const GList *extra)
 
 /* ---- Ops ---- */
 
-static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
+/* One MIDI-derived value onto parameter `id` at `offset`, on the RT thread.
+ * in_params was pre-sized to the plug-in's parameter count, so addParameterData
+ * reuses a queue; a queue reserves 5 points (parameterchanges.cpp,
+ * kQueueReservedPoints) and a sixth would allocate, so a crowded block keeps
+ * the latest value on its last point instead. The value also goes to the
+ * controller through out_xfer, as the SDK wrapper sends it to its GUI, so the
+ * editor shows what the pedal did. */
+static void vst3_midi_param(Vst3Backend *b, ParamID id, ParamValue v, int32 offset)
+{
+    int32 qi = 0;
+    IParamValueQueue *q = b->in_params.addParameterData(id, qi);
+    if (!q) return;
+    int32 pi = 0;
+    int32 np = q->getPointCount();
+    if (np >= 4) {
+        int32 last_off = 0; ParamValue last_v = 0.0;
+        if (q->getPoint(np - 1, last_off, last_v) == kResultOk)
+            offset = last_off;
+    }
+    q->addPoint(offset, v, pi);
+    b->out_xfer.addChange(id, v, offset);
+}
+
+/* This block's MIDI into the VST3 process data: notes as events (in_events,
+ * cleared here), CC / channel pressure / pitch bend / Program Change as
+ * parameter changes through the tables vst3_resolve_midi built. RT-safe. */
+static void vst3_queue_midi(Vst3Backend *b, const PhMidiEvent *ev, int n_ev)
+{
+    b->in_events.clear();
+    for (int i = 0; i < n_ev; i++) {
+        const guint8 *m = ev[i].data;
+        if (ev[i].size < 1) continue;
+        uint8 status = m[0] & 0xF0, ch = m[0] & 0x0F;
+        uint8 d1 = ev[i].size > 1 ? (m[1] & 0x7F) : 0;
+        uint8 d2 = ev[i].size > 2 ? (m[2] & 0x7F) : 0;
+        int32 off = (int32)ev[i].time;
+        Event e{};
+        e.busIndex     = 0;
+        e.sampleOffset = off;
+        e.flags        = Event::kIsLive;
+        if (status == 0x90 && d2 > 0) {
+            e.type = Event::kNoteOnEvent;
+            e.noteOn.channel  = ch;  e.noteOn.pitch = d1;
+            e.noteOn.velocity = d2 / 127.0f;  e.noteOn.noteId = -1;
+            b->in_events.addEvent(e);
+        } else if (status == 0x80 || status == 0x90) {
+            e.type = Event::kNoteOffEvent;
+            e.noteOff.channel  = ch;  e.noteOff.pitch = d1;
+            e.noteOff.velocity = (status == 0x80 ? d2 / 127.0f : 0.0f);
+            e.noteOff.noteId   = -1;
+            b->in_events.addEvent(e);
+        } else if (status == 0xB0) {
+            ParamID id = b->midi_cc[ch][d1];
+            if (id != kNoParamId) vst3_midi_param(b, id, d2 / 127.0, off);
+        } else if (status == 0xD0) {
+            ParamID id = b->midi_cc[ch][kAfterTouch];
+            if (id != kNoParamId) vst3_midi_param(b, id, d1 / 127.0, off);
+        } else if (status == 0xE0) {
+            ParamID id = b->midi_cc[ch][kPitchBend];
+            if (id != kNoParamId)
+                vst3_midi_param(b, id, (double)(d1 | (d2 << 7)) / (double)0x3FFF, off);
+        } else if (status == 0xC0) {
+            ParamID id = b->midi_prog[ch];
+            int32 steps = b->midi_prog_steps[ch];
+            if (id != kNoParamId && steps > 0 && d1 <= steps)
+                vst3_midi_param(b, id, (double)d1 / (double)steps, off);
+        }
+    }
+}
+
+/* Effect render, in place. ev/n_ev is MIDI from the control input (see
+ * pluginhost_process_fx_midi), or none. */
+static void vst3_run_fx(PluginInstance *pi, const PhMidiEvent *ev, int n_ev,
+                        float *L, float *R, int n)
 {
     Vst3Backend *b = (Vst3Backend *)pi->backend;
     if (n > b->max_block || !b->processor) return;
@@ -278,12 +367,17 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
     /* Drain the UI's queued parameter changes into in_params here, on the RT
      * thread, so nothing else ever mutates the object process() reads. */
     b->param_xfer.transferChangesTo(b->in_params);
+    if (n_ev > 0) {
+        vst3_queue_midi(b, ev, n_ev);
+        b->data.inputEvents = &b->in_events;
+    }
     b->data.inputParameterChanges = &b->in_params;
     b->out_params.clearQueue();
     b->data.outputParameterChanges = &b->out_params;
     b->processor->process(b->data);
     b->in_params.clearQueue();
     b->out_xfer.transferChangesFrom(b->out_params);
+    b->data.inputEvents = nullptr;
 
     if (b->data.outputs && b->data.outputs[0].channelBuffers32) {
         memcpy(L, b->data.outputs[0].channelBuffers32[0], sizeof(float) * n);
@@ -291,6 +385,17 @@ static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
         memcpy(R, b->data.outputs[0].channelBuffers32[oc > 1 ? 1 : 0],
                sizeof(float) * n);
     }
+}
+
+static void vst3_process(PluginInstance *pi, float *L, float *R, int n)
+{
+    vst3_run_fx(pi, NULL, 0, L, R, n);
+}
+
+static void vst3_process_fx_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                                 int n_ev, float *L, float *R, int n)
+{
+    vst3_run_fx(pi, ev, n_ev, L, R, n);
 }
 
 /* Deliver this block's MIDI as VST3 note events then render (instruments).
@@ -302,27 +407,6 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
     if (n > b->max_block || !b->processor) return;
 
     b->in_events.clear();
-    for (int i = 0; i < n_ev; i++) {
-        const guint8 *m = ev[i].data;
-        uint8 status = m[0] & 0xF0, ch = m[0] & 0x0F;
-        Event e{};
-        e.busIndex     = 0;
-        e.sampleOffset = (int32)ev[i].time;
-        e.flags        = Event::kIsLive;
-        if (status == 0x90 && m[2] > 0) {
-            e.type = Event::kNoteOnEvent;
-            e.noteOn.channel  = ch;  e.noteOn.pitch = m[1];
-            e.noteOn.velocity = m[2] / 127.0f;  e.noteOn.noteId = -1;
-        } else if (status == 0x80 || (status == 0x90 && m[2] == 0)) {
-            e.type = Event::kNoteOffEvent;
-            e.noteOff.channel  = ch;  e.noteOff.pitch = m[1];
-            e.noteOff.velocity = (status == 0x80 ? m[2] / 127.0f : 0.0f);
-            e.noteOff.noteId   = -1;
-        } else {
-            continue;   /* CC/other: not handled in v1 */
-        }
-        b->in_events.addEvent(e);
-    }
     b->data.inputEvents = &b->in_events;
 
     double bpm, sr; gint64 frame; gboolean playing;
@@ -344,8 +428,11 @@ static void vst3_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
             memset(b->data.outputs[0].channelBuffers32[ch], 0, sizeof(float) * n);
 
     /* Drain the UI's queued parameter changes into in_params here, on the RT
-     * thread, so nothing else ever mutates the object process() reads. */
+     * thread, so nothing else ever mutates the object process() reads. The
+     * MIDI goes in after them: its CC and Program Change are parameter changes
+     * too (vst3_queue_midi). */
     b->param_xfer.transferChangesTo(b->in_params);
+    vst3_queue_midi(b, ev, n_ev);
     b->data.inputParameterChanges = &b->in_params;
     b->out_params.clearQueue();
     b->data.outputParameterChanges = &b->out_params;
@@ -764,6 +851,7 @@ extern "C" gboolean ph_vst3_file_set(PluginInstance *inst, int which,
 static const PhOps vst3_ops = {
     .process      = vst3_process,
     .process_midi = vst3_process_midi,
+    .process_fx_midi = vst3_process_fx_midi,
     .destroy      = vst3_destroy,
     .make_gui     = vst3_make_gui,
     .destroy_gui  = vst3_destroy_gui,
@@ -778,6 +866,58 @@ static const PhOps vst3_ops = {
     .state_save   = vst3_state_save,
     .state_load   = vst3_state_load,
 };
+
+/* Main thread, once per instance: fill midi_cc / midi_prog (see Vst3Backend).
+ * Every answer is checked against the declared parameters before it is
+ * believed — a route to an id nothing was declared under would lose the
+ * message with no error anywhere. A controller with neither interface simply
+ * hears notes only. */
+static void vst3_resolve_midi(Vst3Backend *b)
+{
+    for (int ch = 0; ch < 16; ch++) {
+        for (int cc = 0; cc < kCountCtrlNumber; cc++) b->midi_cc[ch][cc] = kNoParamId;
+        b->midi_prog[ch] = kNoParamId;
+        b->midi_prog_steps[ch] = 0;
+    }
+    IEditController *c = b->controller;
+    if (!c) return;
+
+    std::vector<ParamID> declared(b->param_ids);
+    std::sort(declared.begin(), declared.end());
+
+    FUnknownPtr<IMidiMapping> mapping(c);
+    if (mapping) {
+        for (int ch = 0; ch < 16; ch++)
+            for (int cc = 0; cc < kCountCtrlNumber; cc++) {
+                ParamID id = kNoParamId;
+                if (mapping->getMidiControllerAssignment(0, (int16)ch, (CtrlNumber)cc,
+                                                         id) == kResultTrue &&
+                    id != kNoParamId &&
+                    std::binary_search(declared.begin(), declared.end(), id))
+                    b->midi_cc[ch][cc] = id;
+            }
+    }
+
+    FUnknownPtr<IUnitInfo> units(c);
+    if (units) {
+        int32 pc = c->getParameterCount();
+        for (int ch = 0; ch < 16; ch++) {
+            UnitID unit = kRootUnitId;
+            if (units->getUnitByBus(kEvent, kInput, 0, ch, unit) != kResultTrue)
+                continue;
+            for (int32 i = 0; i < pc; i++) {
+                ParameterInfo pinf{};
+                if (c->getParameterInfo(i, pinf) != kResultOk) continue;
+                if ((pinf.flags & ParameterInfo::kIsProgramChange) &&
+                    pinf.unitId == unit && pinf.stepCount > 0) {
+                    b->midi_prog[ch] = pinf.id;
+                    b->midi_prog_steps[ch] = pinf.stepCount;
+                    break;
+                }
+            }
+        }
+    }
+}
 
 /* ---- Instantiate ---- */
 
@@ -909,6 +1049,8 @@ extern "C" PluginInstance *ph_vst3_instantiate(const PluginInfo *info,
          * while an editor is open, so the controller's values stay current. */
         b->pump_id = g_timeout_add(33, vst3_pump_feedback, b);
     }
+
+    vst3_resolve_midi(b);
 
     PluginInstance *pi = ph_instance_alloc(PH_VST3, info->name, sr, max_block);
     pi->ops = &vst3_ops;

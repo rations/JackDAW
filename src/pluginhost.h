@@ -93,6 +93,15 @@ void            pluginhost_process_midi(PluginInstance *inst,
                                         const PhMidiEvent *ev, int n_ev,
                                         float *L, float *R, int nframes);
 
+/* RT processing for an EFFECT that also hears MIDI — the control input, so a
+ * footswitch reaches a plug-in's own MIDI features (an amp's channel switching
+ * and MIDI learn) as well as JackDAW's MIDI options. In place, like
+ * pluginhost_process (wet/dry mix included); with no events, or a backend with
+ * no MIDI path for effects, it IS pluginhost_process. */
+void            pluginhost_process_fx_midi(PluginInstance *inst,
+                                           const PhMidiEvent *ev, int n_ev,
+                                           float *L, float *R, int nframes);
+
 /* Clear the plugin's internal DSP state — reverb/delay buffers and any held
  * synth voices — without touching parameters. Used after an offline render so
  * resuming the live engine doesn't flush the render's leftover tail (an audible

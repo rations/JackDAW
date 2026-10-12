@@ -1544,7 +1544,7 @@ static void mw_midictl_populate_devices(JackDawMainWindow *win);
 static void midictl_trigger_text(const MidiCtlMapping *m, char *buf, gsize n)
 {
     if (m->msg_type == MIDI_CTL_UNLEARNED) {
-        g_strlcpy(buf, "(unlearned)", n);
+        buf[0] = '\0';   /* nothing yet: the Learn button beside it says what to do */
         return;
     }
     const char *t = m->msg_type == MIDI_CTL_CC      ? "CC"   :
@@ -1935,8 +1935,10 @@ static void mw_open_midictl_window(JackDawMainWindow *win)
         gtk_box_pack_start(GTK_BOX(vbox), drow, FALSE, FALSE, 0);
 
         GtkWidget *hint = gtk_label_new(
-            "Connect a footswitch / controller above, then map its buttons and "
-            "pedals below. Click Learn and move the control to bind it.");
+            "Connect a footswitch or controller above, then click Learn beside "
+            "an action and press or move the control. Effect plug-ins with MIDI "
+            "features of their own, such as an amp's footswitch, hear this device "
+            "too, so one press can do both.");
         gtk_label_set_line_wrap(GTK_LABEL(hint), TRUE);
         gtk_widget_set_halign(hint, GTK_ALIGN_START);
         gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);

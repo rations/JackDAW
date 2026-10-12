@@ -761,6 +761,12 @@ void pluginhost_free(PluginInstance *inst)
 
 void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
 {
+    pluginhost_process_fx_midi(inst, NULL, 0, L, R, nframes);
+}
+
+void pluginhost_process_fx_midi(PluginInstance *inst, const PhMidiEvent *ev,
+                                int n_ev, float *L, float *R, int nframes)
+{
     if (!inst || !inst->ops || !inst->ops->process) return;
     if (!g_atomic_int_get(&inst->active)) return;   /* bypassed */
 
@@ -777,7 +783,10 @@ void pluginhost_process(PluginInstance *inst, float *L, float *R, int nframes)
      * plugin's process(). */
     rt_set_denormal_mode();
     gint64 _t0 = ph_diag_enabled() ? ph_now_us() : 0;
-    inst->ops->process(inst, L, R, nframes);
+    if (n_ev > 0 && inst->ops->process_fx_midi)
+        inst->ops->process_fx_midi(inst, ev, n_ev, L, R, nframes);
+    else
+        inst->ops->process(inst, L, R, nframes);
     if (_t0) { gint64 d = ph_now_us() - _t0; if (d > inst->diag_max_us) inst->diag_max_us = d; }
 
     /* Safety net: a misbehaving plugin must never send NaN/inf or a runaway

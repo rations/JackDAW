@@ -208,13 +208,9 @@ static void vst2_process(PluginInstance *pi, float *L, float *R, int n)
     vst2_run(b, L, R, L, R, n);          /* effect: in-place audio */
 }
 
-/* Deliver this block's MIDI then render. Used for instrument tracks. */
-static void vst2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
-                              int n_ev, float *L, float *R, int n)
+/* Hand this block's MIDI to the plug-in (effEventsProcess, before process). */
+static void vst2_send_events(Vst2Backend *b, const PhMidiEvent *ev, int n_ev)
 {
-    Vst2Backend *b = (Vst2Backend *)pi->backend;
-    if (n > b->max_block) n = b->max_block;
-
     if (n_ev > 0 && b->vst_events) {
         if (n_ev > VST2_MAX_EVENTS) n_ev = VST2_MAX_EVENTS;
         for (int i = 0; i < n_ev; i++) {
@@ -230,10 +226,31 @@ static void vst2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
         b->vst_events->numEvents = n_ev;
         b->eff->dispatcher(b->eff, EFF_PROCESS_EVENTS, 0, 0, b->vst_events, 0.0f);
     }
+}
+
+/* Deliver this block's MIDI then render. Used for instrument tracks. */
+static void vst2_process_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                              int n_ev, float *L, float *R, int n)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (n > b->max_block) n = b->max_block;
+
+    vst2_send_events(b, ev, n_ev);
     /* Instruments take no audio input — feed silence; effects-with-MIDI get the
      * incoming signal. */
     if (b->is_synth) vst2_run(b, b->silence, b->silence, L, R, n);
     else             vst2_run(b, L, R, L, R, n);
+}
+
+/* An effect that also hears the control input (pluginhost_process_fx_midi):
+ * MIDI, then the usual in-place audio. */
+static void vst2_process_fx_midi(PluginInstance *pi, const PhMidiEvent *ev,
+                                 int n_ev, float *L, float *R, int n)
+{
+    Vst2Backend *b = (Vst2Backend *)pi->backend;
+    if (n > b->max_block) n = b->max_block;
+    vst2_send_events(b, ev, n_ev);
+    vst2_run(b, L, R, L, R, n);
 }
 
 static void vst2_reset(PluginInstance *pi)
@@ -471,6 +488,7 @@ static void vst2_destroy_gui(PluginInstance *pi)
 static const PhOps vst2_ops = {
     .process      = vst2_process,
     .process_midi = vst2_process_midi,
+    .process_fx_midi = vst2_process_fx_midi,
     .destroy      = vst2_destroy,
     .make_gui     = vst2_make_gui,
     .destroy_gui  = vst2_destroy_gui,

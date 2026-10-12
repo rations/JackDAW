@@ -328,6 +328,24 @@ otherwise all notes.
 
 ---
 
+## MIDI Control (footswitches)
+
+**Options → MIDI Control…** connects a footswitch or MIDI controller to JackDAW's
+control input. Click **Learn** beside an action (bypass or mix of an effect, a
+plugin parameter, track mute, switching between tracks, play / stop / record)
+and press or move the control.
+
+The same control input also reaches every **effect plugin** (on audio tracks,
+after an instrument, and on the master track), so a plugin with MIDI features
+of its own, such as an amp that switches channels from a footswitch, can learn
+the pedals too. One press can then do both: mute a track in JackDAW and switch
+the amp's channel. VST3 plugins get Control Change and Program Change the way
+the VST3 SDK's own hosts deliver them (as the parameters the plugin assigns to
+them); LV2 plugins get MIDI on their atom input, VST2 plugins as MIDI events.
+CLAP and LADSPA effects do not hear it.
+
+---
+
 ## JACK port model
 
 JackDAW registers N audio inputs, N audio outputs and M MIDI inputs (defaults

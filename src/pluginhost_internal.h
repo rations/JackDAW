@@ -21,6 +21,12 @@ typedef struct {
     /* Optional: deliver MIDI then render (instruments). NULL for effects. */
     void        (*process_midi)(PluginInstance *, const PhMidiEvent *, int n_ev,
                                 float *L, float *R, int n);
+    /* Optional: an EFFECT's in-place audio process that also delivers MIDI —
+     * the control input (a footswitch) for plug-ins with MIDI features of their
+     * own, such as an amp's channel switching. NULL = the backend cannot give an
+     * effect MIDI, and the host calls `process` instead. */
+    void        (*process_fx_midi)(PluginInstance *, const PhMidiEvent *, int n_ev,
+                                   float *L, float *R, int n);
     void        (*destroy)    (PluginInstance *);
     GtkWidget  *(*make_gui)   (PluginInstance *);   /* NULL = use generic panel */
     void        (*destroy_gui)(PluginInstance *);   /* tear down native editor */
