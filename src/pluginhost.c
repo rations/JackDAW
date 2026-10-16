@@ -241,7 +241,9 @@ static void ph_emit_class(PluginFormat fmt, const char *line, GList **catalog)
     g_strfreev(f);
 }
 
-#define PH_SCAN_TIMEOUT_MS 15000
+/* Generous because Windows plug-ins load under emulation on ARM: an
+ * iLok-protected one took 20 s on a Pi 5 before its factory was ready. */
+#define PH_SCAN_TIMEOUT_MS 60000
 #define PH_SCAN_MAX_OUTPUT (1u << 20)   /* untrusted child output, bounded */
 
 /* Newest mtime at or under `path`, recursing into directories (bounded depth).
@@ -345,13 +347,17 @@ static gchar *ph_run_scan_helper(const char *fmt_name, const char *path)
     return g_string_free(out, FALSE);
 }
 
+/* Set during an explicit Rescan: plug-ins cached as failed are probed again. */
+static gboolean ph_retry_failed;
+
 void ph_scan_cached(PluginFormat fmt, const char *path, GList **catalog)
 {
     if (!ph_cache) return;
     gint64 mtime = ph_path_mtime(path, 0);
     PhCacheEnt *e = g_hash_table_lookup(ph_cache, path);
 
-    if (!e || e->mtime != mtime) {                  /* miss -> scan out of process */
+    if (!e || e->mtime != mtime ||                  /* miss -> scan out of process */
+        (ph_retry_failed && e->classes->len == 0)) {
         if (ph_progress_cb) ph_progress_cb(path, ph_progress_u);
         gchar *sout = ph_run_scan_helper(pluginhost_format_name(fmt), path);
         if (!sout) return;                          /* could not start: don't cache */
@@ -487,7 +493,12 @@ const GList *pluginhost_catalog(void)
 
 void pluginhost_rescan(void)
 {
+    /* The user's way to retry a plug-in that failed before, such as one that
+     * timed out while its license service was still starting. The startup scan
+     * keeps the failure, so a broken plug-in isn't probed on every launch. */
+    ph_retry_failed = TRUE;
     ph_do_scan();
+    ph_retry_failed = FALSE;
 }
 
 /* Persisted baseline of every plugin identity seen on the previous scan, used
