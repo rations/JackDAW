@@ -17,19 +17,8 @@
 # under the glibc ceiling and packages -- not that it sounds right on a board.
 name: Linux aarch64
 
-# Every push on every branch, except commits that cannot change the build. The
-# list says what to IGNORE rather than what to match, so a forgotten entry costs
-# a spare run instead of silently skipping a check. icons/ is NOT ignored: the
-# tarball packages it.
+# Started by hand only, to save Actions minutes: no push, pull request or schedule triggers.
 on:
-  push:
-    branches: ['**']
-    paths-ignore: &docs_only
-      - '**.md'
-      - 'LICENSE'
-      - '.gitignore'
-  pull_request:
-    paths-ignore: *docs_only
   workflow_dispatch:
 
 concurrency:
